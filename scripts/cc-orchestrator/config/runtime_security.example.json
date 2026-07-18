@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "runtime_executable": null,
+  "extra_provider_env_keys": ["VENDOR_REGION"],
+  "unsafe_runtimes": []
+}
