@@ -220,6 +220,24 @@ class GuardedLaunchFixture(unittest.TestCase):
             allow_unsafe_runtime=False,
         )
 
+    def _publish_worker_gate(
+        self, run_dir: Path, metadata: dict[str, object]
+    ) -> None:
+        payload = orchestrator._worker_start_gate_payload(metadata)
+        orchestrator._atomic_write_text(
+            run_dir / orchestrator.WORKER_START_GATE_FILENAME,
+            json.dumps(payload, ensure_ascii=False, indent=2),
+        )
+
+    def _arm_worker_gate(self, run_dir: Path, prepared: object) -> None:
+        nonce = prepared.launch_spec.launch_nonce
+        identity = capture_process_identity(os.getpid(), launch_nonce=nonce)
+        orchestrator.update_metadata(
+            run_dir,
+            worker_pid=os.getpid(),
+            worker_process_identity=identity.to_dict(),
+        )
+
     def _direct_worker_protocol(
         self,
         prepared: object,
@@ -269,12 +287,14 @@ class GuardedLaunchFixture(unittest.TestCase):
                         "nonce_consumed": consumed,
                         "nonce_expires_at": expires_at
                         or "2999-01-01T00:00:00+00:00",
-                        "start_gate": gate,
+                        "start_gate": "closed",
                     },
                     "controller_pid": os.getpid(),
                 }
             )
             orchestrator.write_metadata(run_dir, metadata)
+            if gate == "open":
+                self._publish_worker_gate(run_dir, metadata)
             frame = prepared.launch_spec.private_frame()
             protocol = len(frame).to_bytes(8, "big") + frame
             if truncate_prompt:
@@ -683,12 +703,13 @@ class GuardedLaunchFailureTests(GuardedLaunchFixture):
                 "worker_launch": {
                     "nonce_consumed": False,
                     "nonce_expires_at": "2999-01-01T00:00:00+00:00",
-                    "start_gate": "open",
+                    "start_gate": "closed",
                 },
                 "controller_pid": worker_identity.parent_pid,
             }
         )
         orchestrator.write_metadata(run_dir, metadata)
+        self._publish_worker_gate(run_dir, metadata)
         frame = prepared.launch_spec.private_frame()
         protocol = (
             len(frame).to_bytes(8, "big")
@@ -1039,11 +1060,12 @@ class ReviewFixGateAndOwnershipTests(GuardedLaunchFixture):
                 "worker_launch": {
                     "nonce_consumed": False,
                     "nonce_expires_at": "2999-01-01T00:00:00+00:00",
-                    "start_gate": "open",
+                    "start_gate": "closed",
                 },
             }
         )
         orchestrator.write_metadata(run_dir, metadata)
+        self._publish_worker_gate(run_dir, metadata)
         frame = prepared.launch_spec.private_frame()
         protocol = len(frame).to_bytes(8, "big") + frame + (0).to_bytes(8, "big")
         environment = dict(prepared.launch_spec.environment)
@@ -1315,7 +1337,8 @@ class SecondReviewPublicationTests(GuardedLaunchFixture):
     def test_gate_publication_has_no_post_replace_permission_step(self) -> None:
         prepared = self._prepare("streaming", prompt="")
         run_dir, metadata = orchestrator._initialize_prepared_run(prepared)
-        target = run_dir / "metadata.json"
+        self._arm_worker_gate(run_dir, prepared)
+        target = run_dir / orchestrator.WORKER_START_GATE_FILENAME
         real_set_private = orchestrator._set_private_file
 
         def reject_post_publication(path: Path) -> None:
@@ -1330,12 +1353,14 @@ class SecondReviewPublicationTests(GuardedLaunchFixture):
         self.assertEqual(opened["worker_launch"]["start_gate"], "open")
         self.assertEqual(
             orchestrator.read_metadata(run_dir)["worker_launch"]["start_gate"],
-            "open",
+            "closed",
         )
+        self.assertTrue(target.is_file())
 
     def test_gate_is_not_published_when_lock_release_fails(self) -> None:
         prepared = self._prepare("streaming", prompt="")
         run_dir, _metadata = orchestrator._initialize_prepared_run(prepared)
+        self._arm_worker_gate(run_dir, prepared)
 
         class FaultingRelease:
             def __enter__(self) -> None:
@@ -1353,13 +1378,16 @@ class SecondReviewPublicationTests(GuardedLaunchFixture):
             orchestrator.read_metadata(run_dir)["worker_launch"]["start_gate"],
             "closed",
         )
+        self.assertFalse(
+            (run_dir / orchestrator.WORKER_START_GATE_FILENAME).exists()
+        )
 
     def test_gate_verification_fault_keeps_controller_worker_agreement(self) -> None:
         def reject_open_gate(path: Path, *, is_dir: bool = False) -> None:
             candidate = Path(path)
             if not is_dir and candidate.is_file():
                 payload = candidate.read_bytes()
-                if b'"start_gate": "open"' in payload:
+                if b'"state": "open"' in payload:
                     raise OSError("pre-publication verification fault")
 
         with patch.object(
@@ -1447,7 +1475,9 @@ class SecondReviewTransportTests(GuardedLaunchFixture):
         self.assertEqual(metadata["status"], "succeeded", metadata)
         self.assertEqual(metadata["output_budget"]["state"], "truncated")
         self.assertTrue(marker.is_file())
-        self.assertGreater(int(marker.read_text(encoding="utf-8")), 0)
+        self.assertEqual(
+            int(marker.read_text(encoding="utf-8")), metadata["prompt_bytes"]
+        )
         self._wait_for_pid_exit(int(metadata["child_pid"]))
         self._wait_for_pid_exit(int(metadata["worker_pid"]))
 
@@ -1468,6 +1498,9 @@ class SecondReviewTransportTests(GuardedLaunchFixture):
         self.assertEqual(metadata["status"], "succeeded", metadata)
         self.assertEqual(metadata["output_budget"]["state"], "truncated")
         self.assertTrue(marker.is_file())
+        self.assertEqual(
+            int(marker.read_text(encoding="utf-8")), metadata["prompt_bytes"]
+        )
         self._wait_for_pid_exit(int(metadata["child_pid"]))
         self._wait_for_pid_exit(int(metadata["worker_pid"]))
 
@@ -1520,7 +1553,12 @@ class SecondReviewScrubAndScannerTests(GuardedLaunchFixture):
         task_secret = "terminal-task-secret-z5"
         context_secret = "terminal-context-secret-y6"
 
-        def snapshot(_run_dir: Path, _cwd: Path, label: str) -> dict[str, object]:
+        def snapshot(
+            _run_dir: Path,
+            _cwd: Path,
+            label: str,
+            _sensitive_values: tuple[str, ...] = (),
+        ) -> dict[str, object]:
             if label == "after":
                 return {
                     "ok": False,
@@ -1537,7 +1575,9 @@ class SecondReviewScrubAndScannerTests(GuardedLaunchFixture):
         }
         with patch.object(
             orchestrator, "capture_git_snapshot", side_effect=snapshot
-        ), patch.object(orchestrator, "check_write_scope", return_value=scope):
+        ), patch.object(
+            orchestrator, "_check_write_scope_with_evidence", return_value=scope
+        ):
             result = orchestrator.run_agent(
                 task_secret, context=context_secret, cwd=self.workspace
             )
@@ -1805,6 +1845,372 @@ class SecondReviewEventSequenceTests(GuardedLaunchFixture):
             for line in events_path.read_text(encoding="utf-8").splitlines()
         ]
         self.assertEqual([event["seq"] for event in events], [7, 8])
+
+
+class ThirdReviewGateArtifactTests(GuardedLaunchFixture):
+    def test_gate_publication_preserves_concurrent_terminal_metadata(self) -> None:
+        prepared = self._prepare("streaming", prompt="")
+        run_dir, _metadata = orchestrator._initialize_prepared_run(prepared)
+        self._arm_worker_gate(run_dir, prepared)
+        real_replace = orchestrator._replace_prepared_atomic_write
+        gate_name = getattr(
+            orchestrator, "WORKER_START_GATE_FILENAME", "worker-start-gate.json"
+        )
+
+        def interleave(temporary: Path, target: Path) -> None:
+            if Path(target).name == gate_name:
+                orchestrator.update_metadata(
+                    run_dir,
+                    status="stopped",
+                    stop_requested_at="fixture-stop",
+                    terminal_state_count=1,
+                )
+            real_replace(temporary, target)
+
+        with patch.object(
+            orchestrator,
+            "_replace_prepared_atomic_write",
+            side_effect=interleave,
+        ):
+            orchestrator._open_worker_start_gate(run_dir)
+        metadata = orchestrator.read_metadata(run_dir)
+        self.assertEqual(metadata["status"], "stopped")
+        self.assertEqual(metadata["stop_requested_at"], "fixture-stop")
+        self.assertEqual(metadata["terminal_state_count"], 1)
+        self.assertTrue((run_dir / gate_name).is_file())
+
+    def test_gate_publication_preserves_arbitrary_concurrent_fields(self) -> None:
+        prepared = self._prepare("streaming", prompt="")
+        run_dir, _metadata = orchestrator._initialize_prepared_run(prepared)
+        self._arm_worker_gate(run_dir, prepared)
+        real_replace = orchestrator._replace_prepared_atomic_write
+        gate_name = getattr(
+            orchestrator, "WORKER_START_GATE_FILENAME", "worker-start-gate.json"
+        )
+
+        def interleave(temporary: Path, target: Path) -> None:
+            if Path(target).name == gate_name:
+                orchestrator.update_metadata(
+                    run_dir,
+                    arbitrary_controller_field={"preserve": [1, 2, 3]},
+                    status="running",
+                )
+            real_replace(temporary, target)
+
+        with patch.object(
+            orchestrator,
+            "_replace_prepared_atomic_write",
+            side_effect=interleave,
+        ):
+            orchestrator._open_worker_start_gate(run_dir)
+        metadata = orchestrator.read_metadata(run_dir)
+        self.assertEqual(
+            metadata["arbitrary_controller_field"], {"preserve": [1, 2, 3]}
+        )
+        self.assertEqual(metadata["status"], "running")
+        self.assertTrue((run_dir / gate_name).is_file())
+
+
+class ThirdReviewGitEvidenceTests(GuardedLaunchFixture):
+    def _initialize_git_workspace(self) -> None:
+        completed = subprocess.run(
+            ["git", "init"],
+            cwd=self.workspace,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def _write_scope(self, denied_name: str) -> None:
+        scope_dir = self.workspace / ".claude-code-orchestrator"
+        scope_dir.mkdir()
+        (scope_dir / "write-scope.json").write_text(
+            json.dumps(
+                {
+                    "cwd": str(self.workspace),
+                    "allowed_paths": [str(self.workspace)],
+                    "denied_paths": [str(self.workspace / denied_name)],
+                    "max_diff_lines": 100,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _write_git_mutating_runtime(self) -> None:
+        self.fake_runtime.write_text(
+            "\n".join(
+                [
+                    "import pathlib, sys",
+                    "prompt = sys.stdin.buffer.read().decode('utf-8')",
+                    "task = prompt.rsplit('\\nTask:\\n', 1)[1].split('\\n\\nAdditional context:\\n', 1)[0].strip()",
+                    "pathlib.Path(task).write_text('changed', encoding='utf-8')",
+                    "print('done', flush=True)",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def test_raw_git_evidence_enforces_sensitive_denied_path(self) -> None:
+        self._initialize_git_workspace()
+        self._write_git_mutating_runtime()
+        denied_name = "denied-sensitive-task-path"
+        self._write_scope(denied_name)
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                (self.workspace / denied_name).unlink(missing_ok=True)
+                if streaming:
+                    launch = orchestrator.run_streaming_agent(
+                        denied_name, cwd=self.workspace
+                    )
+                    run_dir = self.runs_dir / str(launch["run_id"])
+                    metadata = self._wait_for_terminal_metadata(run_dir)
+                else:
+                    metadata = orchestrator.run_agent(
+                        denied_name, cwd=self.workspace
+                    )
+                    run_dir = self.runs_dir / str(metadata["run_id"])
+                self.assertEqual(
+                    metadata["acceptance_status"], "blocked_write_scope", metadata
+                )
+                violation_types = {
+                    item["type"]
+                    for item in metadata["write_scope_check"]["violations"]
+                }
+                self.assertIn("denied_path", violation_types)
+                self.assertNotIn(denied_name.encode(), self._scan_run(run_dir))
+
+    def test_git_artifacts_are_scrubbed_before_each_atomic_write(self) -> None:
+        self._initialize_git_workspace()
+        secret = "raw-git-artifact-secret"
+        (self.workspace / secret).write_text("changed", encoding="utf-8")
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        run_dir.mkdir(parents=True)
+        observed: list[bytes] = []
+        real_atomic = orchestrator._atomic_write_bytes
+
+        def inspect(path: Path, payload: bytes) -> None:
+            if Path(path).name.startswith("git_after"):
+                observed.append(payload)
+                self.assertNotIn(secret.encode(), payload)
+            real_atomic(path, payload)
+
+        with patch.object(orchestrator, "_atomic_write_bytes", side_effect=inspect):
+            snapshot = orchestrator.capture_git_snapshot(
+                run_dir,
+                self.workspace,
+                "after",
+                sensitive_values=(secret,),
+            )
+        self.assertTrue(snapshot["ok"], snapshot)
+        self.assertGreaterEqual(len(observed), 5)
+        self.assertNotIn(secret.encode(), self._scan_run(run_dir))
+
+    def test_boundary_crashes_never_expose_raw_git_artifacts(self) -> None:
+        self._initialize_git_workspace()
+        self._write_git_mutating_runtime()
+
+        class InjectedCrash(BaseException):
+            pass
+
+        for boundary in ("metadata", "scope", "event", "final_scrub"):
+            with self.subTest(boundary=boundary):
+                secret = f"crash-secret-{boundary}"
+                (self.workspace / secret).unlink(missing_ok=True)
+                real_update = orchestrator.update_metadata
+                real_scope = getattr(
+                    orchestrator, "_check_write_scope_with_evidence", None
+                )
+                real_append = orchestrator.append_event
+                real_scrub = orchestrator._scrub_run_artifacts
+                scrub_calls = 0
+
+                def update(run_dir: Path, **updates: object) -> dict[str, object]:
+                    if boundary == "metadata" and "git_after" in updates:
+                        raise InjectedCrash()
+                    return real_update(run_dir, **updates)
+
+                def scope(*args: object, **kwargs: object) -> dict[str, object]:
+                    if boundary == "scope":
+                        raise InjectedCrash()
+                    if real_scope is None:
+                        return {"ok": True, "violations": []}
+                    return real_scope(*args, **kwargs)
+
+                def append(run_dir: Path, event: dict[str, object]) -> None:
+                    if boundary == "event" and event.get("type") == "process_exited":
+                        raise InjectedCrash()
+                    real_append(run_dir, event)
+
+                def scrub(run_dir: Path, values: tuple[str, ...]) -> None:
+                    nonlocal scrub_calls
+                    scrub_calls += 1
+                    if boundary == "final_scrub" and scrub_calls > 1:
+                        raise InjectedCrash()
+                    real_scrub(run_dir, values)
+
+                before = set(self._run_dirs())
+                with patch.object(
+                    orchestrator, "update_metadata", side_effect=update
+                ), patch.object(
+                    orchestrator,
+                    "_check_write_scope_with_evidence",
+                    side_effect=scope,
+                    create=True,
+                ), patch.object(
+                    orchestrator, "append_event", side_effect=append
+                ), patch.object(
+                    orchestrator, "_scrub_run_artifacts", side_effect=scrub
+                ):
+                    with self.assertRaises(InjectedCrash):
+                        orchestrator.run_agent(secret, cwd=self.workspace)
+                created = [path for path in self._run_dirs() if path not in before]
+                self.assertEqual(len(created), 1)
+                self.assertNotIn(secret.encode(), self._scan_run(created[0]))
+
+
+class ThirdReviewEndpointEncodingTests(GuardedLaunchFixture):
+    def test_raw_and_decoded_endpoint_components_are_scrubbed(self) -> None:
+        raw_user = "encoded%2Duser+literal"
+        decoded_user = "encoded-user+literal"
+        raw_password = "encoded%2Bpassword"
+        decoded_password = "encoded+password"
+        raw_query = "query%2Dsecret+space"
+        decoded_query = "query-secret space"
+        endpoint = (
+            f"https://{raw_user}:{raw_password}@example.invalid/api"
+            f"?token={raw_query}&region=test"
+        )
+        provider = orchestrator.Provider(
+            id="encoded-endpoint-provider",
+            name="Encoded Endpoint Provider",
+            app_type="claude",
+            settings={
+                "env": {
+                    "ANTHROPIC_API_KEY": FAKE_PROVIDER_SECRET,
+                    "ANTHROPIC_MODEL": "fixture-model",
+                    "ANTHROPIC_BASE_URL": endpoint,
+                }
+            },
+            category=None,
+            provider_type=None,
+            is_current=True,
+            endpoints=[],
+        )
+        self.fake_runtime.write_text(
+            "\n".join(
+                [
+                    "import os, sys",
+                    "from urllib.parse import parse_qsl, unquote, urlsplit",
+                    "sys.stdin.buffer.read()",
+                    "endpoint = os.environ['ANTHROPIC_BASE_URL']",
+                    "parsed = urlsplit(endpoint)",
+                    "decoded = (unquote(parsed.username or ''), unquote(parsed.password or ''), dict(parse_qsl(parsed.query)).get('token', ''))",
+                    "print('raw endpoint prose: ' + endpoint, flush=True)",
+                    "print('decoded endpoint prose: ' + ' | '.join(decoded), flush=True)",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with patch.object(orchestrator, "get_provider", return_value=provider):
+            one_shot = orchestrator.run_agent(
+                "encoded endpoint prose", cwd=self.workspace
+            )
+            streaming = orchestrator.run_streaming_agent(
+                "encoded endpoint prose", cwd=self.workspace
+            )
+        stream_dir = self.runs_dir / str(streaming["run_id"])
+        self._wait_for_terminal_metadata(stream_dir)
+        forbidden = (
+            raw_user,
+            decoded_user,
+            raw_password,
+            decoded_password,
+            raw_query,
+            decoded_query,
+        )
+        for run_dir in (
+            self.runs_dir / str(one_shot["run_id"]),
+            stream_dir,
+        ):
+            payload = self._scan_run(run_dir)
+            for value in forbidden:
+                self.assertNotIn(value.encode(), payload)
+
+
+class ThirdReviewEventRecoveryTests(GuardedLaunchFixture):
+    def test_stale_ahead_sidecar_is_ignored_on_size_mismatch(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        run_dir.mkdir(parents=True)
+        events_path = run_dir / "events.ndjson"
+        events_path.write_text(
+            json.dumps({"seq": 7, "type": "complete"}) + "\n",
+            encoding="utf-8",
+        )
+        (run_dir / "event_seq.txt").write_text(
+            json.dumps({"seq": 99, "events_bytes": 0}), encoding="utf-8"
+        )
+        orchestrator.append_event(run_dir, {"type": "recovered"})
+        events = [
+            json.loads(line)
+            for line in events_path.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual([event["seq"] for event in events], [7, 8])
+        sidecar = json.loads(
+            (run_dir / "event_seq.txt").read_text(encoding="utf-8")
+        )
+        self.assertEqual(sidecar["seq"], 8)
+
+
+class ThirdReviewHandleBindingTests(GuardedLaunchFixture):
+    def test_swap_to_link_between_discovery_and_open_is_rejected(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        run_dir.mkdir(parents=True)
+        victim = run_dir / "victim.txt"
+        victim.write_text("safe", encoding="utf-8")
+        outside = self.workspace / "outside.txt"
+        outside.write_text("outside-secret", encoding="utf-8")
+        backup = run_dir / "victim.original"
+        swapped = False
+
+        if os.name == "nt":
+            real_open = getattr(orchestrator, "_open_windows_managed_file", None)
+            self.assertIsNotNone(real_open)
+
+            def swap_then_open(path: Path, *args: object, **kwargs: object) -> object:
+                nonlocal swapped
+                if Path(path) == victim and not swapped:
+                    victim.replace(backup)
+                    os.symlink(outside, victim)
+                    swapped = True
+                return real_open(path, *args, **kwargs)
+
+            opener_patch = patch.object(
+                orchestrator,
+                "_open_windows_managed_file",
+                side_effect=swap_then_open,
+            )
+        else:
+            real_open = os.open
+
+            def swap_then_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+                nonlocal swapped
+                if Path(path) == victim and not swapped:
+                    victim.replace(backup)
+                    os.symlink(outside, victim)
+                    swapped = True
+                return real_open(path, flags, *args, **kwargs)
+
+            opener_patch = patch.object(
+                orchestrator.os, "open", side_effect=swap_then_open
+            )
+        with opener_patch:
+            with self.assertRaises(orchestrator.OrchestratorError):
+                orchestrator._scrub_run_artifacts(run_dir, ("outside-secret",))
+        self.assertTrue(swapped)
+        self.assertEqual(outside.read_text(encoding="utf-8"), "outside-secret")
 
 
 class ReviewFixWrapperChecks(GuardedLaunchFixture):

@@ -29,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, unquote_plus, urlencode, urlsplit, urlunsplit
 
 def configure_stdio() -> None:
     """Keep JSON output readable on Windows consoles with non-ASCII text."""
@@ -156,10 +156,12 @@ WORKER_QUALITY_HISTORY_PATH = CONFIG_DIR / "worker_quality_history.json"
 QUEUE_POLICY_PATH = CONFIG_DIR / "queue_policy.json"
 QUEUE_PATH = RUNS_DIR / "queue.json"
 INTERNAL_WORKER_NONCE_ENV = "CC_ORCHESTRATOR_INTERNAL_WORKER_NONCE"
+INTERNAL_GIT_BIN_ENV = "CC_ORCHESTRATOR_INTERNAL_GIT_BIN"
 PRIVATE_LAUNCH_FRAME_LIMIT = 64 * 1024
 PROMPT_BYTES_LIMIT = 1024 * 1024
 INTERNAL_WORKER_NONCE_TTL_SECONDS = 60
 WORKER_START_GATE_TIMEOUT_SECONDS = 5.0
+WORKER_START_GATE_FILENAME = "worker-start-gate.json"
 SCRUBBED_VALUE = "[REDACTED]"
 CONTROLLER_OS_BASELINE_KEYS = (
     (
@@ -1523,6 +1525,34 @@ def _windows_security_apis() -> tuple[Any, Any, Any]:
         ctypes.c_void_p,
     )
     advapi32.SetFileSecurityW.restype = wintypes.BOOL
+    advapi32.GetSecurityInfo.argtypes = (
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+    )
+    advapi32.GetSecurityInfo.restype = wintypes.DWORD
+    advapi32.SetSecurityInfo.argtypes = (
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    )
+    advapi32.SetSecurityInfo.restype = wintypes.DWORD
+    advapi32.GetSecurityDescriptorDacl.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.BOOL),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.BOOL),
+    )
+    advapi32.GetSecurityDescriptorDacl.restype = wintypes.BOOL
     advapi32.OpenProcessToken.argtypes = (
         ctypes.c_void_p,
         wintypes.DWORD,
@@ -1688,6 +1718,137 @@ def _inspect_windows_private_acl(path: Path, *, is_dir: bool) -> dict[str, Any]:
         kernel32.LocalFree(descriptor)
 
 
+def _inspect_windows_private_acl_handle(
+    native_handle: Any, *, is_dir: bool
+) -> dict[str, Any]:
+    ctypes, advapi32, kernel32 = _windows_security_apis()
+    from ctypes import wintypes
+
+    owner = ctypes.c_void_p()
+    dacl = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    result = advapi32.GetSecurityInfo(
+        native_handle,
+        1,
+        0x00000001 | 0x00000004,
+        ctypes.byref(owner),
+        None,
+        ctypes.byref(dacl),
+        None,
+        ctypes.byref(descriptor),
+    )
+    if result != 0:
+        raise OSError(result, "Could not inspect the Windows artifact ACL")
+    try:
+        owner_sid = _windows_sid_text(ctypes, advapi32, kernel32, owner)
+        current_user_sid = _windows_current_user_sid(ctypes, advapi32, kernel32)
+        control = wintypes.WORD()
+        revision = wintypes.DWORD()
+        if not advapi32.GetSecurityDescriptorControl(
+            descriptor, ctypes.byref(control), ctypes.byref(revision)
+        ):
+            raise OSError(ctypes.get_last_error(), "Could not inspect DACL control")
+
+        class AclSizeInformation(ctypes.Structure):
+            _fields_ = (
+                ("AceCount", wintypes.DWORD),
+                ("AclBytesInUse", wintypes.DWORD),
+                ("AclBytesFree", wintypes.DWORD),
+            )
+
+        info = AclSizeInformation()
+        if not dacl or not advapi32.GetAclInformation(
+            dacl, ctypes.byref(info), ctypes.sizeof(info), 2
+        ):
+            raise OSError(ctypes.get_last_error(), "Could not inspect DACL entries")
+        entries: list[dict[str, Any]] = []
+        for index in range(int(info.AceCount)):
+            ace = ctypes.c_void_p()
+            if not advapi32.GetAce(dacl, index, ctypes.byref(ace)):
+                raise OSError(ctypes.get_last_error(), "Could not inspect a DACL entry")
+            address = int(ace.value)
+            entries.append(
+                {
+                    "type": ctypes.c_ubyte.from_address(address).value,
+                    "flags": ctypes.c_ubyte.from_address(address + 1).value,
+                    "mask": ctypes.c_uint32.from_address(address + 4).value,
+                    "sid": _windows_sid_text(
+                        ctypes,
+                        advapi32,
+                        kernel32,
+                        ctypes.c_void_p(address + 8),
+                    ),
+                }
+            )
+        expected_flags = 0x03 if is_dir else 0
+        exact = bool(control.value & 0x1000) and entries == [
+            {
+                "type": 0,
+                "flags": expected_flags,
+                "mask": 0x001F01FF,
+                "sid": current_user_sid,
+            }
+        ]
+        return {
+            "protected": bool(control.value & 0x1000),
+            "owner_sid": owner_sid,
+            "current_user_sid": current_user_sid,
+            "ace_sids": [str(entry["sid"]) for entry in entries],
+            "has_inherited_aces": any(
+                int(entry["flags"]) & 0x10 for entry in entries
+            ),
+            "entries": entries,
+            "exact": exact,
+        }
+    finally:
+        kernel32.LocalFree(descriptor)
+
+
+def _enforce_windows_private_acl_handle(
+    native_handle: Any, *, is_dir: bool
+) -> None:
+    ctypes, advapi32, kernel32 = _windows_security_apis()
+    current_user_sid = _windows_current_user_sid(ctypes, advapi32, kernel32)
+    flags = "OICI" if is_dir else ""
+    descriptor = ctypes.c_void_p()
+    size = ctypes.c_uint32()
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        f"D:P(A;{flags};FA;;;{current_user_sid})",
+        1,
+        ctypes.byref(descriptor),
+        ctypes.byref(size),
+    ):
+        raise OrchestratorError("Could not construct a private Windows ACL.")
+    try:
+        present = ctypes.c_int()
+        defaulted = ctypes.c_int()
+        dacl = ctypes.c_void_p()
+        if not advapi32.GetSecurityDescriptorDacl(
+            descriptor,
+            ctypes.byref(present),
+            ctypes.byref(dacl),
+            ctypes.byref(defaulted),
+        ) or not present.value:
+            raise OrchestratorError("Could not read the private Windows DACL.")
+        result = advapi32.SetSecurityInfo(
+            native_handle,
+            1,
+            0x00000004 | 0x80000000,
+            None,
+            None,
+            dacl,
+            None,
+        )
+        if result != 0:
+            raise OSError(result, "Could not enforce the private Windows ACL")
+    finally:
+        kernel32.LocalFree(descriptor)
+    if not _inspect_windows_private_acl_handle(
+        native_handle, is_dir=is_dir
+    )["exact"]:
+        raise OrchestratorError("Private Windows ACL verification failed.")
+
+
 def _enforce_windows_private_acl(path: Path, *, is_dir: bool) -> None:
     _lstat_managed_path(path, is_dir=is_dir)
     ctypes, advapi32, kernel32 = _windows_security_apis()
@@ -1717,8 +1878,160 @@ def _enforce_windows_private_acl(path: Path, *, is_dir: bool) -> None:
         )
 
 
+@contextlib.contextmanager
+def _open_windows_managed_file(
+    path: Path, *, writable: bool = False, verify_private: bool = True
+) -> Any:
+    if os.name != "nt":
+        raise OrchestratorError("Windows managed-file handles are unavailable.")
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = (
+            ("dwFileAttributes", wintypes.DWORD),
+            ("ftCreationTime", wintypes.FILETIME),
+            ("ftLastAccessTime", wintypes.FILETIME),
+            ("ftLastWriteTime", wintypes.FILETIME),
+            ("dwVolumeSerialNumber", wintypes.DWORD),
+            ("nFileSizeHigh", wintypes.DWORD),
+            ("nFileSizeLow", wintypes.DWORD),
+            ("nNumberOfLinks", wintypes.DWORD),
+            ("nFileIndexHigh", wintypes.DWORD),
+            ("nFileIndexLow", wintypes.DWORD),
+        )
+
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+    )
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    kernel32.GetFileInformationByHandle.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(ByHandleFileInformation),
+    )
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    desired_access = 0x80000000 | 0x00020000
+    if writable:
+        desired_access |= 0x40000000 | 0x00040000
+    native_handle = kernel32.CreateFileW(
+        str(path),
+        desired_access,
+        0x00000001 | 0x00000002,
+        None,
+        3,
+        0x00200000,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if native_handle in {None, invalid_handle}:
+        raise ctypes.WinError(ctypes.get_last_error())
+    file_handle: Any | None = None
+    try:
+        information = ByHandleFileInformation()
+        if not kernel32.GetFileInformationByHandle(
+            native_handle, ctypes.byref(information)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        attributes = int(information.dwFileAttributes)
+        size = (int(information.nFileSizeHigh) << 32) | int(
+            information.nFileSizeLow
+        )
+        if attributes & _WINDOWS_REPARSE_POINT:
+            raise OrchestratorError(
+                f"Managed artifact links and reparse points are forbidden: {path.name}"
+            )
+        if attributes & 0x10:
+            raise OrchestratorError(
+                f"Managed artifact is not a regular file: {path.name}"
+            )
+        if size > MAX_MANAGED_ARTIFACT_BYTES:
+            raise OrchestratorError(
+                f"Managed artifact exceeds its size limit: {path.name}"
+            )
+        if writable:
+            _enforce_windows_private_acl_handle(native_handle, is_dir=False)
+        elif verify_private and not _inspect_windows_private_acl_handle(
+            native_handle, is_dir=False
+        )["exact"]:
+            raise OrchestratorError(
+                f"Private Windows ACL verification failed for {path.name}."
+            )
+        flags = os.O_BINARY | (os.O_RDWR if writable else os.O_RDONLY)
+        fd = msvcrt.open_osfhandle(int(native_handle), flags)
+        native_handle = None
+        file_handle = os.fdopen(fd, "r+b" if writable else "rb")
+        yield file_handle, {"size": size, "attributes": attributes}
+    finally:
+        if file_handle is not None:
+            file_handle.close()
+        elif native_handle not in {None, invalid_handle}:
+            kernel32.CloseHandle(native_handle)
+
+
+@contextlib.contextmanager
+def _open_posix_managed_file(
+    path: Path, *, writable: bool = False, verify_private: bool = True
+) -> Any:
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = os.open(path.parent, directory_flags)
+    fd: int | None = None
+    file_handle: Any | None = None
+    try:
+        flags = os.O_RDWR if writable else os.O_RDONLY
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path.name, flags, dir_fd=directory_fd)
+        details = os.fstat(fd)
+        if not stat.S_ISREG(details.st_mode):
+            raise OrchestratorError(
+                f"Managed artifact is not a regular file: {path.name}"
+            )
+        if details.st_size > MAX_MANAGED_ARTIFACT_BYTES:
+            raise OrchestratorError(
+                f"Managed artifact exceeds its size limit: {path.name}"
+            )
+        if verify_private and stat.S_IMODE(details.st_mode) != 0o600:
+            raise OrchestratorError(f"Private artifact mode is invalid: {path.name}")
+        file_handle = os.fdopen(fd, "r+b" if writable else "rb")
+        fd = None
+        yield file_handle, details
+    except OSError as exc:
+        if getattr(exc, "errno", None) in {getattr(os, "ELOOP", 40), 40}:
+            raise OrchestratorError(
+                f"Managed artifact links are forbidden: {path.name}"
+            ) from exc
+        raise
+    finally:
+        if file_handle is not None:
+            file_handle.close()
+        if fd is not None:
+            os.close(fd)
+        os.close(directory_fd)
+
+
+def _open_managed_file(
+    path: Path, *, writable: bool = False, verify_private: bool = True
+) -> Any:
+    opener = _open_windows_managed_file if os.name == "nt" else _open_posix_managed_file
+    return opener(path, writable=writable, verify_private=verify_private)
+
+
 def _verify_private_path(path: Path, *, is_dir: bool = False) -> None:
-    details = _lstat_managed_path(path, is_dir=is_dir)
+    if not is_dir:
+        with _open_managed_file(path, verify_private=True):
+            return
+    details = _lstat_managed_path(path, is_dir=True)
     if os.name == "nt":
         if not _inspect_windows_private_acl(path, is_dir=is_dir)["exact"]:
             raise OrchestratorError(
@@ -1740,11 +2053,17 @@ def _set_private_directory(path: Path) -> None:
 
 
 def _set_private_file(path: Path) -> None:
-    _lstat_managed_path(path, is_dir=False)
-    os.chmod(path, 0o600)
     if os.name == "nt":
-        _enforce_windows_private_acl(path, is_dir=False)
-    _verify_private_path(path, is_dir=False)
+        with _open_windows_managed_file(
+            path, writable=True, verify_private=False
+        ):
+            return
+    with _open_posix_managed_file(
+        path, writable=True, verify_private=False
+    ) as (handle, _details):
+        os.fchmod(handle.fileno(), 0o600)
+        if stat.S_IMODE(os.fstat(handle.fileno()).st_mode) != 0o600:
+            raise OrchestratorError(f"Private artifact mode is invalid: {path.name}")
 
 
 def _iter_managed_artifacts(run_dir: Path) -> list[tuple[Path, bool]]:
@@ -1791,7 +2110,12 @@ def _scrub_run_artifacts(
         for path, is_dir in _iter_managed_artifacts(run_dir):
             if is_dir:
                 continue
-            payload = path.read_bytes()
+            with _open_managed_file(path) as (handle, _details):
+                payload = handle.read(MAX_MANAGED_ARTIFACT_BYTES + 1)
+            if len(payload) > MAX_MANAGED_ARTIFACT_BYTES:
+                raise OrchestratorError(
+                    f"Managed artifact exceeds its size limit: {path.name}"
+                )
             scrubbed = payload
             for value in sorted(replacements, key=len, reverse=True):
                 scrubbed = scrubbed.replace(value, marker)
@@ -1897,8 +2221,9 @@ def update_metadata(run_dir: Path, **updates: Any) -> dict[str, Any]:
 
 
 def run_git_command(cwd: Path, args: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
+    git_command = os.environ.get(INTERNAL_GIT_BIN_ENV) or "git"
     return subprocess.run(
-        ["git", *args],
+        [git_command, *args],
         cwd=str(cwd),
         capture_output=True,
         text=True,
@@ -2054,6 +2379,9 @@ def launch_lock(timeout_seconds: int = 15, stale_seconds: int = 60) -> Any:
 
 
 def snapshot_hashes(snapshot: dict[str, Any]) -> dict[str, Any]:
+    raw_hashes = snapshot.get("_raw_hashes")
+    if isinstance(raw_hashes, dict):
+        return raw_hashes
     path = snapshot.get("hashes_path")
     if not path:
         return {}
@@ -2070,11 +2398,23 @@ def changed_paths_between_snapshots(before: dict[str, Any], after: dict[str, Any
     for path in before_hashes:
         if path not in after_hashes:
             changed.add(path)
-    before_status = set(str(p).replace("\\", "/") for p in before.get("changed_paths", []) or [])
-    after_status = set(str(p).replace("\\", "/") for p in after.get("changed_paths", []) or [])
+    before_status = set(
+        str(p).replace("\\", "/")
+        for p in before.get("_raw_changed_paths", before.get("changed_paths", [])) or []
+    )
+    after_status = set(
+        str(p).replace("\\", "/")
+        for p in after.get("_raw_changed_paths", after.get("changed_paths", [])) or []
+    )
     changed.update(after_status - before_status)
-    before_untracked = set(str(p).replace("\\", "/") for p in before.get("untracked_paths", []) or [])
-    after_untracked = set(str(p).replace("\\", "/") for p in after.get("untracked_paths", []) or [])
+    before_untracked = set(
+        str(p).replace("\\", "/")
+        for p in before.get("_raw_untracked_paths", before.get("untracked_paths", [])) or []
+    )
+    after_untracked = set(
+        str(p).replace("\\", "/")
+        for p in after.get("_raw_untracked_paths", after.get("untracked_paths", [])) or []
+    )
     changed.update(after_untracked - before_untracked)
     return sorted(path for path in changed if path)
 
@@ -2334,7 +2674,7 @@ def append_event(run_dir: Path, event: dict[str, Any]) -> None:
                 handle.truncate(truncate_at)
                 handle.flush()
                 os.fsync(handle.fileno())
-        last_seq = max(sidecar_seq, event_seq)
+        last_seq = sidecar_seq if sidecar_size == current_size else event_seq
         seq = last_seq + 1
         persisted_event = dict(event)
         persisted_event["seq"] = seq
@@ -3623,10 +3963,18 @@ def _endpoint_sensitive_values(value: str) -> tuple[str, ...]:
     if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
         return ()
     sensitive: list[str] = []
-    if parsed.username:
-        sensitive.append(parsed.username)
-    if parsed.password:
-        sensitive.append(parsed.password)
+    for component in (parsed.username, parsed.password):
+        if not component:
+            continue
+        sensitive.extend((component, unquote(component), unquote_plus(component)))
+    for field in parsed.query.split("&"):
+        raw_key, separator, raw_value = field.partition("=")
+        if not separator or not raw_value:
+            continue
+        decoded_key = unquote_plus(raw_key)
+        decoded_value = unquote_plus(raw_value)
+        if should_redact_key(decoded_key, decoded_value):
+            sensitive.extend((raw_value, unquote(raw_value), decoded_value))
     try:
         query = parse_qsl(parsed.query, keep_blank_values=True)
     except ValueError:
@@ -3636,7 +3984,7 @@ def _endpoint_sensitive_values(value: str) -> tuple[str, ...]:
         for query_key, query_value in query
         if query_value and should_redact_key(query_key, query_value)
     )
-    return tuple(sensitive)
+    return _normalize_sensitive_values(sensitive)
 
 
 def _sanitize_endpoint(value: str) -> str:
@@ -4006,7 +4354,23 @@ def _validate_started_identity(
         raise _process_identity_unverified(process_identity.pid, process_kind)
 
 
-def capture_git_snapshot(run_dir: Path, cwd: Path, label: str) -> dict[str, Any]:
+def _git_snapshot_projection(
+    snapshot: Mapping[str, Any], sensitive_values: tuple[str, ...]
+) -> dict[str, Any]:
+    public = {
+        key: value
+        for key, value in snapshot.items()
+        if not str(key).startswith("_raw_")
+    }
+    return _scrub_guarded_value(public, sensitive_values)
+
+
+def capture_git_snapshot(
+    run_dir: Path,
+    cwd: Path,
+    label: str,
+    sensitive_values: tuple[str, ...] = (),
+) -> dict[str, Any]:
     """Capture git diff/status, untracked files, and key file hashes."""
     result = {"ok": False, "label": label, "is_git_repo": False}
     if not (cwd / ".git").exists():
@@ -4025,11 +4389,31 @@ def capture_git_snapshot(run_dir: Path, cwd: Path, label: str) -> dict[str, Any]
         porcelain_path = run_dir / f"git_{label}_porcelain.json"
         untracked_path = run_dir / f"git_{label}_untracked.txt"
         hashes_path = run_dir / f"git_{label}_hashes.json"
-        diff_path.write_text(str(redact(diff_proc.stdout or diff_proc.stderr or "")), encoding="utf-8")
-        status_path.write_text(str(redact(status_proc.stdout or status_proc.stderr or "")), encoding="utf-8")
-        porcelain_path.write_text(json.dumps(status_items, ensure_ascii=False, indent=2), encoding="utf-8")
-        untracked_path.write_text("\n".join(untracked_paths) + ("\n" if untracked_paths else ""), encoding="utf-8")
-        hashes_path.write_text(json.dumps(hashes, ensure_ascii=False, indent=2), encoding="utf-8")
+        raw_diff = diff_proc.stdout or diff_proc.stderr or ""
+        raw_status = status_proc.stdout or status_proc.stderr or ""
+        safe_diff = _scrub_exact_text(str(redact(raw_diff)), sensitive_values)
+        safe_status = _scrub_exact_text(str(redact(raw_status)), sensitive_values)
+        safe_items = _scrub_guarded_value(status_items, sensitive_values)
+        safe_untracked = _scrub_guarded_value(untracked_paths, sensitive_values)
+        safe_hashes = _scrub_guarded_value(hashes, sensitive_values)
+        artifact_payloads = (
+            (diff_path, safe_diff),
+            (status_path, safe_status),
+            (
+                porcelain_path,
+                json.dumps(safe_items, ensure_ascii=False, indent=2),
+            ),
+            (
+                untracked_path,
+                "\n".join(safe_untracked) + ("\n" if safe_untracked else ""),
+            ),
+            (
+                hashes_path,
+                json.dumps(safe_hashes, ensure_ascii=False, indent=2),
+            ),
+        )
+        for artifact_path, safe_payload in artifact_payloads:
+            _atomic_write_text(artifact_path, safe_payload)
         return {
             "ok": diff_proc.returncode == 0 and status_proc.returncode == 0 and porcelain_proc.returncode == 0,
             "label": label,
@@ -4039,16 +4423,26 @@ def capture_git_snapshot(run_dir: Path, cwd: Path, label: str) -> dict[str, Any]
             "porcelain_path": str(porcelain_path),
             "untracked_path": str(untracked_path),
             "hashes_path": str(hashes_path),
-            "diff_bytes": diff_path.stat().st_size,
-            "status_bytes": status_path.stat().st_size,
-            "changed_paths": changed_paths,
-            "untracked_paths": untracked_paths,
+            "diff_bytes": len(safe_diff.encode("utf-8")),
+            "status_bytes": len(safe_status.encode("utf-8")),
+            "changed_paths": safe_items and status_paths(safe_items) or [],
+            "untracked_paths": safe_untracked,
             "changed_count": len(changed_paths),
             "untracked_count": len(untracked_paths),
             "hash_count": len(hashes),
+            "_raw_diff_text": raw_diff,
+            "_raw_changed_paths": changed_paths,
+            "_raw_untracked_paths": untracked_paths,
+            "_raw_hashes": hashes,
         }
     except Exception as exc:
-        return {"ok": False, "label": label, "is_git_repo": True, "error": str(exc)}
+        return {
+            "ok": False,
+            "label": label,
+            "is_git_repo": True,
+            "error": _scrub_exact_text(str(exc), sensitive_values),
+            "_raw_error": str(exc),
+        }
 
 
 def _launch_failure_error(code: str, message: str) -> RuntimeSecurityError:
@@ -4245,9 +4639,12 @@ def _initialize_prepared_run(
         Path(str(metadata["workspace_root"])),
         artifact_root,
     )
-    metadata["git_before"] = _scrub_guarded_value(
+    metadata["git_before"] = _git_snapshot_projection(
         capture_git_snapshot(
-            run_dir, Path(str(metadata["cwd"])), "before"
+            run_dir,
+            Path(str(metadata["cwd"])),
+            "before",
+            prepared.sensitive_values,
         ),
         prepared.sensitive_values,
     )
@@ -4333,6 +4730,26 @@ def _start_one_shot_launch(
             error=_launch_failure_error(
                 "artifact_write_failed",
                 "Unsafe-runtime security event could not be persisted.",
+            ),
+        )
+    try:
+        git_before_raw = capture_git_snapshot(
+            run_dir,
+            Path(spec.cwd),
+            "before",
+            prepared.sensitive_values,
+        )
+        if git_before_raw.get("is_git_repo") and not git_before_raw.get("ok"):
+            raise OrchestratorError("Pre-launch Git evidence is unavailable.")
+    except Exception:
+        return _record_blocked_launch(
+            run_dir,
+            metadata,
+            sensitive_values=prepared.sensitive_values,
+            status="blocked_runtime_launch",
+            error=_launch_failure_error(
+                "artifact_write_failed",
+                "Pre-launch Git evidence could not be persisted safely.",
             ),
         )
     try:
@@ -4441,17 +4858,40 @@ def _start_one_shot_launch(
         ),
         prepared.sensitive_values,
     )
-    git_after = _scrub_guarded_value(
-        capture_git_snapshot(run_dir, Path(spec.cwd), "after"),
+    git_after_raw = capture_git_snapshot(
+        run_dir,
+        Path(spec.cwd),
+        "after",
         prepared.sensitive_values,
     )
-    updates: dict[str, Any] = _scrub_guarded_value({
-        "finished_at": utc_now_iso(),
-        "duration_ms": int((time.time() - started) * 1000),
-        "exit_code": exit_code,
-        "timed_out": timed_out,
-        "git_after": git_after,
-    }, prepared.sensitive_values)
+    scope_check_raw = _check_write_scope_with_evidence(
+        str(metadata["run_id"]),
+        Path(spec.cwd),
+        git_before_raw,
+        git_after_raw,
+    )
+    git_after = _git_snapshot_projection(
+        git_after_raw, prepared.sensitive_values
+    )
+    scope_check = _scrub_guarded_value(
+        scope_check_raw, prepared.sensitive_values
+    )
+    updates: dict[str, Any] = _scrub_guarded_value(
+        {
+            "finished_at": utc_now_iso(),
+            "duration_ms": int((time.time() - started) * 1000),
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "git_after": git_after,
+            "write_scope_check": scope_check,
+            "acceptance_status": (
+                "blocked_write_scope"
+                if not scope_check.get("ok", True)
+                else "pending_controller_review"
+            ),
+        },
+        prepared.sensitive_values,
+    )
     if actual_route.get("actual_model") or actual_route.get("actual_model_usage"):
         updates.update(
             {
@@ -4466,17 +4906,16 @@ def _start_one_shot_launch(
             }
         )
     metadata = update_metadata(run_dir, **updates)
-    scope_check = _scrub_guarded_value(
-        check_write_scope(run_id=str(metadata["run_id"])),
-        prepared.sensitive_values,
-    )
-    metadata = update_metadata(
+    append_event(
         run_dir,
-        write_scope_check=scope_check,
-        acceptance_status=(
-            "blocked_write_scope"
-            if not scope_check.get("ok", True)
-            else "pending_controller_review"
+        _scrub_guarded_value(
+            {
+                "type": "process_exited",
+                "status": "timed_out" if timed_out else "completed",
+                "exit_code": exit_code,
+                "duration_ms": updates["duration_ms"],
+            },
+            prepared.sensitive_values,
         ),
     )
     try:
@@ -4641,9 +5080,52 @@ def _write_pipe_chunk(pipe: Any, payload: bytes) -> None:
         raise BrokenPipeError("short write to internal worker protocol")
 
 
+def _worker_start_gate_payload(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    public = metadata.get("runtime_launch")
+    worker_identity = metadata.get("worker_process_identity")
+    if not isinstance(public, Mapping) or not isinstance(worker_identity, Mapping):
+        raise OrchestratorError("Worker start gate identity is unavailable.")
+    launch_nonce = public.get("launch_nonce")
+    worker_pid = metadata.get("worker_pid")
+    creation_token = worker_identity.get("creation_token")
+    if (
+        not isinstance(launch_nonce, str)
+        or not launch_nonce
+        or not isinstance(worker_pid, int)
+        or isinstance(worker_pid, bool)
+        or worker_pid <= 0
+        or not isinstance(creation_token, str)
+        or not creation_token
+    ):
+        raise OrchestratorError("Worker start gate identity is invalid.")
+    return {
+        "state": "open",
+        "run_id": str(metadata.get("run_id") or ""),
+        "launch_nonce": launch_nonce,
+        "worker_pid": worker_pid,
+        "worker_creation_token": creation_token,
+        "opened_at": utc_now_iso(),
+    }
+
+
+def _read_worker_start_gate(run_dir: Path) -> dict[str, Any]:
+    gate_path = run_dir / WORKER_START_GATE_FILENAME
+    with _open_managed_file(gate_path) as (handle, _details):
+        payload = handle.read(MAX_MANAGED_ARTIFACT_BYTES + 1)
+    if len(payload) > MAX_MANAGED_ARTIFACT_BYTES:
+        raise OrchestratorError("Worker start gate exceeds its size limit.")
+    try:
+        gate = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise OrchestratorError("Worker start gate is invalid.") from exc
+    if not isinstance(gate, dict):
+        raise OrchestratorError("Worker start gate is invalid.")
+    return gate
+
+
 def _open_worker_start_gate(run_dir: Path) -> dict[str, Any]:
     temporary_path: Path | None = None
-    target = run_dir / "metadata.json"
+    target = run_dir / WORKER_START_GATE_FILENAME
     try:
         with artifact_lock(run_dir):
             metadata = read_metadata(run_dir)
@@ -4652,14 +5134,19 @@ def _open_worker_start_gate(run_dir: Path) -> dict[str, Any]:
                 raise OrchestratorError("Worker start gate metadata is unavailable.")
             if worker_launch.get("start_gate") != "closed":
                 raise OrchestratorError("Worker start gate is not closed.")
-            opened = dict(worker_launch)
-            opened.update(
-                {"start_gate": "open", "gate_opened_at": utc_now_iso()}
-            )
-            metadata["worker_launch"] = opened
+            if target.exists():
+                raise OrchestratorError("Worker start gate is already published.")
+            gate = _worker_start_gate_payload(metadata)
             temporary_path = _prepare_private_atomic_write(
-                target, _metadata_bytes(metadata)
+                target,
+                json.dumps(gate, ensure_ascii=False, indent=2).encode("utf-8"),
             )
+            opened_metadata = dict(metadata)
+            opened_worker_launch = dict(worker_launch)
+            opened_worker_launch.update(
+                {"start_gate": "open", "gate_opened_at": gate["opened_at"]}
+            )
+            opened_metadata["worker_launch"] = opened_worker_launch
     except Exception:
         _discard_prepared_atomic_write(temporary_path)
         raise
@@ -4668,7 +5155,7 @@ def _open_worker_start_gate(run_dir: Path) -> dict[str, Any]:
     except Exception:
         _discard_prepared_atomic_write(temporary_path)
         raise
-    return metadata
+    return opened_metadata
 
 
 def _start_streaming_controller(
@@ -4679,6 +5166,9 @@ def _start_streaming_controller(
     spec = prepared.launch_spec
     worker_env = dict(spec.environment)
     worker_env[INTERNAL_WORKER_NONCE_ENV] = spec.launch_nonce
+    git_command = shutil.which("git")
+    if git_command:
+        worker_env[INTERNAL_GIT_BIN_ENV] = str(Path(git_command).resolve())
     worker_command = [
         str(Path(sys.executable).resolve()),
         "-I",
@@ -5109,19 +5599,26 @@ def _consume_worker_nonce(run_dir: Path, nonce: str) -> dict[str, Any]:
     deadline = time.monotonic() + WORKER_START_GATE_TIMEOUT_SECONDS
     while True:
         latest = read_metadata(run_dir)
-        worker_launch = latest.get("worker_launch")
-        if (
-            isinstance(worker_launch, dict)
-            and worker_launch.get("start_gate") == "open"
-        ):
-            break
-        if str(latest.get("status") or "").startswith("blocked_"):
+        status = str(latest.get("status") or "")
+        if status not in {"starting", "running"}:
             raise _runtime_not_trusted("Controller closed the worker start gate.")
+        try:
+            _read_worker_start_gate(run_dir)
+        except FileNotFoundError:
+            pass
+        except OrchestratorError as exc:
+            if not (run_dir / WORKER_START_GATE_FILENAME).exists():
+                pass
+            else:
+                raise _runtime_not_trusted("Worker start gate is invalid.") from exc
+        else:
+            break
         if time.monotonic() >= deadline:
             raise _runtime_not_trusted("Worker start gate did not open in time.")
         time.sleep(0.01)
     with artifact_lock(run_dir):
         metadata = read_metadata(run_dir)
+        gate = _read_worker_start_gate(run_dir)
         public = metadata.get("runtime_launch")
         worker_launch = metadata.get("worker_launch")
         if (
@@ -5129,7 +5626,7 @@ def _consume_worker_nonce(run_dir: Path, nonce: str) -> dict[str, Any]:
             or not isinstance(worker_launch, dict)
             or public.get("launch_nonce") != nonce
             or worker_launch.get("nonce_consumed") is not False
-            or worker_launch.get("start_gate") != "open"
+            or worker_launch.get("start_gate") != "closed"
         ):
             raise _runtime_not_trusted("Internal worker launch nonce is unavailable.")
         try:
@@ -5150,6 +5647,11 @@ def _consume_worker_nonce(run_dir: Path, nonce: str) -> dict[str, Any]:
             or recorded_identity.pid != os.getpid()
             or recorded_identity.parent_pid != controller_pid
             or recorded_identity.launch_nonce != nonce
+            or gate.get("state") != "open"
+            or gate.get("run_id") != run_dir.name
+            or gate.get("launch_nonce") != nonce
+            or gate.get("worker_pid") != os.getpid()
+            or gate.get("worker_creation_token") != recorded_identity.creation_token
         ):
             raise _runtime_not_trusted(
                 "Controller worker identity ownership does not match this process."
@@ -5298,6 +5800,23 @@ def stream_worker(run_id: str) -> dict[str, Any]:
             status="blocked_runtime_launch",
             error=_launch_failure_error(
                 "artifact_write_failed", "Worker readiness metadata could not be persisted."
+            ),
+        )
+    try:
+        git_before_raw = capture_git_snapshot(
+            run_dir, cwd, "before", sensitive_values
+        )
+        if git_before_raw.get("is_git_repo") and not git_before_raw.get("ok"):
+            raise OrchestratorError("Pre-launch Git evidence is unavailable.")
+    except Exception:
+        return _record_blocked_launch(
+            run_dir,
+            metadata,
+            sensitive_values=sensitive_values,
+            status="blocked_runtime_launch",
+            error=_launch_failure_error(
+                "artifact_write_failed",
+                "Pre-launch Git evidence could not be persisted safely.",
             ),
         )
     creationflags = 0
@@ -5828,8 +6347,14 @@ def stream_worker(run_id: str) -> dict[str, Any]:
         if stopped and not budget.get("stop_reason"):
             budget["stop_reason"] = "user_requested"
         persist_budget_unlocked(str(budget.get("stop_reason") or "") or None)
-    git_after = _scrub_guarded_value(
-        capture_git_snapshot(run_dir, cwd, "after"), sensitive_values
+    git_after_raw = capture_git_snapshot(
+        run_dir, cwd, "after", sensitive_values
+    )
+    scope_check_raw = _check_write_scope_with_evidence(
+        run_id, cwd, git_before_raw, git_after_raw
+    )
+    git_after = _git_snapshot_projection(
+        git_after_raw, sensitive_values
     )
     final_metadata = update_metadata(
         run_dir,
@@ -5842,9 +6367,7 @@ def stream_worker(run_id: str) -> dict[str, Any]:
         stop_reason=budget.get("stop_reason") or ("timeout" if timed_out else "user_requested" if stopped else None),
         git_after=git_after,
     )
-    scope_check = _scrub_guarded_value(
-        check_write_scope(run_id=run_id), sensitive_values
-    )
+    scope_check = _scrub_guarded_value(scope_check_raw, sensitive_values)
     final_metadata = update_metadata(
         run_dir,
         write_scope_check=scope_check,
@@ -6490,15 +7013,13 @@ def count_diff_changed_lines(diff_text: str) -> int:
     return count
 
 
-def check_write_scope(run_id: str | None = None, cwd: Path | None = None) -> dict[str, Any]:
-    metadata: dict[str, Any] = {}
-    run_dir: Path | None = None
-    if run_id:
-        run_dir = safe_run_dir(run_id)
-        metadata = read_metadata(run_dir)
-        root = Path(str(metadata.get("cwd") or cwd or Path.cwd())).resolve()
-    else:
-        root = (cwd or Path.cwd()).resolve()
+def _check_write_scope_with_evidence(
+    run_id: str | None,
+    root: Path,
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+) -> dict[str, Any]:
+    root = root.resolve()
     scope_path, scope = load_write_scope(root)
     if not scope:
         return {
@@ -6511,10 +7032,8 @@ def check_write_scope(run_id: str | None = None, cwd: Path | None = None) -> dic
             "violations": [],
         }
 
-    before = metadata.get("git_before") or {}
-    after = metadata.get("git_after") or {}
     if run_id and before and after:
-        changed_paths = changed_paths_between_snapshots(before, after)
+        changed_paths = changed_paths_between_snapshots(dict(before), dict(after))
     elif (root / ".git").exists():
         changed_paths = current_git_changed_paths(root)
     else:
@@ -6545,7 +7064,11 @@ def check_write_scope(run_id: str | None = None, cwd: Path | None = None) -> dic
     max_diff_lines = int(scope.get("max_diff_lines") or 0)
     diff_lines = 0
     diff_source = "current"
-    if after.get("diff_path") and Path(str(after["diff_path"])).exists():
+    raw_diff = after.get("_raw_diff_text")
+    if isinstance(raw_diff, str):
+        diff_lines = count_diff_changed_lines(raw_diff)
+        diff_source = "run_after_memory_snapshot"
+    elif after.get("diff_path") and Path(str(after["diff_path"])).exists():
         diff_lines = count_diff_changed_lines(Path(str(after["diff_path"])).read_text(encoding="utf-8", errors="replace"))
         diff_source = "run_after_snapshot"
     elif (root / ".git").exists():
@@ -6576,6 +7099,22 @@ def check_write_scope(run_id: str | None = None, cwd: Path | None = None) -> dic
         "max_diff_lines": max_diff_lines,
         "rollback_recommendation": rollback_hint,
     }
+
+
+def check_write_scope(
+    run_id: str | None = None, cwd: Path | None = None
+) -> dict[str, Any]:
+    before: Mapping[str, Any] = {}
+    after: Mapping[str, Any] = {}
+    if run_id:
+        run_dir = safe_run_dir(run_id)
+        metadata = read_metadata(run_dir)
+        root = Path(str(metadata.get("cwd") or cwd or Path.cwd())).resolve()
+        before = metadata.get("git_before") or {}
+        after = metadata.get("git_after") or {}
+    else:
+        root = (cwd or Path.cwd()).resolve()
+    return _check_write_scope_with_evidence(run_id, root, before, after)
 
 
 def diff_summary(cwd: Path | None = None, limit_chars: int = 200000) -> dict[str, Any]:
