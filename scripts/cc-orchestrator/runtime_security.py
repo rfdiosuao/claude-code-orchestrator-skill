@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import json
+import ctypes
+import os
+import secrets
+import shlex
+import shutil
 import string
+import sys
 from hashlib import sha256
 from collections.abc import Mapping as MappingABC
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -38,6 +44,9 @@ _ABSOLUTE_DENY_ENV_KEYS = frozenset(
         "COMSPEC",
         "SHELL",
         "CLAUDE_CODE_BIN",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+        "LANG",
+        "LC_ALL",
         "PYTHONPATH",
         "PYTHONHOME",
         "NODE_OPTIONS",
@@ -154,6 +163,519 @@ class PinnedExecutableIdentity:
     file_id: tuple[int, int] | None = None
     target_kind: str = "native"
     interpreter_identity: "PinnedExecutableIdentity | None" = None
+
+
+@dataclass(frozen=True)
+class ExecutableIdentity:
+    canonical_path: str
+    size: int
+    mtime_ns: int
+    sha256: str
+    file_id: tuple[int, int] | None
+    target_kind: str
+    interpreter_identity: "ExecutableIdentity | None"
+
+    @classmethod
+    def capture(cls, executable: str | Path) -> "ExecutableIdentity":
+        return cls._capture(executable, depth=1, seen=set())
+
+    @classmethod
+    def _capture(
+        cls,
+        executable: str | Path,
+        *,
+        depth: int,
+        seen: set[str],
+    ) -> "ExecutableIdentity":
+        if depth > MAX_IDENTITY_DEPTH:
+            raise ValueError("Executable identity exceeds maximum interpreter depth.")
+        path = canonical_path(executable)
+        if not path.is_file():
+            raise ValueError("Executable identity target must be a file.")
+        path_key = os.path.normcase(str(path))
+        if path_key in seen:
+            raise ValueError("Executable identity contains an interpreter cycle.")
+        seen.add(path_key)
+        try:
+            before = path.stat()
+            digest = sha256()
+            with path.open("rb") as executable_file:
+                for chunk in iter(lambda: executable_file.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            after = path.stat()
+            if _stat_identity(before) != _stat_identity(after):
+                raise ValueError("Executable changed while its identity was captured.")
+            target_kind, interpreter_path = _resolve_interpreter(path)
+            interpreter_identity = (
+                None
+                if interpreter_path is None
+                else cls._capture(
+                    interpreter_path,
+                    depth=depth + 1,
+                    seen=seen,
+                )
+            )
+            return cls(
+                canonical_path=str(path),
+                size=after.st_size,
+                mtime_ns=after.st_mtime_ns,
+                sha256=digest.hexdigest(),
+                file_id=_file_id(after),
+                target_kind=target_kind,
+                interpreter_identity=interpreter_identity,
+            )
+        finally:
+            seen.remove(path_key)
+
+    def matches_current_file(self) -> bool:
+        try:
+            return self == type(self).capture(self.canonical_path)
+        except (OSError, TypeError, ValueError):
+            return False
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return self._to_public_dict(depth=1, seen=set())
+
+    def _to_public_dict(
+        self, *, depth: int, seen: set[int]
+    ) -> dict[str, Any]:
+        if depth > MAX_IDENTITY_DEPTH or id(self) in seen:
+            raise ValueError("Executable identity is cyclic or too deep.")
+        seen.add(id(self))
+        try:
+            return {
+                "canonical_path": self.canonical_path,
+                "size": self.size,
+                "mtime_ns": self.mtime_ns,
+                "sha256": self.sha256,
+                "file_id": None if self.file_id is None else list(self.file_id),
+                "target_kind": self.target_kind,
+                "interpreter_identity": (
+                    None
+                    if self.interpreter_identity is None
+                    else self.interpreter_identity._to_public_dict(
+                        depth=depth + 1, seen=seen
+                    )
+                ),
+            }
+        finally:
+            seen.remove(id(self))
+
+    @classmethod
+    def from_public_dict(cls, data: Mapping[str, Any]) -> "ExecutableIdentity":
+        return cls._from_public_dict(data, depth=1, seen=set())
+
+    @classmethod
+    def _from_public_dict(
+        cls,
+        data: Mapping[str, Any],
+        *,
+        depth: int,
+        seen: set[int],
+    ) -> "ExecutableIdentity":
+        if depth > MAX_IDENTITY_DEPTH:
+            raise ValueError("Executable identity exceeds maximum interpreter depth.")
+        if not isinstance(data, MappingABC):
+            raise TypeError("Executable identity must be a mapping.")
+        if id(data) in seen:
+            raise ValueError("Executable identity contains an interpreter cycle.")
+        expected_fields = {
+            "canonical_path",
+            "size",
+            "mtime_ns",
+            "sha256",
+            "file_id",
+            "target_kind",
+            "interpreter_identity",
+        }
+        if set(data) != expected_fields:
+            raise ValueError("Executable identity has an invalid shape.")
+        canonical = data["canonical_path"]
+        size = data["size"]
+        mtime_ns = data["mtime_ns"]
+        digest = data["sha256"]
+        file_id_data = data["file_id"]
+        target_kind = data["target_kind"]
+        interpreter_data = data["interpreter_identity"]
+        if (
+            not isinstance(canonical, str)
+            or not canonical
+            or "\x00" in canonical
+            or not Path(canonical).is_absolute()
+        ):
+            raise ValueError("Executable identity has an invalid canonical path.")
+        for field_name, value in (("size", size), ("mtime_ns", mtime_ns)):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise TypeError(f"Executable identity has an invalid {field_name}.")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in string.hexdigits for character in digest)
+        ):
+            raise ValueError("Executable identity has an invalid SHA-256 digest.")
+        if file_id_data is None:
+            file_id = None
+        elif (
+            isinstance(file_id_data, list)
+            and len(file_id_data) == 2
+            and all(
+                isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                for value in file_id_data
+            )
+        ):
+            file_id = (file_id_data[0], file_id_data[1])
+        else:
+            raise TypeError("Executable identity has an invalid file id.")
+        if target_kind not in {"native", "cmd", "powershell", "python", "shebang"}:
+            raise ValueError("Executable identity has an invalid target kind.")
+        if interpreter_data is not None and not isinstance(interpreter_data, MappingABC):
+            raise TypeError("Executable interpreter identity must be a mapping or null.")
+        seen.add(id(data))
+        try:
+            interpreter = (
+                None
+                if interpreter_data is None
+                else cls._from_public_dict(
+                    interpreter_data, depth=depth + 1, seen=seen
+                )
+            )
+        finally:
+            seen.remove(id(data))
+        if (target_kind == "native") != (interpreter is None):
+            raise ValueError("Executable identity has an inconsistent interpreter.")
+        return cls(
+            canonical_path=canonical,
+            size=size,
+            mtime_ns=mtime_ns,
+            sha256=digest,
+            file_id=file_id,
+            target_kind=target_kind,
+            interpreter_identity=interpreter,
+        )
+
+
+def _file_id(stat_result: os.stat_result) -> tuple[int, int] | None:
+    if not stat_result.st_ino:
+        return None
+    return (stat_result.st_dev, stat_result.st_ino)
+
+
+def _stat_identity(stat_result: os.stat_result) -> tuple[int, int, int, tuple[int, int] | None]:
+    return (
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+        _file_id(stat_result),
+    )
+
+
+def _resolve_interpreter(path: Path) -> tuple[str, Path | None]:
+    suffix = path.suffix.casefold()
+    if suffix in {".cmd", ".bat"}:
+        return "cmd", _resolve_cmd_executable()
+    if suffix == ".ps1":
+        return "powershell", _resolve_powershell_executable()
+    if suffix == ".py":
+        return "python", canonical_path(sys.executable)
+
+    try:
+        with path.open("rb") as executable_file:
+            first_line = executable_file.readline(4096)
+    except OSError:
+        raise
+    if not first_line.startswith(b"#!"):
+        return "native", None
+    try:
+        command = shlex.split(
+            first_line[2:].decode("utf-8").strip(), posix=os.name != "nt"
+        )
+    except (UnicodeDecodeError, ValueError) as error:
+        raise ValueError("Executable contains an invalid shebang.") from error
+    if not command:
+        raise ValueError("Executable contains an empty shebang.")
+    interpreter = Path(command[0])
+    if interpreter.name.casefold() == "env" and interpreter.as_posix() == "/usr/bin/env":
+        if len(command) != 2 or not command[1] or os.path.basename(command[1]) != command[1]:
+            raise ValueError("Executable contains an unsupported env shebang.")
+        resolved = shutil.which(command[1])
+        if resolved is None:
+            raise FileNotFoundError(command[1])
+        interpreter = Path(resolved)
+    elif not interpreter.is_absolute():
+        raise ValueError("Shebang interpreter must be absolute.")
+    return "shebang", canonical_path(interpreter)
+
+
+def _resolve_cmd_executable() -> Path:
+    if os.name == "nt":
+        candidate = _windows_system_directory() / "cmd.exe"
+        return canonical_path(candidate)
+    resolved = shutil.which("cmd.exe") or shutil.which("cmd")
+    if resolved is None:
+        raise FileNotFoundError("cmd.exe")
+    return canonical_path(resolved)
+
+
+def _resolve_powershell_executable() -> Path:
+    if os.name == "nt":
+        candidate = (
+            _windows_system_directory()
+            / "WindowsPowerShell"
+            / "v1.0"
+            / "powershell.exe"
+        )
+        return canonical_path(candidate)
+    resolved = shutil.which("pwsh") or shutil.which("powershell")
+    if resolved is None:
+        raise FileNotFoundError("PowerShell")
+    return canonical_path(resolved)
+
+
+def _windows_system_directory() -> Path:
+    buffer = ctypes.create_unicode_buffer(32_768)
+    length = ctypes.windll.kernel32.GetSystemDirectoryW(buffer, len(buffer))
+    if length == 0 or length >= len(buffer):
+        raise OSError(ctypes.get_last_error(), "Could not resolve Windows system directory")
+    return canonical_path(buffer.value)
+
+
+def generate_launch_nonce() -> str:
+    return secrets.token_hex(32)
+
+
+_ARGUMENT_KINDS = {
+    "-p": "prompt_stdin",
+    "--output-format": "output_format_flag",
+    "json": "json_format",
+    "stream-json": "stream_json_format",
+    "--permission-mode": "permission_mode_flag",
+    "plan": "plan_permission",
+    "acceptEdits": "accept_edits_permission",
+    "--no-session-persistence": "no_session_persistence",
+    "--verbose": "verbose",
+    "--include-partial-messages": "include_partial_messages",
+}
+
+
+@dataclass(frozen=True)
+class RuntimeLaunchSpec:
+    runtime_id: str
+    protocol_version: int
+    executable_identity: ExecutableIdentity
+    arguments: tuple[str, ...]
+    cwd: str
+    permission_mode: str
+    timeout_seconds: int
+    environment_items: tuple[tuple[str, str], ...]
+    trust_level: str
+    policy_decision_id: str
+    launch_nonce: str = field(init=False, default_factory=generate_launch_nonce)
+
+    def __post_init__(self) -> None:
+        _validate_nonempty_string(self.runtime_id, "runtime_id")
+        if (
+            not isinstance(self.protocol_version, int)
+            or isinstance(self.protocol_version, bool)
+            or self.protocol_version < 1
+        ):
+            raise TypeError("protocol_version must be a positive integer")
+        if not isinstance(self.executable_identity, ExecutableIdentity):
+            raise TypeError("executable_identity must be an ExecutableIdentity")
+        arguments = tuple(self.arguments)
+        for argument in arguments:
+            if not isinstance(argument, str):
+                raise TypeError("runtime arguments must be strings")
+            if argument not in _ARGUMENT_KINDS:
+                raise ValueError("runtime argument is outside the allowed vocabulary")
+        object.__setattr__(self, "arguments", arguments)
+        if not isinstance(self.cwd, (str, Path)):
+            raise TypeError("cwd must be a path")
+        object.__setattr__(
+            self, "cwd", str(Path(self.cwd).expanduser().resolve(strict=False))
+        )
+        if self.permission_mode not in {"plan", "acceptEdits"}:
+            raise ValueError("permission_mode is not allowed")
+        if (
+            not isinstance(self.timeout_seconds, int)
+            or isinstance(self.timeout_seconds, bool)
+            or self.timeout_seconds < 1
+        ):
+            raise TypeError("timeout_seconds must be a positive integer")
+        environment_items = _validate_environment_items(self.environment_items)
+        object.__setattr__(self, "environment_items", environment_items)
+        _validate_nonempty_string(self.trust_level, "trust_level")
+        _validate_nonempty_string(self.policy_decision_id, "policy_decision_id")
+        if (
+            len(self.launch_nonce) != 64
+            or any(character not in string.hexdigits for character in self.launch_nonce)
+        ):
+            raise ValueError("launch nonce is invalid")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        runtime_id: str,
+        protocol_version: int,
+        executable_identity: ExecutableIdentity,
+        arguments: tuple[str, ...],
+        cwd: str | Path,
+        permission_mode: str,
+        timeout_seconds: int,
+        environment: Mapping[str, str],
+        trust_level: str,
+        policy_decision_id: str,
+    ) -> "RuntimeLaunchSpec":
+        if not isinstance(environment, MappingABC):
+            raise TypeError("environment must be a mapping")
+        argument_items = tuple(arguments)
+        environment_items = tuple(environment.items())
+        provider_values = {
+            entry[1]
+            for entry in environment_items
+            if isinstance(entry, (list, tuple)) and len(entry) == 2
+        }
+        if any(argument in provider_values for argument in argument_items):
+            raise ValueError("environment values cannot appear in runtime arguments")
+        return cls(
+            runtime_id=runtime_id,
+            protocol_version=protocol_version,
+            executable_identity=executable_identity,
+            arguments=argument_items,
+            cwd=str(cwd),
+            permission_mode=permission_mode,
+            timeout_seconds=timeout_seconds,
+            environment_items=environment_items,
+            trust_level=trust_level,
+            policy_decision_id=policy_decision_id,
+        )
+
+    @property
+    def environment(self) -> Mapping[str, str]:
+        return MappingProxyType(dict(self.environment_items))
+
+    def private_frame(self) -> bytes:
+        frame = {
+            "runtime_id": self.runtime_id,
+            "protocol_version": self.protocol_version,
+            "executable_identity": self.executable_identity.to_public_dict(),
+            "arguments": list(self.arguments),
+            "cwd": self.cwd,
+            "permission_mode": self.permission_mode,
+            "timeout_seconds": self.timeout_seconds,
+            "environment_keys": [key for key, _ in self.environment_items],
+            "trust_level": self.trust_level,
+            "policy_decision_id": self.policy_decision_id,
+            "launch_nonce": self.launch_nonce,
+        }
+        return json.dumps(
+            frame, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+
+    def public_metadata(self) -> dict[str, Any]:
+        frame = self.private_frame()
+        return {
+            "runtime_id": self.runtime_id,
+            "protocol_version": self.protocol_version,
+            "executable_identity": self.executable_identity.to_public_dict(),
+            "argument_kinds": [_ARGUMENT_KINDS[value] for value in self.arguments],
+            "cwd": self.cwd,
+            "permission_mode": self.permission_mode,
+            "timeout_seconds": self.timeout_seconds,
+            "environment_keys": [key for key, _ in self.environment_items],
+            "trust_level": self.trust_level,
+            "policy_decision_id": self.policy_decision_id,
+            "launch_nonce": self.launch_nonce,
+            "launch_contract_sha256": sha256(frame).hexdigest(),
+        }
+
+
+def _validate_nonempty_string(value: object, field_name: str) -> None:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise TypeError(f"{field_name} must be a non-empty string")
+
+
+def _validate_environment_items(
+    entries: object,
+) -> tuple[tuple[str, str], ...]:
+    if not isinstance(entries, (list, tuple)):
+        raise TypeError("environment_items must be a sequence")
+    normalized: list[tuple[str, str]] = []
+    folded_keys: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            raise TypeError("environment_items contains an invalid pair")
+        key, value = entry
+        if (
+            not isinstance(key, str)
+            or not isinstance(value, str)
+            or not key
+            or "\x00" in key
+            or "\x00" in value
+        ):
+            raise TypeError("environment_items contains an invalid entry")
+        folded = key.casefold()
+        if folded in folded_keys:
+            raise ValueError("environment_items contains duplicate keys")
+        folded_keys.add(folded)
+        normalized.append((key, value))
+    return tuple(sorted(normalized))
+
+
+def build_runtime_launch_spec(
+    *,
+    runtime_candidate: RuntimeExecutableCandidate,
+    provider_env: Mapping[str, str],
+    model_override: str | None,
+    cwd: str | Path,
+    workspace_root: str | Path,
+    artifact_root: str | Path,
+    permission_mode: str,
+    timeout_seconds: int,
+    arguments: tuple[str, ...],
+    policy: RuntimeSecurityPolicy,
+    allow_unsafe_runtime: bool,
+) -> RuntimeLaunchSpec:
+    validated_provider = policy.validate_provider_env(provider_env)
+    identity = ExecutableIdentity.capture(runtime_candidate.canonical_path)
+    decision = authorize_runtime(
+        candidate=runtime_candidate,
+        identity=identity,
+        policy=policy,
+        allow_unsafe_runtime=allow_unsafe_runtime,
+    )
+    provider_values = {value for _, value in validated_provider}
+    if any(argument in provider_values for argument in arguments):
+        raise ValueError("provider environment values cannot appear in runtime arguments")
+
+    environment = dict(validated_provider)
+    if model_override is not None:
+        _validate_nonempty_string(model_override, "model_override")
+        environment["ANTHROPIC_MODEL"] = model_override
+    environment["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+    environment["CC_ORCHESTRATOR_WORKSPACE_ROOT"] = str(
+        Path(workspace_root).expanduser().resolve(strict=False)
+    )
+    environment["CC_ORCHESTRATOR_ARTIFACT_ROOT"] = str(
+        Path(artifact_root).expanduser().resolve(strict=False)
+    )
+    environment.setdefault("PYTHONIOENCODING", "utf-8")
+    environment.setdefault("PYTHONUTF8", "1")
+    if os.name != "nt":
+        environment.setdefault("LANG", "C.UTF-8")
+        environment.setdefault("LC_ALL", "C.UTF-8")
+    return RuntimeLaunchSpec.create(
+        runtime_id=decision.runtime_id,
+        protocol_version=1,
+        executable_identity=identity,
+        arguments=arguments,
+        cwd=cwd,
+        permission_mode=permission_mode,
+        timeout_seconds=timeout_seconds,
+        environment=environment,
+        trust_level=decision.trust_level,
+        policy_decision_id=decision.policy_decision_id,
+    )
 
 
 @dataclass(frozen=True)

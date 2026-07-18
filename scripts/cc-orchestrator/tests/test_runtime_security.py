@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import json
+import inspect
+import os
+import shutil
 import sys
 import tempfile
 import unittest
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
+from hashlib import sha256
 from pathlib import Path
+from unittest.mock import patch
 
 TESTS_DIR = Path(__file__).resolve().parent
 if str(TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(TESTS_DIR))
 
 from _support import ORCHESTRATOR_DIR  # noqa: F401
+import runtime_security
 from runtime_security import (
     ApprovedUnsafeRuntime,
     PinnedExecutableIdentity,
@@ -21,9 +27,14 @@ from runtime_security import (
     authorize_runtime,
 )
 
+ExecutableIdentity = getattr(runtime_security, "ExecutableIdentity", None)
+RuntimeLaunchSpec = getattr(runtime_security, "RuntimeLaunchSpec", None)
+build_runtime_launch_spec = getattr(runtime_security, "build_runtime_launch_spec", None)
+
 
 ABSOLUTE_DENY_CASES = [
     "PATH", "Path", "PATHEXT", "COMSPEC", "SHELL", "CLAUDE_CODE_BIN",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "LANG", "LC_ALL",
     "PYTHONPATH", "PYTHONHOME", "NODE_OPTIONS", "NODE_PATH",
     "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
     "CC_ORCHESTRATOR_ARTIFACT_ROOT", "BASH_ENV", "ENV", "ZDOTDIR",
@@ -32,6 +43,432 @@ ABSOLUTE_DENY_CASES = [
     "RUBYOPT", "RUBYLIB", "PERL5OPT", "PERL5LIB", "GIT_CONFIG_COUNT",
     "GIT_CONFIG_GLOBAL", "GIT_SSH_COMMAND", "SSLKEYLOGFILE",
 ]
+
+
+class ExecutableIdentityTests(unittest.TestCase):
+    def test_identity_contract_exists(self) -> None:
+        self.assertIsNotNone(ExecutableIdentity)
+
+    def test_capture_records_strict_metadata_and_chunked_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            executable = Path(temp_dir) / "runtime.bin"
+            payload = b"a" * (1024 * 1024) + b"tail"
+            executable.write_bytes(payload)
+
+            identity = ExecutableIdentity.capture(executable)
+
+            stat = executable.stat()
+            self.assertEqual(identity.canonical_path, str(executable.resolve(strict=True)))
+            self.assertEqual(identity.size, len(payload))
+            self.assertEqual(identity.mtime_ns, stat.st_mtime_ns)
+            self.assertEqual(identity.sha256, sha256(payload).hexdigest())
+            expected_file_id = (
+                (stat.st_dev, stat.st_ino) if stat.st_dev or stat.st_ino else None
+            )
+            self.assertEqual(identity.file_id, expected_file_id)
+            self.assertEqual(identity.target_kind, "native")
+            self.assertIsNone(identity.interpreter_identity)
+            self.assertTrue(identity.matches_current_file())
+
+    def test_current_match_detects_metadata_and_digest_only_replacements(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            executable = Path(temp_dir) / "runtime.bin"
+            executable.write_bytes(b"first")
+            metadata_identity = ExecutableIdentity.capture(executable)
+            later_mtime = metadata_identity.mtime_ns + 1_000_000_000
+            executable.write_bytes(b"other")
+            os.utime(executable, ns=(later_mtime, later_mtime))
+            self.assertFalse(metadata_identity.matches_current_file())
+
+            digest_identity = ExecutableIdentity.capture(executable)
+            executable.write_bytes(b"third")
+            os.utime(
+                executable,
+                ns=(digest_identity.mtime_ns, digest_identity.mtime_ns),
+            )
+            self.assertFalse(digest_identity.matches_current_file())
+
+    def test_public_identity_round_trip_is_strict_and_recursive(self) -> None:
+        interpreter = ExecutableIdentity.capture(sys.executable)
+        identity = replace(
+            interpreter,
+            target_kind="python",
+            interpreter_identity=interpreter,
+        )
+
+        public = identity.to_public_dict()
+
+        self.assertEqual(ExecutableIdentity.from_public_dict(public), identity)
+        invalid = (
+            {key: value for key, value in public.items() if key != "mtime_ns"},
+            {**public, "extra": True},
+            {**public, "size": True},
+            {**public, "mtime_ns": "1"},
+            {**public, "sha256": "z" * 64},
+            {**public, "file_id": [1, True]},
+        )
+        for payload in invalid:
+            with self.subTest(keys=tuple(payload)), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                ExecutableIdentity.from_public_dict(payload)
+
+        cyclic = dict(public)
+        cyclic["interpreter_identity"] = cyclic
+        with self.assertRaises((TypeError, ValueError)):
+            ExecutableIdentity.from_public_dict(cyclic)
+
+        too_deep = ExecutableIdentity.capture(sys.executable).to_public_dict()
+        for _ in range(4):
+            too_deep = {**public, "interpreter_identity": too_deep}
+        with self.assertRaises((TypeError, ValueError)):
+            ExecutableIdentity.from_public_dict(too_deep)
+
+    def test_python_and_shebang_wrappers_capture_full_interpreter_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            python_wrapper = directory / "runtime.py"
+            python_wrapper.write_text("print('fixture')\n", encoding="utf-8")
+            python_identity = ExecutableIdentity.capture(python_wrapper)
+            expected_python = ExecutableIdentity.capture(sys.executable)
+            self.assertEqual(python_identity.target_kind, "python")
+            self.assertEqual(python_identity.interpreter_identity, expected_python)
+
+            env_interpreter = shutil.which(Path(sys.executable).stem)
+            if env_interpreter is None:
+                self.skipTest("current Python interpreter is not on PATH")
+            shebang_wrapper = directory / "runtime-wrapper"
+            shebang_wrapper.write_text(
+                f"#!/usr/bin/env {Path(sys.executable).stem}\nfixture\n",
+                encoding="utf-8",
+            )
+            shebang_identity = ExecutableIdentity.capture(shebang_wrapper)
+            self.assertEqual(shebang_identity.target_kind, "shebang")
+            self.assertEqual(
+                shebang_identity.interpreter_identity,
+                ExecutableIdentity.capture(Path(env_interpreter).resolve(strict=True)),
+            )
+            self.assertTrue(shebang_identity.matches_current_file())
+
+    def test_platform_wrappers_use_verified_absolute_interpreters(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            cases = (("cmd", "cmd"), ("bat", "cmd"), ("ps1", "powershell"))
+            for suffix, expected_kind in cases:
+                wrapper = directory / f"runtime.{suffix}"
+                wrapper.write_text("fixture\n", encoding="utf-8")
+                try:
+                    identity = ExecutableIdentity.capture(wrapper)
+                except FileNotFoundError:
+                    if os.name == "nt":
+                        raise
+                    continue
+                with self.subTest(suffix=suffix):
+                    self.assertEqual(identity.target_kind, expected_kind)
+                    self.assertIsNotNone(identity.interpreter_identity)
+                    self.assertTrue(Path(identity.interpreter_identity.canonical_path).is_absolute())
+                    self.assertTrue(identity.interpreter_identity.matches_current_file())
+
+    @unittest.skipUnless(os.name == "nt", "Windows interpreter verification")
+    def test_windows_wrappers_ignore_forged_system_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            fake_cmd = directory / "System32" / "cmd.exe"
+            fake_powershell = (
+                directory
+                / "System32"
+                / "WindowsPowerShell"
+                / "v1.0"
+                / "powershell.exe"
+            )
+            for executable in (fake_cmd, fake_powershell):
+                executable.parent.mkdir(parents=True, exist_ok=True)
+                executable.write_bytes(b"forged")
+            cmd_wrapper = directory / "runtime.cmd"
+            ps_wrapper = directory / "runtime.ps1"
+            cmd_wrapper.write_text("fixture\n", encoding="utf-8")
+            ps_wrapper.write_text("fixture\n", encoding="utf-8")
+
+            with patch.dict(os.environ, {"SystemRoot": str(directory)}):
+                cmd_identity = ExecutableIdentity.capture(cmd_wrapper)
+                ps_identity = ExecutableIdentity.capture(ps_wrapper)
+
+            self.assertNotEqual(
+                cmd_identity.interpreter_identity.canonical_path,
+                str(fake_cmd.resolve(strict=True)),
+            )
+            self.assertNotEqual(
+                ps_identity.interpreter_identity.canonical_path,
+                str(fake_powershell.resolve(strict=True)),
+            )
+
+    def test_recursive_capture_rejects_cycles_and_chains_over_four_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            first = directory / "first"
+            second = directory / "second"
+            first.write_text(f"#!{second.resolve().as_posix()}\n", encoding="utf-8")
+            second.write_text(f"#!{first.resolve().as_posix()}\n", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                ExecutableIdentity.capture(first)
+
+            wrappers = [directory / f"wrapper-{index}" for index in range(4)]
+            for index, wrapper in enumerate(wrappers):
+                interpreter = wrappers[index + 1] if index + 1 < len(wrappers) else Path(sys.executable)
+                wrapper.write_text(
+                    f"#!{interpreter.resolve().as_posix()}\n", encoding="utf-8"
+                )
+            accepted = ExecutableIdentity.capture(wrappers[1])
+            self.assertEqual(self._identity_depth(accepted), 4)
+            with self.assertRaises(ValueError):
+                ExecutableIdentity.capture(wrappers[0])
+
+    @staticmethod
+    def _identity_depth(identity: ExecutableIdentity) -> int:
+        depth = 0
+        current = identity
+        while current is not None:
+            depth += 1
+            current = current.interpreter_identity
+        return depth
+
+
+class RuntimeLaunchSpecTests(unittest.TestCase):
+    arguments = (
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--permission-mode",
+        "plan",
+        "--no-session-persistence",
+        "--verbose",
+        "--include-partial-messages",
+    )
+
+    def test_launch_spec_contract_exists(self) -> None:
+        self.assertIsNotNone(RuntimeLaunchSpec)
+        self.assertIsNotNone(build_runtime_launch_spec)
+
+    def create_spec(
+        self,
+        directory: Path,
+        *,
+        arguments: object | None = None,
+        environment: object | None = None,
+    ) -> object:
+        return RuntimeLaunchSpec.create(
+            runtime_id="fixture-runtime",
+            protocol_version=1,
+            executable_identity=ExecutableIdentity.capture(sys.executable),
+            arguments=list(self.arguments) if arguments is None else arguments,
+            cwd=directory,
+            permission_mode="plan",
+            timeout_seconds=30,
+            environment={"ANTHROPIC_API_KEY": "fixture-secret"}
+            if environment is None
+            else environment,
+            trust_level="trusted_default",
+            policy_decision_id="decision-fixture",
+        )
+
+    def test_spec_is_deeply_immutable_and_nonce_cannot_be_injected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            arguments = list(self.arguments)
+            environment = {"ANTHROPIC_API_KEY": "fixture-secret"}
+            spec = self.create_spec(
+                directory, arguments=arguments, environment=environment
+            )
+            arguments.append("json")
+            environment["ANTHROPIC_API_KEY"] = "changed-secret"
+
+            self.assertEqual(spec.arguments, self.arguments)
+            self.assertEqual(spec.environment["ANTHROPIC_API_KEY"], "fixture-secret")
+            with self.assertRaises(TypeError):
+                spec.environment["NEW_KEY"] = "value"
+            with self.assertRaises(FrozenInstanceError):
+                spec.cwd = "changed"
+            self.assertNotIn("launch_nonce", inspect.signature(RuntimeLaunchSpec).parameters)
+            with self.assertRaises(ValueError):
+                replace(spec, launch_nonce="0" * 64)
+            self.assertEqual(len(spec.launch_nonce), 64)
+            int(spec.launch_nonce, 16)
+
+            nonces = {self.create_spec(directory).launch_nonce for _ in range(1000)}
+            self.assertEqual(len(nonces), 1000)
+
+    def test_private_frame_is_exact_and_public_projection_contains_no_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            secret = "provider-secret-never-public"
+            spec = self.create_spec(
+                directory,
+                environment={
+                    "ANTHROPIC_API_KEY": secret,
+                    "ANTHROPIC_MODEL": "provider-model-never-public",
+                },
+            )
+
+            frame = spec.private_frame()
+            decoded = json.loads(frame.decode("utf-8"))
+            self.assertEqual(frame, spec.private_frame())
+            self.assertEqual(
+                set(decoded),
+                {
+                    "runtime_id",
+                    "protocol_version",
+                    "executable_identity",
+                    "arguments",
+                    "cwd",
+                    "permission_mode",
+                    "timeout_seconds",
+                    "environment_keys",
+                    "trust_level",
+                    "policy_decision_id",
+                    "launch_nonce",
+                },
+            )
+            self.assertEqual(decoded["arguments"], list(self.arguments))
+            self.assertEqual(
+                decoded["environment_keys"], ["ANTHROPIC_API_KEY", "ANTHROPIC_MODEL"]
+            )
+            self.assertEqual(
+                decoded["executable_identity"],
+                spec.executable_identity.to_public_dict(),
+            )
+
+            public = spec.public_metadata()
+            serialized_public = json.dumps(public, sort_keys=True)
+            self.assertEqual(
+                public["launch_contract_sha256"], sha256(frame).hexdigest()
+            )
+            self.assertEqual(
+                public["argument_kinds"],
+                [
+                    "prompt_stdin",
+                    "output_format_flag",
+                    "stream_json_format",
+                    "permission_mode_flag",
+                    "plan_permission",
+                    "no_session_persistence",
+                    "verbose",
+                    "include_partial_messages",
+                ],
+            )
+            self.assertNotIn("arguments", public)
+            self.assertNotIn(secret, serialized_public)
+            self.assertNotIn("provider-model-never-public", serialized_public)
+            public["environment_keys"].append("MUTATED")
+            self.assertNotIn("MUTATED", spec.public_metadata()["environment_keys"])
+
+    def test_create_rejects_arguments_outside_claude_control_vocabulary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            for arguments in (
+                ("-p", "prompt text"),
+                ("--model", "claude-secret"),
+                ("-p", 1),
+            ):
+                with self.subTest(arguments=arguments), self.assertRaises(
+                    (TypeError, ValueError)
+                ):
+                    self.create_spec(directory, arguments=arguments)
+
+            with self.assertRaises(ValueError):
+                self.create_spec(
+                    directory,
+                    arguments=("-p", "json"),
+                    environment={"ANTHROPIC_MODEL": "json"},
+                )
+
+    def test_builder_validates_provider_first_and_does_not_mutate_inputs(self) -> None:
+        missing = Path(tempfile.gettempdir()) / "definitely-missing-runtime-task-3.exe"
+        candidate = RuntimeExecutableCandidate(
+            canonical_path=str(missing),
+            source="fixture",
+            trust_class="trusted_default",
+        )
+        provider_env = {"PATH": "provider-secret"}
+        with self.assertRaises(RuntimeSecurityError) as raised:
+            build_runtime_launch_spec(
+                runtime_candidate=candidate,
+                provider_env=provider_env,
+                model_override=None,
+                cwd=missing,
+                workspace_root=missing,
+                artifact_root=missing,
+                permission_mode="plan",
+                timeout_seconds=30,
+                arguments=self.arguments,
+                policy=RuntimeSecurityPolicy.default(),
+                allow_unsafe_runtime=False,
+            )
+        self.assertEqual(raised.exception.code, "provider_env_forbidden")
+        self.assertEqual(provider_env, {"PATH": "provider-secret"})
+
+    def test_builder_canonicalizes_paths_authorizes_and_adds_owned_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            cwd = directory / "cwd"
+            workspace = directory / "workspace"
+            artifacts = directory / "artifacts"
+            for path in (cwd, workspace, artifacts):
+                path.mkdir()
+            candidate = RuntimeExecutableCandidate(
+                canonical_path=str(Path(sys.executable).resolve(strict=True)),
+                source="fixture",
+                trust_class="trusted_default",
+            )
+            provider_env = {"ANTHROPIC_API_KEY": "provider-secret"}
+
+            spec = build_runtime_launch_spec(
+                runtime_candidate=candidate,
+                provider_env=provider_env,
+                model_override="controller-model",
+                cwd=cwd / ".." / "cwd",
+                workspace_root=workspace / ".." / "workspace",
+                artifact_root=artifacts / ".." / "artifacts",
+                permission_mode="plan",
+                timeout_seconds=30,
+                arguments=self.arguments,
+                policy=RuntimeSecurityPolicy.default(),
+                allow_unsafe_runtime=False,
+            )
+
+            self.assertEqual(spec.cwd, str(cwd.resolve(strict=True)))
+            self.assertEqual(spec.runtime_id, "trusted-default")
+            self.assertEqual(spec.trust_level, "trusted_default")
+            self.assertEqual(spec.environment["ANTHROPIC_API_KEY"], "provider-secret")
+            self.assertEqual(spec.environment["ANTHROPIC_MODEL"], "controller-model")
+            self.assertEqual(
+                spec.environment["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"], "1"
+            )
+            self.assertEqual(
+                spec.environment["CC_ORCHESTRATOR_WORKSPACE_ROOT"],
+                str(workspace.resolve(strict=True)),
+            )
+            self.assertEqual(
+                spec.environment["CC_ORCHESTRATOR_ARTIFACT_ROOT"],
+                str(artifacts.resolve(strict=True)),
+            )
+            self.assertEqual(spec.environment["PYTHONIOENCODING"], "utf-8")
+            self.assertEqual(spec.environment["PYTHONUTF8"], "1")
+            self.assertEqual(provider_env, {"ANTHROPIC_API_KEY": "provider-secret"})
+
+            with self.assertRaises(ValueError):
+                build_runtime_launch_spec(
+                    runtime_candidate=candidate,
+                    provider_env={"ANTHROPIC_MODEL": "json"},
+                    model_override=None,
+                    cwd=cwd,
+                    workspace_root=workspace,
+                    artifact_root=artifacts,
+                    permission_mode="plan",
+                    timeout_seconds=30,
+                    arguments=("-p", "json"),
+                    policy=RuntimeSecurityPolicy.default(),
+                    allow_unsafe_runtime=False,
+                )
 
 
 class ProviderEnvironmentPolicyTests(unittest.TestCase):
