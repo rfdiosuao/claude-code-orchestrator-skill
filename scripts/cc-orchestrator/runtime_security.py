@@ -47,6 +47,8 @@ _ABSOLUTE_DENY_ENV_KEYS = frozenset(
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
         "LANG",
         "LC_ALL",
+        "PYTHONIOENCODING",
+        "PYTHONUTF8",
         "PYTHONPATH",
         "PYTHONHOME",
         "NODE_OPTIONS",
@@ -174,6 +176,23 @@ class ExecutableIdentity:
     file_id: tuple[int, int] | None
     target_kind: str
     interpreter_identity: "ExecutableIdentity | None"
+
+    def __post_init__(self) -> None:
+        file_id = self.file_id
+        if file_id is not None:
+            if (
+                not isinstance(file_id, (list, tuple))
+                or len(file_id) != 2
+                or any(
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value < 0
+                    for value in file_id
+                )
+            ):
+                raise TypeError("Executable identity has an invalid file id.")
+            object.__setattr__(self, "file_id", (file_id[0], file_id[1]))
+        _validate_executable_identity(self, depth=1, seen=set())
 
     @classmethod
     def capture(cls, executable: str | Path) -> "ExecutableIdentity":
@@ -360,6 +379,85 @@ def _file_id(stat_result: os.stat_result) -> tuple[int, int] | None:
     return (stat_result.st_dev, stat_result.st_ino)
 
 
+def _validate_executable_identity(
+    identity: ExecutableIdentity,
+    *,
+    depth: int,
+    seen: set[int],
+) -> None:
+    if depth > MAX_IDENTITY_DEPTH:
+        raise ValueError("Executable identity exceeds maximum interpreter depth.")
+    if not isinstance(identity, ExecutableIdentity):
+        raise TypeError("Interpreter identity must be an ExecutableIdentity.")
+    if id(identity) in seen:
+        raise ValueError("Executable identity contains an interpreter cycle.")
+    seen.add(id(identity))
+    try:
+        if (
+            not isinstance(identity.canonical_path, str)
+            or not identity.canonical_path
+            or "\x00" in identity.canonical_path
+            or not Path(identity.canonical_path).is_absolute()
+        ):
+            raise ValueError("Executable identity has an invalid canonical path.")
+        try:
+            resolved_path = str(
+                Path(identity.canonical_path).expanduser().resolve(strict=False)
+            )
+        except (OSError, RuntimeError) as error:
+            raise ValueError(
+                "Executable identity has an invalid canonical path."
+            ) from error
+        if identity.canonical_path != resolved_path:
+            raise ValueError("Executable identity path is not canonical.")
+        for field_name, value in (
+            ("size", identity.size),
+            ("mtime_ns", identity.mtime_ns),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise TypeError(f"Executable identity has an invalid {field_name}.")
+        if (
+            not isinstance(identity.sha256, str)
+            or len(identity.sha256) != 64
+            or any(
+                character not in string.hexdigits for character in identity.sha256
+            )
+        ):
+            raise ValueError("Executable identity has an invalid SHA-256 digest.")
+        if identity.file_id is not None and (
+            not isinstance(identity.file_id, tuple)
+            or len(identity.file_id) != 2
+            or any(
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+                for value in identity.file_id
+            )
+        ):
+            raise TypeError("Executable identity has an invalid file id.")
+        if identity.target_kind not in {
+            "native",
+            "cmd",
+            "powershell",
+            "python",
+            "shebang",
+        }:
+            raise ValueError("Executable identity has an invalid target kind.")
+        interpreter = identity.interpreter_identity
+        if interpreter is not None and not isinstance(interpreter, ExecutableIdentity):
+            raise TypeError("Interpreter identity must be an ExecutableIdentity.")
+        if (identity.target_kind == "native") != (interpreter is None):
+            raise ValueError("Executable identity has an inconsistent interpreter.")
+        if interpreter is not None:
+            _validate_executable_identity(
+                interpreter,
+                depth=depth + 1,
+                seen=seen,
+            )
+    finally:
+        seen.remove(id(identity))
+
+
 def _stat_identity(stat_result: os.stat_result) -> tuple[int, int, int, tuple[int, int] | None]:
     return (
         stat_result.st_size,
@@ -457,6 +555,24 @@ _ARGUMENT_KINDS = {
 }
 
 
+def _validate_runtime_arguments(
+    arguments: object,
+    *,
+    forbidden_values: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    if not isinstance(arguments, (list, tuple)):
+        raise TypeError("runtime arguments must be a sequence")
+    normalized = tuple(arguments)
+    for argument in normalized:
+        if not isinstance(argument, str):
+            raise TypeError("runtime arguments must be strings")
+        if argument not in _ARGUMENT_KINDS:
+            raise ValueError("runtime argument is outside the allowed vocabulary")
+        if argument in forbidden_values:
+            raise ValueError("environment values cannot appear in runtime arguments")
+    return normalized
+
+
 @dataclass(frozen=True)
 class RuntimeLaunchSpec:
     runtime_id: str
@@ -481,12 +597,7 @@ class RuntimeLaunchSpec:
             raise TypeError("protocol_version must be a positive integer")
         if not isinstance(self.executable_identity, ExecutableIdentity):
             raise TypeError("executable_identity must be an ExecutableIdentity")
-        arguments = tuple(self.arguments)
-        for argument in arguments:
-            if not isinstance(argument, str):
-                raise TypeError("runtime arguments must be strings")
-            if argument not in _ARGUMENT_KINDS:
-                raise ValueError("runtime argument is outside the allowed vocabulary")
+        arguments = _validate_runtime_arguments(self.arguments)
         object.__setattr__(self, "arguments", arguments)
         if not isinstance(self.cwd, (str, Path)):
             raise TypeError("cwd must be a path")
@@ -503,6 +614,10 @@ class RuntimeLaunchSpec:
             raise TypeError("timeout_seconds must be a positive integer")
         environment_items = _validate_environment_items(self.environment_items)
         object.__setattr__(self, "environment_items", environment_items)
+        _validate_runtime_arguments(
+            arguments,
+            forbidden_values=tuple(value for _, value in environment_items),
+        )
         _validate_nonempty_string(self.trust_level, "trust_level")
         _validate_nonempty_string(self.policy_decision_id, "policy_decision_id")
         if (
@@ -528,20 +643,12 @@ class RuntimeLaunchSpec:
     ) -> "RuntimeLaunchSpec":
         if not isinstance(environment, MappingABC):
             raise TypeError("environment must be a mapping")
-        argument_items = tuple(arguments)
         environment_items = tuple(environment.items())
-        provider_values = {
-            entry[1]
-            for entry in environment_items
-            if isinstance(entry, (list, tuple)) and len(entry) == 2
-        }
-        if any(argument in provider_values for argument in argument_items):
-            raise ValueError("environment values cannot appear in runtime arguments")
         return cls(
             runtime_id=runtime_id,
             protocol_version=protocol_version,
             executable_identity=executable_identity,
-            arguments=argument_items,
+            arguments=arguments,
             cwd=str(cwd),
             permission_mode=permission_mode,
             timeout_seconds=timeout_seconds,
@@ -637,6 +744,10 @@ def build_runtime_launch_spec(
     allow_unsafe_runtime: bool,
 ) -> RuntimeLaunchSpec:
     validated_provider = policy.validate_provider_env(provider_env)
+    argument_items = _validate_runtime_arguments(
+        arguments,
+        forbidden_values=tuple(value for _, value in validated_provider),
+    )
     identity = ExecutableIdentity.capture(runtime_candidate.canonical_path)
     decision = authorize_runtime(
         candidate=runtime_candidate,
@@ -644,10 +755,6 @@ def build_runtime_launch_spec(
         policy=policy,
         allow_unsafe_runtime=allow_unsafe_runtime,
     )
-    provider_values = {value for _, value in validated_provider}
-    if any(argument in provider_values for argument in arguments):
-        raise ValueError("provider environment values cannot appear in runtime arguments")
-
     environment = dict(validated_provider)
     if model_override is not None:
         _validate_nonempty_string(model_override, "model_override")
@@ -659,16 +766,19 @@ def build_runtime_launch_spec(
     environment["CC_ORCHESTRATOR_ARTIFACT_ROOT"] = str(
         Path(artifact_root).expanduser().resolve(strict=False)
     )
-    environment.setdefault("PYTHONIOENCODING", "utf-8")
-    environment.setdefault("PYTHONUTF8", "1")
+    environment["PYTHONIOENCODING"] = "utf-8"
+    environment["PYTHONUTF8"] = "1"
     if os.name != "nt":
-        environment.setdefault("LANG", "C.UTF-8")
-        environment.setdefault("LC_ALL", "C.UTF-8")
+        environment["LANG"] = "C.UTF-8"
+        environment["LC_ALL"] = "C.UTF-8"
+    else:
+        environment.pop("LANG", None)
+        environment.pop("LC_ALL", None)
     return RuntimeLaunchSpec.create(
         runtime_id=decision.runtime_id,
         protocol_version=1,
         executable_identity=identity,
-        arguments=arguments,
+        arguments=argument_items,
         cwd=cwd,
         permission_mode=permission_mode,
         timeout_seconds=timeout_seconds,

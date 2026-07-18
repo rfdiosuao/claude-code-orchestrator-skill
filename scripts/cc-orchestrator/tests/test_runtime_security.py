@@ -35,6 +35,7 @@ build_runtime_launch_spec = getattr(runtime_security, "build_runtime_launch_spec
 ABSOLUTE_DENY_CASES = [
     "PATH", "Path", "PATHEXT", "COMSPEC", "SHELL", "CLAUDE_CODE_BIN",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "LANG", "LC_ALL",
+    "PYTHONIOENCODING", "PYTHONUTF8",
     "PYTHONPATH", "PYTHONHOME", "NODE_OPTIONS", "NODE_PATH",
     "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
     "CC_ORCHESTRATOR_ARTIFACT_ROOT", "BASH_ENV", "ENV", "ZDOTDIR",
@@ -123,6 +124,100 @@ class ExecutableIdentityTests(unittest.TestCase):
             too_deep = {**public, "interpreter_identity": too_deep}
         with self.assertRaises((TypeError, ValueError)):
             ExecutableIdentity.from_public_dict(too_deep)
+
+    def test_direct_construction_defensively_copies_file_id_for_launch_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            captured = ExecutableIdentity.capture(sys.executable)
+            source_file_id = [11, 22]
+            identity = ExecutableIdentity(
+                canonical_path=captured.canonical_path,
+                size=captured.size,
+                mtime_ns=captured.mtime_ns,
+                sha256=captured.sha256,
+                file_id=source_file_id,
+                target_kind="native",
+                interpreter_identity=None,
+            )
+            spec = RuntimeLaunchSpec.create(
+                runtime_id="fixture-runtime",
+                protocol_version=1,
+                executable_identity=identity,
+                arguments=("-p",),
+                cwd=directory,
+                permission_mode="plan",
+                timeout_seconds=30,
+                environment={},
+                trust_level="trusted_default",
+                policy_decision_id="decision-fixture",
+            )
+            original_frame = spec.private_frame()
+            original_hash = spec.public_metadata()["launch_contract_sha256"]
+
+            source_file_id[0] = 99
+            source_file_id.append(33)
+
+            self.assertEqual(identity.file_id, (11, 22))
+            self.assertEqual(spec.private_frame(), original_frame)
+            self.assertEqual(
+                spec.public_metadata()["launch_contract_sha256"], original_hash
+            )
+
+    def test_direct_construction_rejects_invalid_scalars_and_recursive_chains(self) -> None:
+        captured = ExecutableIdentity.capture(sys.executable)
+        noncanonical_path = str(
+            Path(captured.canonical_path).parent
+            / "unused-directory"
+            / ".."
+            / Path(captured.canonical_path).name
+        )
+        invalid_changes = (
+            {"canonical_path": True},
+            {"canonical_path": "relative.exe"},
+            {"canonical_path": noncanonical_path},
+            {"size": True},
+            {"size": -1},
+            {"mtime_ns": True},
+            {"mtime_ns": -1},
+            {"sha256": "bad"},
+            {"file_id": [1, True]},
+            {"file_id": [1]},
+            {"target_kind": "unknown"},
+            {"target_kind": "shebang", "interpreter_identity": object()},
+            {"target_kind": "native", "interpreter_identity": captured},
+        )
+        for changes in invalid_changes:
+            with self.subTest(changes=changes), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                replace(captured, **changes)
+
+        depth_four = captured
+        for _ in range(3):
+            depth_four = replace(
+                captured,
+                target_kind="shebang",
+                interpreter_identity=depth_four,
+            )
+        with self.assertRaises(ValueError):
+            replace(
+                captured,
+                target_kind="shebang",
+                interpreter_identity=depth_four,
+            )
+
+        cyclic = replace(
+            captured,
+            target_kind="shebang",
+            interpreter_identity=captured,
+        )
+        object.__setattr__(cyclic, "interpreter_identity", cyclic)
+        with self.assertRaises(ValueError):
+            replace(
+                captured,
+                target_kind="shebang",
+                interpreter_identity=cyclic,
+            )
 
     def test_python_and_shebang_wrappers_capture_full_interpreter_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -406,6 +501,68 @@ class RuntimeLaunchSpecTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "provider_env_forbidden")
         self.assertEqual(provider_env, {"PATH": "provider-secret"})
 
+        provider_argument_cases = (
+            ({"ANTHROPIC_MODEL": "json"}, ("-p", "json"), "environment values"),
+            ({}, ("-p", "prompt text"), "allowed vocabulary"),
+        )
+        for environment, arguments, expected_message in provider_argument_cases:
+            with self.subTest(arguments=arguments), self.assertRaisesRegex(
+                ValueError, expected_message
+            ):
+                build_runtime_launch_spec(
+                    runtime_candidate=candidate,
+                    provider_env=environment,
+                    model_override=None,
+                    cwd=missing,
+                    workspace_root=missing,
+                    artifact_root=missing,
+                    permission_mode="plan",
+                    timeout_seconds=30,
+                    arguments=arguments,
+                    policy=RuntimeSecurityPolicy.default(),
+                    allow_unsafe_runtime=False,
+                )
+
+    def test_builder_overwrites_controller_owned_utf8_controls(self) -> None:
+        class LeakyValidationPolicy(RuntimeSecurityPolicy):
+            def validate_provider_env(self, provider_env: object) -> tuple[tuple[str, str], ...]:
+                return tuple(sorted(provider_env.items()))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            candidate = RuntimeExecutableCandidate(
+                canonical_path=str(Path(sys.executable).resolve(strict=True)),
+                source="fixture",
+                trust_class="trusted_default",
+            )
+            spec = build_runtime_launch_spec(
+                runtime_candidate=candidate,
+                provider_env={
+                    "PYTHONIOENCODING": "unsafe",
+                    "PYTHONUTF8": "0",
+                    "LANG": "unsafe",
+                    "LC_ALL": "unsafe",
+                },
+                model_override=None,
+                cwd=directory,
+                workspace_root=directory,
+                artifact_root=directory,
+                permission_mode="plan",
+                timeout_seconds=30,
+                arguments=("-p",),
+                policy=LeakyValidationPolicy(),
+                allow_unsafe_runtime=False,
+            )
+
+            self.assertEqual(spec.environment["PYTHONIOENCODING"], "utf-8")
+            self.assertEqual(spec.environment["PYTHONUTF8"], "1")
+            if os.name == "nt":
+                self.assertNotIn("LANG", spec.environment)
+                self.assertNotIn("LC_ALL", spec.environment)
+            else:
+                self.assertEqual(spec.environment["LANG"], "C.UTF-8")
+                self.assertEqual(spec.environment["LC_ALL"], "C.UTF-8")
+
     def test_builder_canonicalizes_paths_authorizes_and_adds_owned_environment(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             directory = Path(temp_dir)
@@ -518,14 +675,19 @@ class ProviderEnvironmentPolicyTests(unittest.TestCase):
     def test_absolute_deny_cannot_be_allowlisted(self) -> None:
         for key in (
             "PATH",
+            "PYTHONIOENCODING",
+            "PYTHONUTF8",
+            "LANG",
+            "LC_ALL",
             "DYLD_LIBRARY_PATH",
             "dyld_insert_libraries",
             "CC_ORCHESTRATOR_WORKSPACE_ROOT",
             "cc_orchestrator_workspace_root",
         ):
-            with self.subTest(key=key), self.assertRaises(RuntimeSecurityError) as raised:
-                RuntimeSecurityPolicy(extra_provider_env_keys=(key,))
-            self.assertEqual(raised.exception.code, "runtime_policy_invalid")
+            with self.subTest(key=key):
+                with self.assertRaises(RuntimeSecurityError) as raised:
+                    RuntimeSecurityPolicy(extra_provider_env_keys=(key,))
+                self.assertEqual(raised.exception.code, "runtime_policy_invalid")
 
     def test_absolute_deny_prefixes_cannot_be_supplied_with_case_variants(self) -> None:
         policy = RuntimeSecurityPolicy.default()
