@@ -135,7 +135,9 @@ def _provider_env_error(
 
 def _is_absolute_deny_env_key(key: str) -> bool:
     folded = key.casefold()
-    return folded in _ABSOLUTE_DENY_ENV_KEYS or folded.startswith("git_config")
+    return folded in _ABSOLUTE_DENY_ENV_KEYS or folded.startswith(
+        ("cc_orchestrator_", "dyld_", "git_config")
+    )
 
 
 def _validate_absolute_path(value: str, field: str) -> str:
@@ -294,7 +296,13 @@ class RuntimeSecurityPolicy:
             "extra_provider_env_keys",
             "unsafe_runtimes",
         }
-        if set(payload) != expected_keys or payload["schema_version"] != POLICY_SCHEMA_VERSION:
+        schema_version = payload.get("schema_version")
+        if (
+            set(payload) != expected_keys
+            or not isinstance(schema_version, int)
+            or isinstance(schema_version, bool)
+            or schema_version != POLICY_SCHEMA_VERSION
+        ):
             raise _policy_error("Runtime policy JSON has an unsupported schema.")
         if payload["runtime_executable"] is not None and not isinstance(payload["runtime_executable"], str):
             raise _policy_error("Runtime policy contains an invalid runtime executable.")
@@ -373,7 +381,7 @@ class RuntimeSecurityPolicy:
                     "Provider environment value exceeds the size limit.",
                     keys=(key,),
                 )
-            total_bytes += len(key.encode("utf-8")) + value_bytes
+            total_bytes += len(key.encode("utf-8")) + 1 + value_bytes + 1
             if total_bytes > MAX_PROVIDER_ENV_BYTES:
                 raise _provider_env_error(
                     "provider_env_too_large",

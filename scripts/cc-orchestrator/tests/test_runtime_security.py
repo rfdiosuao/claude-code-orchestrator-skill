@@ -79,9 +79,28 @@ class ProviderEnvironmentPolicyTests(unittest.TestCase):
         self.assertEqual(validated, (("VENDOR_REGION", "cn"),))
 
     def test_absolute_deny_cannot_be_allowlisted(self) -> None:
-        with self.assertRaises(RuntimeSecurityError) as raised:
-            RuntimeSecurityPolicy(extra_provider_env_keys=("PATH",))
-        self.assertEqual(raised.exception.code, "runtime_policy_invalid")
+        for key in (
+            "PATH",
+            "DYLD_LIBRARY_PATH",
+            "dyld_insert_libraries",
+            "CC_ORCHESTRATOR_WORKSPACE_ROOT",
+            "cc_orchestrator_workspace_root",
+        ):
+            with self.subTest(key=key), self.assertRaises(RuntimeSecurityError) as raised:
+                RuntimeSecurityPolicy(extra_provider_env_keys=(key,))
+            self.assertEqual(raised.exception.code, "runtime_policy_invalid")
+
+    def test_absolute_deny_prefixes_cannot_be_supplied_with_case_variants(self) -> None:
+        policy = RuntimeSecurityPolicy.default()
+        for key in (
+            "DYLD_LIBRARY_PATH",
+            "dyld_library_path",
+            "CC_ORCHESTRATOR_WORKSPACE_ROOT",
+            "cc_orchestrator_workspace_root",
+        ):
+            with self.subTest(key=key), self.assertRaises(RuntimeSecurityError) as raised:
+                policy.validate_provider_env({key: "fixture-secret"})
+            self.assertEqual(raised.exception.code, "provider_env_forbidden")
 
     def test_provider_environment_rejects_folded_duplicates_nuls_and_size_limits(self) -> None:
         policy = RuntimeSecurityPolicy.default()
@@ -104,6 +123,40 @@ class ProviderEnvironmentPolicyTests(unittest.TestCase):
             ) as raised:
                 policy.validate_provider_env(provider_env)
             self.assertNotIn("x" * 100, json.dumps(raised.exception.to_dict()))
+
+    def test_provider_environment_serialized_block_size_has_exact_boundaries(self) -> None:
+        keys = (
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        )
+
+        def environment_at_size(total_bytes: int) -> dict[str, str]:
+            remaining = total_bytes - sum(len(key.encode("utf-8")) + 2 for key in keys)
+            provider_env = {}
+            for key in keys:
+                value_size = min(remaining, 32 * 1024)
+                provider_env[key] = "x" * value_size
+                remaining -= value_size
+            self.assertEqual(remaining, 0)
+            self.assertEqual(
+                sum(
+                    len(key.encode("utf-8")) + 1 + len(value.encode("utf-8")) + 1
+                    for key, value in provider_env.items()
+                ),
+                total_bytes,
+            )
+            return provider_env
+
+        policy = RuntimeSecurityPolicy.default()
+        accepted = environment_at_size(128 * 1024)
+        self.assertEqual(policy.validate_provider_env(accepted), tuple(sorted(accepted.items())))
+        rejected = environment_at_size(128 * 1024 + 1)
+        with self.assertRaises(RuntimeSecurityError) as raised:
+            policy.validate_provider_env(rejected)
+        self.assertEqual(raised.exception.code, "provider_env_too_large")
 
 
 class RuntimeSecurityPolicyConfigTests(unittest.TestCase):
@@ -154,6 +207,7 @@ class RuntimeSecurityPolicyConfigTests(unittest.TestCase):
             }
             invalid_payloads = [
                 "not-json",
+                {**base, "schema_version": True},
                 {**base, "runtime_executable": "relative.exe"},
                 {**base, "extra_provider_env_keys": ["PATH"]},
                 {**base, "unsafe_runtimes": base["unsafe_runtimes"] * 2},
