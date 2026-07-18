@@ -13,6 +13,7 @@ import re
 import shutil
 import signal
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
@@ -20,9 +21,11 @@ import threading
 import time
 import uuid
 import zipfile
+from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 def configure_stdio() -> None:
@@ -56,6 +59,19 @@ configure_stdio()
 
 
 ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from process_identity import ProcessIdentity, capture_process_identity
+from runtime_security import (
+    ExecutableIdentity,
+    RuntimeExecutableCandidate,
+    RuntimeLaunchSpec,
+    RuntimeSecurityError,
+    RuntimeSecurityPolicy,
+    build_runtime_launch_spec,
+    canonical_path,
+)
 
 
 def _has_skill_assets(candidate: Path) -> bool:
@@ -128,9 +144,16 @@ VERSION_STATE_PATH = CONFIG_DIR / "version_state.json"
 MODEL_REGISTRY_PATH = CONFIG_DIR / "model_registry.json"
 MODEL_BENCHMARK_HISTORY_PATH = CONFIG_DIR / "model_benchmark_history.json"
 LOCAL_POLICY_OVERRIDE_PATH = CONFIG_DIR / "local_policy.override.json"
+RUNTIME_SECURITY_POLICY_PATH = CONFIG_DIR / "runtime_security.override.json"
 WORKER_QUALITY_HISTORY_PATH = CONFIG_DIR / "worker_quality_history.json"
 QUEUE_POLICY_PATH = CONFIG_DIR / "queue_policy.json"
 QUEUE_PATH = RUNS_DIR / "queue.json"
+INTERNAL_WORKER_NONCE_ENV = "CC_ORCHESTRATOR_INTERNAL_WORKER_NONCE"
+PRIVATE_LAUNCH_FRAME_LIMIT = 64 * 1024
+PROMPT_BYTES_LIMIT = 1024 * 1024
+INTERNAL_WORKER_NONCE_TTL_SECONDS = 60
+_ACTIVE_WORKER_HANDLES: dict[str, subprocess.Popen[Any]] = {}
+_ACTIVE_WORKER_HANDLES_LOCK = threading.Lock()
 CLAUDE_MD_MARKER_BEGIN = "<!-- claude-code-orchestrator:begin -->"
 CLAUDE_MD_MARKER_END = "<!-- claude-code-orchestrator:end -->"
 SECRET_KEY_RE = re.compile(r"(key|token|secret|authorization|auth)", re.IGNORECASE)
@@ -422,6 +445,131 @@ def claude_bin_path() -> str:
     return candidates[0] if candidates else "claude"
 
 
+def load_runtime_security_policy() -> RuntimeSecurityPolicy:
+    if not RUNTIME_SECURITY_POLICY_PATH.exists():
+        return RuntimeSecurityPolicy.default()
+    return RuntimeSecurityPolicy.load(RUNTIME_SECURITY_POLICY_PATH)
+
+
+def local_configured_candidate(path: str | Path) -> RuntimeExecutableCandidate:
+    return RuntimeExecutableCandidate(
+        canonical_path=str(canonical_path(path)),
+        source="runtime_security.override.json",
+        trust_class="local_configured",
+    )
+
+
+def _trusted_candidate_source(path: Path) -> str | None:
+    normalized = path.as_posix().casefold()
+    local_names = {"claude", "claude.exe"}
+    official_local = (user_home() / ".local" / "bin" / path.name).resolve(
+        strict=False
+    )
+    if path.name.casefold() in local_names and path == official_local:
+        return "official_user_local"
+    package_suffixes = (
+        "/node_modules/@anthropic-ai/claude-code/bin/claude",
+        "/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+    )
+    if normalized.endswith(package_suffixes):
+        if "/.workbuddy/binaries/node/versions/" in normalized:
+            return "workbuddy_package"
+        return "anthropic_package"
+    return None
+
+
+def discover_claude_candidate(
+    *, ignore_environment_override: bool = True
+) -> RuntimeExecutableCandidate:
+    candidates: list[Path] = []
+    home = user_home()
+    direct_names = ("claude.exe", "claude") if os.name == "nt" else ("claude",)
+    for name in direct_names:
+        candidate = home / ".local" / "bin" / name
+        if candidate.is_file():
+            candidates.append(candidate)
+    glob_roots = (
+        (
+            home,
+            ".workbuddy/binaries/node/versions/*/node_modules/@anthropic-ai/claude-code/bin/claude*",
+        ),
+        (
+            Path(os.environ.get("PROGRAMDATA", "")) / "WorkBuddy",
+            "chromium-env/*/.workbuddy/binaries/node/versions/*/node_modules/@anthropic-ai/claude-code/bin/claude*",
+        ),
+    )
+    for root, pattern in glob_roots:
+        if not str(root) or not root.exists():
+            continue
+        try:
+            candidates.extend(path for path in root.glob(pattern) if path.is_file())
+        except OSError:
+            continue
+    path_hit = shutil.which("claude")
+    if path_hit:
+        candidates.append(Path(path_hit))
+    if not ignore_environment_override:
+        explicit = os.environ.get("CLAUDE_CODE_BIN")
+        if explicit:
+            explicit_path = Path(explicit).expanduser()
+            resolved = (
+                str(explicit_path)
+                if explicit_path.is_absolute()
+                else shutil.which(explicit) or ""
+            )
+            if resolved and Path(resolved).is_file():
+                candidates.insert(0, Path(resolved))
+
+    seen: set[str] = set()
+    resolved_candidates: list[Path] = []
+    for candidate in candidates:
+        try:
+            resolved = canonical_path(candidate)
+        except (OSError, ValueError):
+            continue
+        key = os.path.normcase(str(resolved))
+        if key not in seen:
+            seen.add(key)
+            resolved_candidates.append(resolved)
+    if not resolved_candidates:
+        ambient = os.environ.get("CLAUDE_CODE_BIN")
+        action = (
+            "Pin the absolute executable and identity in "
+            "runtime_security.override.json; CLAUDE_CODE_BIN is ignored."
+            if ambient
+            else "Install Claude Code in a recognized layout or pin it in runtime_security.override.json."
+        )
+        raise RuntimeSecurityError(
+            code="runtime_not_trusted",
+            message="No approved Claude Code runtime candidate was found.",
+            safe_details={"ambient_override_ignored": bool(ambient)},
+            suggested_action=action,
+        )
+
+    selected = sorted(
+        resolved_candidates,
+        key=lambda item: (
+            0 if _trusted_candidate_source(item) is not None else 1,
+            _claude_candidate_rank(str(item)),
+        ),
+    )[0]
+    trusted_source = _trusted_candidate_source(selected)
+    return RuntimeExecutableCandidate(
+        canonical_path=str(selected),
+        source=trusted_source or "path_discovery",
+        trust_class="trusted_default" if trusted_source else "discovered_unpinned",
+    )
+
+
+def resolve_runtime_candidate(
+    policy: RuntimeSecurityPolicy,
+) -> RuntimeExecutableCandidate:
+    configured = policy.configured_runtime_path()
+    if configured is not None:
+        return local_configured_candidate(configured)
+    return discover_claude_candidate(ignore_environment_override=True)
+
+
 def load_json(path: Path) -> dict[str, Any]:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -489,15 +637,21 @@ def build_worker_env(
     workspace_root: str | Path | None = None,
     artifact_root: str | Path | None = None,
 ) -> dict[str, str]:
-    env = {key: value for key, value in os.environ.items() if key in PASSTHROUGH_ENV_KEYS}
-    for key, value in provider_env.items():
-        env[validate_env_key(str(key))] = str(value)
-    if model_override:
-        env["ANTHROPIC_MODEL"] = str(model_override)
+    policy = load_runtime_security_policy()
+    env = dict(policy.validate_provider_env(provider_env))
+    if model_override is not None:
+        if not isinstance(model_override, str) or not model_override or "\x00" in model_override:
+            raise OrchestratorError("model_override must be a non-empty string.")
+        env["ANTHROPIC_MODEL"] = model_override
     env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
     env["CC_ORCHESTRATOR_WORKSPACE_ROOT"] = str(Path(workspace_root).expanduser().resolve() if workspace_root else WORKSPACE_ROOT)
     env["CC_ORCHESTRATOR_ARTIFACT_ROOT"] = str(Path(artifact_root).expanduser().resolve() if artifact_root else ARTIFACT_ROOT)
-    return force_utf8_env(env)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    if os.name != "nt":
+        env["LANG"] = "C.UTF-8"
+        env["LC_ALL"] = "C.UTF-8"
+    return env
 
 
 def workspace_paths(cwd: str | Path | None = None) -> dict[str, Path]:
@@ -1073,22 +1227,126 @@ def new_run_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
 
 
+class _ArtifactLock:
+    def __init__(self, run_dir: Path, timeout_seconds: float) -> None:
+        self.run_dir = Path(run_dir).resolve()
+        self.timeout_seconds = timeout_seconds
+        self.lock_dir = self.run_dir.parent / f".{self.run_dir.name}.artifact.lock"
+
+    def __enter__(self) -> None:
+        if not RUN_ID_RE.match(self.run_dir.name):
+            raise OrchestratorError(
+                f"Invalid run directory for artifact lock: {self.run_dir}"
+            )
+        self.run_dir.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + self.timeout_seconds
+        while True:
+            try:
+                self.lock_dir.mkdir()
+                return
+            except FileExistsError:
+                if time.monotonic() >= deadline:
+                    raise OrchestratorError(
+                        f"Timed out acquiring artifact lock for run: {self.run_dir.name}"
+                    )
+                time.sleep(0.005)
+            except OSError as exc:
+                if (
+                    os.name == "nt"
+                    and getattr(exc, "winerror", None) in {5, 32, 183}
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.005)
+                    continue
+                raise OrchestratorError(
+                    f"Could not acquire artifact lock for run: {self.run_dir.name}"
+                ) from exc
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
+        try:
+            self.lock_dir.rmdir()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise OrchestratorError(
+                f"Could not release artifact lock for run: {self.run_dir.name}"
+            ) from exc
+        return False
+
+
+def artifact_lock(run_dir: Path, timeout_seconds: float = 10.0) -> _ArtifactLock:
+    """Serialize controller/worker writes for one run across processes."""
+    return _ArtifactLock(run_dir, timeout_seconds)
+
+
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=str(path.parent),
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        replace_deadline = time.monotonic() + 2.0
+        while True:
+            try:
+                os.replace(temporary_path, path)
+                break
+            except PermissionError:
+                if time.monotonic() >= replace_deadline:
+                    raise
+                time.sleep(0.005)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    _atomic_write_bytes(path, text.encode("utf-8"))
+
+
+def _metadata_bytes(metadata: Mapping[str, Any]) -> bytes:
+    return json.dumps(
+        sanitize_for_json(dict(metadata)), ensure_ascii=False, indent=2
+    ).encode("utf-8")
+
+
 def read_metadata(run_dir: Path) -> dict[str, Any]:
     metadata_path = run_dir / "metadata.json"
     if not metadata_path.exists():
         raise OrchestratorError(f"Run metadata not found: {run_dir.name}")
-    return json.loads(metadata_path.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 2.0
+    while True:
+        try:
+            return json.loads(metadata_path.read_text(encoding="utf-8"))
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.005)
 
 
 def write_metadata(run_dir: Path, metadata: dict[str, Any]) -> None:
-    (run_dir / "metadata.json").write_text(json.dumps(sanitize_for_json(metadata), ensure_ascii=False, indent=2), encoding="utf-8")
+    with artifact_lock(run_dir):
+        _atomic_write_bytes(run_dir / "metadata.json", _metadata_bytes(metadata))
 
 
 def update_metadata(run_dir: Path, **updates: Any) -> dict[str, Any]:
-    metadata = read_metadata(run_dir)
-    metadata.update(updates)
-    write_metadata(run_dir, metadata)
-    return metadata
+    with artifact_lock(run_dir):
+        metadata = read_metadata(run_dir)
+        metadata.update(updates)
+        _atomic_write_bytes(run_dir / "metadata.json", _metadata_bytes(metadata))
+        return metadata
 
 
 def run_git_command(cwd: Path, args: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
@@ -1439,18 +1697,27 @@ def extract_tool_calls_from_payload(payload: Any) -> list[dict[str, Any]]:
 
 
 def append_event(run_dir: Path, event: dict[str, Any]) -> None:
-    seq_path = run_dir / "event_seq.txt"
-    try:
-        seq = int(seq_path.read_text(encoding="utf-8").strip() or "0") + 1
-    except (FileNotFoundError, ValueError):
-        seq = 1
-    event.setdefault("seq", seq)
-    event.setdefault("ts", utc_now_iso())
-    event.setdefault("run_id", run_dir.name)
-    path = run_dir / "events.ndjson"
-    with path.open("a", encoding="utf-8", errors="replace") as handle:
-        handle.write(json.dumps(sanitize_for_json(redact(event)), ensure_ascii=False) + "\n")
-    seq_path.write_text(str(seq), encoding="utf-8")
+    with artifact_lock(run_dir):
+        seq_path = run_dir / "event_seq.txt"
+        try:
+            seq = int(seq_path.read_text(encoding="utf-8").strip() or "0") + 1
+        except (FileNotFoundError, ValueError):
+            seq = 1
+        persisted_event = dict(event)
+        persisted_event.setdefault("seq", seq)
+        persisted_event.setdefault("ts", utc_now_iso())
+        persisted_event.setdefault("run_id", run_dir.name)
+        path = run_dir / "events.ndjson"
+        with path.open("a", encoding="utf-8", errors="replace") as handle:
+            handle.write(
+                json.dumps(
+                    sanitize_for_json(redact(persisted_event)), ensure_ascii=False
+                )
+                + "\n"
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        _atomic_write_text(seq_path, str(seq))
 
 
 def parse_events_delta(path: Path, offset: int = 0, max_bytes: int = 20000) -> dict[str, Any]:
@@ -2689,6 +2956,228 @@ def build_prompt(role: str, task: str, context: str | None = None, artifact_root
     return "\n".join(pieces)
 
 
+def _freeze_route_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {str(key): _freeze_route_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_route_value(item) for item in value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError("safe route metadata must contain only JSON-compatible values")
+
+
+def _thaw_route_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _thaw_route_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_route_value(item) for item in value]
+    return value
+
+
+@dataclass(frozen=True)
+class PreparedWorkerLaunch:
+    mode: str
+    launch_spec: RuntimeLaunchSpec
+    prompt_bytes: bytes
+    safe_route_metadata: Mapping[str, Any]
+    expected_child_launches: int
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"one_shot", "streaming"}:
+            raise ValueError("prepared launch mode is unsupported")
+        if not isinstance(self.launch_spec, RuntimeLaunchSpec):
+            raise TypeError("launch_spec must be a RuntimeLaunchSpec")
+        if not isinstance(self.prompt_bytes, bytes):
+            raise TypeError("prompt_bytes must be bytes")
+        object.__setattr__(self, "prompt_bytes", bytes(self.prompt_bytes))
+        if len(self.prompt_bytes) > PROMPT_BYTES_LIMIT:
+            raise OrchestratorError("Prompt exceeds the 1 MiB launch limit.")
+        if len(self.launch_spec.private_frame()) > PRIVATE_LAUNCH_FRAME_LIMIT:
+            raise OrchestratorError("Private launch frame exceeds the 64 KiB limit.")
+        if not isinstance(self.safe_route_metadata, Mapping):
+            raise TypeError("safe_route_metadata must be a mapping")
+        object.__setattr__(
+            self,
+            "safe_route_metadata",
+            _freeze_route_value(self.safe_route_metadata),
+        )
+        if (
+            not isinstance(self.expected_child_launches, int)
+            or isinstance(self.expected_child_launches, bool)
+            or self.expected_child_launches < 1
+        ):
+            raise TypeError("expected_child_launches must be a positive integer")
+
+    def metadata(self) -> dict[str, Any]:
+        return _thaw_route_value(self.safe_route_metadata)
+
+
+def prepare_worker_launch(
+    *,
+    mode: str,
+    prompt: str | bytes,
+    provider_env: Mapping[str, str],
+    model_override: str | None,
+    cwd: str | Path,
+    workspace_root: str | Path,
+    artifact_root: str | Path,
+    permission_mode: str,
+    timeout_seconds: int,
+    arguments: tuple[str, ...],
+    safe_route_metadata: Mapping[str, Any],
+    expected_child_launches: int = 1,
+    allow_unsafe_runtime: bool = False,
+) -> PreparedWorkerLaunch:
+    if mode not in {"one_shot", "streaming"}:
+        raise OrchestratorError("Launch mode must be one_shot or streaming.")
+    if isinstance(prompt, str):
+        prompt_bytes = prompt.encode("utf-8")
+    elif isinstance(prompt, bytes):
+        prompt_bytes = bytes(prompt)
+        try:
+            prompt_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise OrchestratorError("Prompt bytes must be valid UTF-8.") from exc
+    else:
+        raise TypeError("prompt must be text or bytes")
+    if len(prompt_bytes) > PROMPT_BYTES_LIMIT:
+        raise OrchestratorError("Prompt exceeds the 1 MiB launch limit.")
+    effective_cwd = Path(cwd).expanduser().resolve()
+    if not effective_cwd.is_dir():
+        raise OrchestratorError(f"Launch cwd is not a directory: {effective_cwd}")
+    workspace = Path(workspace_root).expanduser().resolve()
+    artifacts = Path(artifact_root).expanduser().resolve()
+    policy = load_runtime_security_policy()
+    candidate = resolve_runtime_candidate(policy)
+    launch_spec = build_runtime_launch_spec(
+        runtime_candidate=candidate,
+        provider_env=provider_env,
+        model_override=model_override,
+        cwd=effective_cwd,
+        workspace_root=workspace,
+        artifact_root=artifacts,
+        permission_mode=permission_mode,
+        timeout_seconds=timeout_seconds,
+        arguments=arguments,
+        policy=policy,
+        allow_unsafe_runtime=allow_unsafe_runtime,
+    )
+    frame = launch_spec.private_frame()
+    if len(frame) > PRIVATE_LAUNCH_FRAME_LIMIT:
+        raise OrchestratorError("Private launch frame exceeds the 64 KiB limit.")
+    metadata = dict(safe_route_metadata)
+    metadata.update(
+        {
+            "run_id": new_run_id(),
+            "mode": "streaming" if mode == "streaming" else "one_shot",
+            "started_at": utc_now_iso(),
+            "cwd": str(effective_cwd),
+            "workspace_root": str(workspace),
+            "artifact_root": str(artifacts),
+            "runs_root": str(artifacts / "runs"),
+            "timeout_seconds": timeout_seconds,
+            "permission_mode": permission_mode,
+            "prompt_bytes": len(prompt_bytes),
+            "prompt_tokens_est": max(0, (len(prompt_bytes) + 3) // 4),
+        }
+    )
+    return PreparedWorkerLaunch(
+        mode=mode,
+        launch_spec=launch_spec,
+        prompt_bytes=prompt_bytes,
+        safe_route_metadata=metadata,
+        expected_child_launches=expected_child_launches,
+    )
+
+
+def _runtime_command(
+    identity: ExecutableIdentity, arguments: tuple[str, ...]
+) -> list[str]:
+    executable = identity.canonical_path
+    interpreter = identity.interpreter_identity
+    if interpreter is None:
+        return [executable, *arguments]
+    host = interpreter.canonical_path
+    if identity.target_kind == "cmd":
+        return [host, "/d", "/s", "/c", executable, *arguments]
+    if identity.target_kind == "powershell":
+        return [
+            host,
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            executable,
+            *arguments,
+        ]
+    return [host, executable, *arguments]
+
+
+def _expected_process_image(identity: ExecutableIdentity) -> str:
+    current = identity
+    while current.interpreter_identity is not None:
+        current = current.interpreter_identity
+    return current.canonical_path
+
+
+def _paths_match(left: str, right: str) -> bool:
+    return os.path.normcase(str(Path(left).resolve(strict=False))) == os.path.normcase(
+        str(Path(right).resolve(strict=False))
+    )
+
+
+def _security_error(
+    code: str,
+    message: str,
+    *,
+    safe_details: Mapping[str, Any] | None = None,
+    suggested_action: str,
+) -> RuntimeSecurityError:
+    return RuntimeSecurityError(
+        code=code,
+        message=message,
+        safe_details=dict(safe_details or {}),
+        suggested_action=suggested_action,
+    )
+
+
+def _runtime_identity_changed(path: str) -> RuntimeSecurityError:
+    return _security_error(
+        "runtime_identity_changed",
+        "Runtime executable identity changed after launch approval.",
+        safe_details={"canonical_path": path},
+        suggested_action="Re-run preflight and review the executable identity.",
+    )
+
+
+def _process_identity_unverified(pid: int, kind: str) -> RuntimeSecurityError:
+    return _security_error(
+        "process_identity_unverified",
+        f"The {kind} process identity could not be verified.",
+        safe_details={"pid": pid, "process_kind": kind},
+        suggested_action="Use a platform with supported process identity capture.",
+    )
+
+
+def _validate_started_identity(
+    process_identity: ProcessIdentity,
+    executable_identity: ExecutableIdentity,
+    *,
+    process_kind: str,
+) -> None:
+    if (
+        not process_identity.supported
+        or process_identity.executable_path is None
+        or not _paths_match(
+            process_identity.executable_path,
+            _expected_process_image(executable_identity),
+        )
+    ):
+        raise _process_identity_unverified(process_identity.pid, process_kind)
+
+
 def capture_git_snapshot(run_dir: Path, cwd: Path, label: str) -> dict[str, Any]:
     """Capture git diff/status, untracked files, and key file hashes."""
     result = {"ok": False, "label": label, "is_git_repo": False}
@@ -2734,115 +3223,264 @@ def capture_git_snapshot(run_dir: Path, cwd: Path, label: str) -> dict[str, Any]
         return {"ok": False, "label": label, "is_git_repo": True, "error": str(exc)}
 
 
-def run_agent(
-    task: str,
-    role: str = "implementation",
-    task_type: str | None = None,
-    profile: str | None = None,
-    allow_write: bool = False,
-    timeout_seconds: int | None = None,
-    cwd: Path | None = None,
-    context: str | None = None,
-    output_format: str = "json",
+def _launch_failure_error(code: str, message: str) -> RuntimeSecurityError:
+    return _security_error(
+        code,
+        message,
+        suggested_action="Review the blocked launch details and retry preflight.",
+    )
+
+
+def _record_blocked_launch(
+    run_dir: Path,
+    metadata: Mapping[str, Any],
+    *,
+    status: str,
+    error: RuntimeSecurityError,
+    **updates: Any,
 ) -> dict[str, Any]:
-    if not task.strip():
-        raise OrchestratorError("Task cannot be empty.")
-    route = resolve_route(role=role, task_type=task_type, profile=profile)
-    provider = get_provider(route["profile"])
-    policy = load_json(POLICY_PATH)
-    default_write = bool(policy.get("safety", {}).get("default_write_enabled", False))
-    write_enabled = allow_write or default_write
-    permission_mode = route["permission_mode"] if not write_enabled else "acceptEdits"
-    timeout = timeout_seconds or int(route["timeout_seconds"])
-    timeout = min(timeout, int(policy.get("safety", {}).get("max_timeout_seconds", 1800)))
-    timeout = enforce_cost_guard(route.get("model_override") or provider.model, timeout)
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
-    effective_cwd = (cwd or Path.cwd()).expanduser().resolve()
-    paths = workspace_paths(effective_cwd)
-    run_dir = paths["runs"] / run_id
-    run_dir.mkdir(parents=True, exist_ok=False)
-    register_run_dir(run_id, run_dir, paths["workspace_root"], paths["artifact_root"])
-    prompt = build_prompt(role, task, context, artifact_root=paths["artifact_root"])
-    safe_prompt = str(redact(prompt))
-    prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-    env = build_worker_env(provider.env, route.get("model_override"), workspace_root=paths["workspace_root"], artifact_root=paths["artifact_root"])
-    cmd = [
-        claude_bin_path(),
-        "-p",
-        "--output-format",
-        output_format,
-        "--permission-mode",
-        permission_mode,
-        "--no-session-persistence",
-        safe_prompt,
-    ]
-    started = time.time()
-    metadata: dict[str, Any] = {
-        "run_id": run_id,
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "cwd": str(effective_cwd),
-        "workspace_root": str(paths["workspace_root"]),
-        "artifact_root": str(paths["artifact_root"]),
-        "runs_root": str(paths["runs"]),
-        "role": role,
-        "task_type": route["task_type"],
-        "profile": {
-            "id": provider.id,
-            "name": provider.name,
-            "model": route.get("model_override") or provider.model,
-            "provider_default_model": provider.model,
-            "base_url": provider.env.get("ANTHROPIC_BASE_URL"),
-            "endpoints": provider.endpoints,
-        },
-        "permission_mode": permission_mode,
-        "allow_write": write_enabled,
-        "timeout_seconds": timeout,
-        "prompt_sha256": prompt_hash,
-        "route_reason": route.get("reason", ""),
-        "command": redact(cmd),
-    }
-    metadata["git_before"] = capture_git_snapshot(run_dir, effective_cwd, "before")
-    write_metadata(run_dir, metadata)
-    (run_dir / "prompt.txt").write_text(safe_prompt, encoding="utf-8")
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(effective_cwd),
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            encoding="utf-8",
-            errors="replace",
-        )
-        timed_out = False
-        stdout = proc.stdout or ""
-        stderr = proc.stderr or ""
-        exit_code = proc.returncode
-    except subprocess.TimeoutExpired as exc:
-        timed_out = True
-        stdout = subprocess_text(exc.stdout)
-        stderr = subprocess_text(exc.stderr)
-        exit_code = 124
-    duration_ms = int((time.time() - started) * 1000)
-    safe_stdout = redact(stdout)
-    safe_stderr = redact(stderr)
-    (run_dir / "stdout.txt").write_text(str(safe_stdout), encoding="utf-8")
-    (run_dir / "stderr.txt").write_text(str(safe_stderr), encoding="utf-8")
-    actual_route = actual_route_from_text(str(stdout), declared_model=(metadata.get("profile") or {}).get("model"))
-    metadata.update(
+    blocked = dict(metadata)
+    blocked.update(updates)
+    blocked.update(
         {
-            "finished_at": datetime.now(timezone.utc).isoformat(),
-            "duration_ms": duration_ms,
-            "exit_code": exit_code,
-            "timed_out": timed_out,
-            "stdout_path": str(run_dir / "stdout.txt"),
-            "stderr_path": str(run_dir / "stderr.txt"),
-            "git_after": capture_git_snapshot(run_dir, effective_cwd, "after"),
+            "status": status,
+            "finished_at": utc_now_iso(),
+            "exit_code": None,
+            "security_error": error.to_dict(),
+            "terminal_state_count": 1,
         }
     )
+    try:
+        write_metadata(run_dir, blocked)
+    except Exception:
+        _atomic_write_bytes(run_dir / "metadata.json", _metadata_bytes(blocked))
+    return blocked
+
+
+def _terminate_owned_process(process: subprocess.Popen[Any]) -> None:
+    if process.poll() is None:
+        try:
+            process.terminate()
+            process.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+def _retain_worker_handle(run_id: str, worker: subprocess.Popen[Any]) -> None:
+    with _ACTIVE_WORKER_HANDLES_LOCK:
+        _ACTIVE_WORKER_HANDLES[run_id] = worker
+
+    def reap() -> None:
+        try:
+            worker.wait()
+        finally:
+            for stream in (worker.stdin, worker.stdout, worker.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+            with _ACTIVE_WORKER_HANDLES_LOCK:
+                if _ACTIVE_WORKER_HANDLES.get(run_id) is worker:
+                    _ACTIVE_WORKER_HANDLES.pop(run_id, None)
+
+    threading.Thread(
+        target=reap,
+        name=f"cc-worker-reaper-{run_id}",
+        daemon=True,
+    ).start()
+
+
+def _initialize_prepared_run(
+    prepared: PreparedWorkerLaunch,
+) -> tuple[Path, dict[str, Any]]:
+    metadata = prepared.metadata()
+    run_id = str(metadata["run_id"])
+    artifact_root = Path(str(metadata["artifact_root"]))
+    run_dir = artifact_root / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=False)
+    metadata.update(
+        {
+            "status": "starting" if prepared.mode == "streaming" else metadata.get("status"),
+            "runtime_launch": prepared.launch_spec.public_metadata(),
+            "stdout_path": str(run_dir / "stdout.txt"),
+            "stderr_path": str(run_dir / "stderr.txt"),
+            "events_path": str(run_dir / "events.ndjson"),
+            "worker_pid": None,
+            "child_pid": None,
+        }
+    )
+    if metadata["status"] is None:
+        metadata.pop("status")
+    if prepared.mode == "streaming":
+        metadata["worker_launch"] = {
+            "nonce_consumed": False,
+            "nonce_expires_at": (
+                datetime.now(timezone.utc)
+                + timedelta(seconds=INTERNAL_WORKER_NONCE_TTL_SECONDS)
+            ).isoformat(),
+        }
+    for name in ("stdout.txt", "stderr.txt", "events.ndjson"):
+        _atomic_write_text(run_dir / name, "")
+    register_run_dir(
+        run_id,
+        run_dir,
+        Path(str(metadata["workspace_root"])),
+        artifact_root,
+    )
+    metadata["git_before"] = capture_git_snapshot(
+        run_dir, Path(str(metadata["cwd"])), "before"
+    )
+    write_metadata(run_dir, metadata)
+    if prepared.mode == "streaming":
+        append_event(
+            run_dir,
+            {
+                "type": "run_started",
+                "status": "starting",
+                "role": metadata.get("role"),
+                "task_type": metadata.get("task_type"),
+            },
+        )
+    return run_dir, metadata
+
+
+def _publish_latest_run(metadata: Mapping[str, Any]) -> None:
+    run_id = str(metadata["run_id"])
+    runs_root = Path(str(metadata["runs_root"]))
+    runs_root.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(runs_root / "latest.txt", run_id)
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(RUNS_DIR / "latest.txt", run_id)
+
+
+def _start_one_shot_launch(
+    prepared: PreparedWorkerLaunch,
+    run_dir: Path,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    spec = prepared.launch_spec
+    identity = spec.executable_identity
+    if not identity.matches_current_file():
+        return _record_blocked_launch(
+            run_dir,
+            metadata,
+            status="blocked_runtime_identity",
+            error=_runtime_identity_changed(identity.canonical_path),
+        )
+    command = _runtime_command(identity, spec.arguments)
+    started = time.time()
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=spec.cwd,
+            env=dict(spec.environment),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError:
+        return _record_blocked_launch(
+            run_dir,
+            metadata,
+            status="blocked_runtime_launch",
+            error=_launch_failure_error(
+                "runtime_launch_failed", "The approved runtime process could not be started."
+            ),
+        )
+    try:
+        try:
+            child_identity = capture_process_identity(
+                process.pid, launch_nonce=spec.launch_nonce
+            )
+            _validate_started_identity(
+                child_identity, identity, process_kind="runtime child"
+            )
+        except (OSError, TypeError, ValueError, RuntimeSecurityError) as exc:
+            _terminate_owned_process(process)
+            error = (
+                exc
+                if isinstance(exc, RuntimeSecurityError)
+                else _process_identity_unverified(process.pid, "runtime child")
+            )
+            return _record_blocked_launch(
+                run_dir,
+                metadata,
+                status="blocked_process_identity",
+                error=error,
+                child_pid=process.pid,
+            )
+        try:
+            metadata = update_metadata(
+                run_dir,
+                child_pid=process.pid,
+                child_process_identity=child_identity.to_dict(),
+            )
+        except Exception:
+            _terminate_owned_process(process)
+            return _record_blocked_launch(
+                run_dir,
+                metadata,
+                status="blocked_runtime_launch",
+                error=_launch_failure_error(
+                    "artifact_write_failed",
+                    "Child process identity metadata could not be persisted.",
+                ),
+                child_pid=process.pid,
+                child_process_identity=child_identity.to_dict(),
+            )
+        if not identity.matches_current_file():
+            _terminate_owned_process(process)
+            return _record_blocked_launch(
+                run_dir,
+                metadata,
+                status="blocked_runtime_identity",
+                error=_runtime_identity_changed(identity.canonical_path),
+                child_pid=process.pid,
+                child_process_identity=child_identity.to_dict(),
+            )
+        try:
+            stdout_bytes, stderr_bytes = process.communicate(
+                input=prepared.prompt_bytes, timeout=spec.timeout_seconds
+            )
+            timed_out = False
+            exit_code = process.returncode
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _terminate_owned_process(process)
+            stdout_bytes = b""
+            stderr_bytes = b""
+            exit_code = 124
+    finally:
+        if process.poll() is None:
+            _terminate_owned_process(process)
+    stdout = stdout_bytes.decode("utf-8", errors="replace")
+    stderr = stderr_bytes.decode("utf-8", errors="replace")
+    safe_stdout = str(redact(stdout))
+    safe_stderr = str(redact(stderr))
+    _atomic_write_text(run_dir / "stdout.txt", safe_stdout)
+    _atomic_write_text(run_dir / "stderr.txt", safe_stderr)
+    actual_route = actual_route_from_text(
+        stdout, declared_model=(metadata.get("profile") or {}).get("model")
+    )
+    updates: dict[str, Any] = {
+        "finished_at": utc_now_iso(),
+        "duration_ms": int((time.time() - started) * 1000),
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "git_after": capture_git_snapshot(run_dir, Path(spec.cwd), "after"),
+    }
     if actual_route.get("actual_model") or actual_route.get("actual_model_usage"):
-        metadata.update(
+        updates.update(
             {
                 "actual_route": actual_route,
                 "actual_model": actual_route.get("actual_model"),
@@ -2854,19 +3492,300 @@ def run_agent(
                 "route_mismatch": actual_route.get("route_mismatch"),
             }
         )
-    write_metadata(run_dir, metadata)
-    scope_check = check_write_scope(run_id=run_id)
-    metadata["write_scope_check"] = scope_check
-    metadata["acceptance_status"] = "blocked_write_scope" if not scope_check.get("ok", True) else "pending_controller_review"
-    write_metadata(run_dir, metadata)
-    paths["runs"].mkdir(parents=True, exist_ok=True)
-    (paths["runs"] / "latest.txt").write_text(run_id, encoding="utf-8")
-    RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    (RUNS_DIR / "latest.txt").write_text(run_id, encoding="utf-8")
+    metadata = update_metadata(run_dir, **updates)
+    scope_check = check_write_scope(run_id=str(metadata["run_id"]))
+    metadata = update_metadata(
+        run_dir,
+        write_scope_check=scope_check,
+        acceptance_status=(
+            "blocked_write_scope"
+            if not scope_check.get("ok", True)
+            else "pending_controller_review"
+        ),
+    )
+    try:
+        _publish_latest_run(metadata)
+    except Exception:
+        return _record_blocked_launch(
+            run_dir,
+            metadata,
+            status="blocked_runtime_launch",
+            error=_launch_failure_error(
+                "artifact_write_failed", "Latest-run metadata could not be persisted."
+            ),
+            child_pid=process.pid,
+            child_process_identity=child_identity.to_dict(),
+        )
     return {
         **metadata,
-        "stdout_tail": str(safe_stdout)[-4000:],
-        "stderr_tail": str(safe_stderr)[-2000:],
+        "stdout_tail": safe_stdout[-4000:],
+        "stderr_tail": safe_stderr[-2000:],
+    }
+
+
+def start_prepared_worker_launch(
+    prepared: PreparedWorkerLaunch,
+) -> dict[str, Any]:
+    if not isinstance(prepared, PreparedWorkerLaunch):
+        raise TypeError("prepared must be a PreparedWorkerLaunch")
+    metadata = prepared.metadata()
+    run_dir = (
+        Path(str(metadata["artifact_root"]))
+        / "runs"
+        / str(metadata["run_id"])
+    )
+    try:
+        run_dir, metadata = _initialize_prepared_run(prepared)
+    except Exception:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        metadata.update(
+            {
+                "runtime_launch": prepared.launch_spec.public_metadata(),
+                "stdout_path": str(run_dir / "stdout.txt"),
+                "stderr_path": str(run_dir / "stderr.txt"),
+                "events_path": str(run_dir / "events.ndjson"),
+            }
+        )
+        for name in ("stdout.txt", "stderr.txt", "events.ndjson"):
+            if not (run_dir / name).exists():
+                _atomic_write_text(run_dir / name, "")
+        return _record_blocked_launch(
+            run_dir,
+            metadata,
+            status="blocked_runtime_launch",
+            error=_launch_failure_error(
+                "artifact_write_failed", "Run artifacts could not be initialized atomically."
+            ),
+        )
+    if prepared.mode == "one_shot":
+        return _start_one_shot_launch(prepared, run_dir, metadata)
+    return _start_streaming_controller(prepared, run_dir, metadata)
+
+
+def run_agent(
+    task: str,
+    role: str = "implementation",
+    task_type: str | None = None,
+    profile: str | None = None,
+    allow_write: bool = False,
+    timeout_seconds: int | None = None,
+    cwd: Path | None = None,
+    context: str | None = None,
+    output_format: str = "json",
+    allow_unsafe_runtime: bool = False,
+) -> dict[str, Any]:
+    if not isinstance(task, str) or not task.strip():
+        raise OrchestratorError("Task cannot be empty.")
+    route = resolve_route(role=role, task_type=task_type, profile=profile)
+    provider = get_provider(route["profile"])
+    model_policy = load_json(POLICY_PATH)
+    default_write = bool(
+        model_policy.get("safety", {}).get("default_write_enabled", False)
+    )
+    write_enabled = allow_write or default_write
+    permission_mode = route["permission_mode"] if not write_enabled else "acceptEdits"
+    timeout = timeout_seconds or int(route["timeout_seconds"])
+    timeout = min(
+        timeout,
+        int(model_policy.get("safety", {}).get("max_timeout_seconds", 1800)),
+    )
+    selected_model = route.get("model_override") or provider.model
+    timeout = enforce_cost_guard(selected_model, timeout)
+    effective_cwd = (cwd or Path.cwd()).expanduser().resolve()
+    paths = workspace_paths(effective_cwd)
+    prompt = build_prompt(
+        role, task, context, artifact_root=paths["artifact_root"]
+    )
+    prepared = prepare_worker_launch(
+        mode="one_shot",
+        prompt=prompt,
+        provider_env=provider.env,
+        model_override=route.get("model_override"),
+        cwd=effective_cwd,
+        workspace_root=paths["workspace_root"],
+        artifact_root=paths["artifact_root"],
+        permission_mode=permission_mode,
+        timeout_seconds=timeout,
+        arguments=(
+            "-p",
+            "--output-format",
+            output_format,
+            "--permission-mode",
+            permission_mode,
+            "--no-session-persistence",
+        ),
+        safe_route_metadata={
+            "role": role,
+            "task_type": route["task_type"],
+            "profile": {
+                "id": provider.id,
+                "name": provider.name,
+                "model": selected_model,
+                "provider_default_model": provider.model,
+                "endpoints": provider.endpoints,
+            },
+            "permission_mode": permission_mode,
+            "allow_write": write_enabled,
+            "route_reason": route.get("reason", ""),
+            "output_format": output_format,
+        },
+        allow_unsafe_runtime=allow_unsafe_runtime,
+    )
+    return start_prepared_worker_launch(prepared)
+
+
+def _validate_worker_process_identity(identity: ProcessIdentity) -> None:
+    expected = str(Path(sys.executable).resolve())
+    if (
+        not identity.supported
+        or identity.executable_path is None
+        or not _paths_match(identity.executable_path, expected)
+    ):
+        raise _process_identity_unverified(identity.pid, "internal worker")
+
+
+def _write_pipe_chunk(pipe: Any, payload: bytes) -> None:
+    written = pipe.write(payload)
+    if written != len(payload):
+        raise BrokenPipeError("short write to internal worker protocol")
+
+
+def _start_streaming_controller(
+    prepared: PreparedWorkerLaunch,
+    run_dir: Path,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    spec = prepared.launch_spec
+    worker_env = dict(spec.environment)
+    worker_env[INTERNAL_WORKER_NONCE_ENV] = spec.launch_nonce
+    worker_command = [
+        str(Path(sys.executable).resolve()),
+        "-I",
+        "-B",
+        str(Path(__file__).resolve()),
+        "_stream-worker",
+        "--run-id",
+        str(metadata["run_id"]),
+    ]
+    creationflags = 0
+    popen_kwargs: dict[str, Any] = {}
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    else:
+        popen_kwargs["start_new_session"] = True
+    worker: subprocess.Popen[bytes] | None = None
+    try:
+        worker = subprocess.Popen(
+            worker_command,
+            cwd=str(ROOT),
+            env=worker_env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+            **popen_kwargs,
+        )
+    except OSError:
+        return _record_blocked_launch(
+            run_dir,
+            metadata,
+            status="blocked_runtime_launch",
+            error=_launch_failure_error(
+                "runtime_launch_failed", "The isolated internal worker could not be started."
+            ),
+        )
+
+    try:
+        frame = spec.private_frame()
+        if len(frame) > PRIVATE_LAUNCH_FRAME_LIMIT:
+            raise BrokenPipeError("private launch frame exceeds limit")
+        if len(prepared.prompt_bytes) > PROMPT_BYTES_LIMIT:
+            raise BrokenPipeError("prompt exceeds limit")
+        if worker.stdin is None:
+            raise BrokenPipeError("internal worker stdin is unavailable")
+        _write_pipe_chunk(worker.stdin, struct.pack("!Q", len(frame)))
+        _write_pipe_chunk(worker.stdin, frame)
+        _write_pipe_chunk(worker.stdin, struct.pack("!Q", len(prepared.prompt_bytes)))
+        _write_pipe_chunk(worker.stdin, prepared.prompt_bytes)
+        worker.stdin.flush()
+        worker.stdin.close()
+        worker.stdin = None
+    except (BrokenPipeError, OSError):
+        _terminate_owned_process(worker)
+        return _record_blocked_launch(
+            run_dir,
+            metadata,
+            status="blocked_runtime_launch",
+            error=_launch_failure_error(
+                "worker_protocol_failed", "The private worker launch pipe failed."
+            ),
+            worker_pid=worker.pid,
+        )
+
+    try:
+        worker_identity = capture_process_identity(
+            worker.pid, launch_nonce=spec.launch_nonce
+        )
+        _validate_worker_process_identity(worker_identity)
+        metadata = update_metadata(
+            run_dir,
+            worker_pid=worker.pid,
+            worker_process_identity=worker_identity.to_dict(),
+        )
+        append_event(
+            run_dir, {"type": "stream_worker_started", "worker_pid": worker.pid}
+        )
+    except (OSError, TypeError, ValueError, RuntimeSecurityError) as exc:
+        _terminate_owned_process(worker)
+        error = (
+            exc
+            if isinstance(exc, RuntimeSecurityError)
+            else _process_identity_unverified(worker.pid, "internal worker")
+        )
+        return _record_blocked_launch(
+            run_dir,
+            metadata,
+            status="blocked_process_identity",
+            error=error,
+            worker_pid=worker.pid,
+        )
+    except Exception:
+        _terminate_owned_process(worker)
+        return _record_blocked_launch(
+            run_dir,
+            metadata,
+            status="blocked_runtime_launch",
+            error=_launch_failure_error(
+                "artifact_write_failed", "Worker identity metadata could not be persisted."
+            ),
+            worker_pid=worker.pid,
+        )
+
+    _retain_worker_handle(str(metadata["run_id"]), worker)
+    try:
+        _publish_latest_run(metadata)
+    except Exception:
+        _terminate_owned_process(worker)
+        return _record_blocked_launch(
+            run_dir,
+            metadata,
+            status="blocked_runtime_launch",
+            error=_launch_failure_error(
+                "artifact_write_failed", "Latest-run metadata could not be persisted."
+            ),
+            worker_pid=worker.pid,
+        )
+    return {
+        **metadata,
+        "status": "starting",
+        "worker_pid": worker.pid,
+        "poll": {
+            "tool": "cc_poll_run",
+            "run_id": metadata["run_id"],
+            "event_offset": 0,
+            "stdout_offset": 0,
+            "stderr_offset": 0,
+        },
     }
 
 
@@ -2890,20 +3809,29 @@ def run_streaming_agent(
     final_only: bool = False,
     final_max_chars: int | None = None,
     skip_cost_guard: bool = False,
+    allow_unsafe_runtime: bool = False,
 ) -> dict[str, Any]:
-    """Start Claude Code in the background and stream events to events.ndjson."""
-    if not task.strip():
+    if not isinstance(task, str) or not task.strip():
         raise OrchestratorError("Task cannot be empty.")
     route = resolve_route(role=role, task_type=task_type, profile=profile)
     provider = get_provider(route["profile"])
-    policy = load_json(POLICY_PATH)
-    default_write = bool(policy.get("safety", {}).get("default_write_enabled", False))
+    model_policy = load_json(POLICY_PATH)
+    default_write = bool(
+        model_policy.get("safety", {}).get("default_write_enabled", False)
+    )
     write_enabled = allow_write or default_write
     permission_mode = route["permission_mode"] if not write_enabled else "acceptEdits"
     timeout = timeout_seconds or int(route["timeout_seconds"])
-    timeout = min(timeout, int(policy.get("safety", {}).get("max_timeout_seconds", 1800)))
+    timeout = min(
+        timeout,
+        int(model_policy.get("safety", {}).get("max_timeout_seconds", 1800)),
+    )
     selected_model = model_override or route.get("model_override") or provider.model
-    timeout = clamp_timeout_for_model(selected_model, timeout) if skip_cost_guard else timeout
+    timeout = (
+        clamp_timeout_for_model(selected_model, timeout)
+        if skip_cost_guard
+        else enforce_cost_guard(selected_model, timeout)
+    )
     if output_format != "stream-json":
         raise OrchestratorError("run_streaming_agent requires output_format='stream-json'.")
     budget = resolve_output_budget(
@@ -2926,150 +3854,298 @@ def run_streaming_agent(
             ]
         )
         context = "\n\n".join(part for part in [context or "", final_rules] if part)
-
     effective_cwd = (cwd or Path.cwd()).expanduser().resolve()
     paths = workspace_paths(effective_cwd)
-    run_id = new_run_id()
-    run_dir = paths["runs"] / run_id
-    run_dir.mkdir(parents=True, exist_ok=False)
-    register_run_dir(run_id, run_dir, paths["workspace_root"], paths["artifact_root"])
-    prompt = build_prompt(role, task, context, artifact_root=paths["artifact_root"])
-    safe_prompt = str(redact(prompt))
-    prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-    prompt_path = run_dir / "prompt.txt"
-    prompt_path.write_text(safe_prompt, encoding="utf-8")
-    stdout_path = run_dir / "stdout.txt"
-    stderr_path = run_dir / "stderr.txt"
-    events_path = run_dir / "events.ndjson"
-    stdout_path.write_text("", encoding="utf-8")
-    stderr_path.write_text("", encoding="utf-8")
-    events_path.write_text("", encoding="utf-8")
-
-    metadata: dict[str, Any] = {
-        "run_id": run_id,
-        "mode": "streaming",
-        "status": "starting",
-        "started_at": utc_now_iso(),
-        "cwd": str(effective_cwd),
-        "workspace_root": str(paths["workspace_root"]),
-        "artifact_root": str(paths["artifact_root"]),
-        "runs_root": str(paths["runs"]),
-        "role": role,
-        "task_type": route["task_type"],
-        "profile": {
-            "id": provider.id,
-            "name": provider.name,
-            "model": selected_model,
-            "provider_default_model": provider.model,
-            "base_url": provider.env.get("ANTHROPIC_BASE_URL"),
-            "endpoints": provider.endpoints,
-        },
-        "route": {
-            "profile": provider.name,
-            "model": selected_model,
-            "profile_id": provider.id,
-            "task_type": route["task_type"],
-            "reason": route.get("reason", ""),
-            "model_override": model_override or route.get("model_override"),
-        },
-        "permission_mode": permission_mode,
-        "allow_write": write_enabled,
-        "timeout_seconds": timeout,
-        "output_format": output_format,
-        "include_partial_messages": include_partial_messages,
-        "output_budget": budget,
-        "stop_reason": None,
-        "prompt_sha256": prompt_hash,
-        "route_reason": route.get("reason", ""),
-        "prompt_path": str(prompt_path),
-        "stdout_path": str(stdout_path),
-        "stderr_path": str(stderr_path),
-        "events_path": str(events_path),
-        "worker_pid": None,
-        "child_pid": None,
-    }
-    metadata["git_before"] = capture_git_snapshot(run_dir, effective_cwd, "before")
-    write_metadata(run_dir, metadata)
-    append_event(run_dir, {"type": "run_started", "status": "starting", "role": role, "task_type": route["task_type"]})
-
-    env = build_worker_env(
-        provider.env,
-        selected_model if selected_model != provider.model else route.get("model_override"),
+    prompt = build_prompt(
+        role, task, context, artifact_root=paths["artifact_root"]
+    )
+    arguments = ["-p", "--output-format", "stream-json", "--verbose"]
+    if include_partial_messages:
+        arguments.append("--include-partial-messages")
+    arguments.extend(
+        ["--permission-mode", permission_mode, "--no-session-persistence"]
+    )
+    prepared = prepare_worker_launch(
+        mode="streaming",
+        prompt=prompt,
+        provider_env=provider.env,
+        model_override=selected_model,
+        cwd=effective_cwd,
         workspace_root=paths["workspace_root"],
         artifact_root=paths["artifact_root"],
-    )
-    worker_cmd = [sys.executable, "-B", str(Path(__file__).resolve()), "_stream-worker", "--run-id", run_id]
-    creationflags = 0
-    popen_kwargs: dict[str, Any] = {}
-    if os.name == "nt":
-        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    else:
-        popen_kwargs["start_new_session"] = True
-    with (contextlib.nullcontext() if skip_cost_guard else launch_lock()):
-        if not skip_cost_guard:
-            timeout = enforce_cost_guard(selected_model, timeout)
-            metadata["timeout_seconds"] = timeout
-            write_metadata(run_dir, metadata)
-        worker = subprocess.Popen(
-            worker_cmd,
-            cwd=str(ROOT),
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creationflags,
-            **popen_kwargs,
-        )
-    metadata.update({"worker_pid": worker.pid, "worker_command": redact(worker_cmd)})
-    write_metadata(run_dir, metadata)
-    append_event(run_dir, {"type": "stream_worker_started", "worker_pid": worker.pid})
-    paths["runs"].mkdir(parents=True, exist_ok=True)
-    (paths["runs"] / "latest.txt").write_text(run_id, encoding="utf-8")
-    RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    (RUNS_DIR / "latest.txt").write_text(run_id, encoding="utf-8")
-    return {
-        **metadata,
-        "status": "starting",
-        "worker_pid": worker.pid,
-        "poll": {
-            "tool": "cc_poll_run",
-            "run_id": run_id,
-            "event_offset": 0,
-            "stdout_offset": 0,
-            "stderr_offset": 0,
+        permission_mode=permission_mode,
+        timeout_seconds=timeout,
+        arguments=tuple(arguments),
+        safe_route_metadata={
+            "role": role,
+            "task_type": route["task_type"],
+            "profile": {
+                "id": provider.id,
+                "name": provider.name,
+                "model": selected_model,
+                "provider_default_model": provider.model,
+                "endpoints": provider.endpoints,
+            },
+            "route": {
+                "profile": provider.name,
+                "model": selected_model,
+                "profile_id": provider.id,
+                "task_type": route["task_type"],
+                "reason": route.get("reason", ""),
+                "model_override": model_override or route.get("model_override"),
+            },
+            "permission_mode": permission_mode,
+            "allow_write": write_enabled,
+            "output_format": output_format,
+            "include_partial_messages": include_partial_messages,
+            "output_budget": budget,
+            "stop_reason": None,
+            "route_reason": route.get("reason", ""),
         },
+        allow_unsafe_runtime=allow_unsafe_runtime,
+    )
+    return start_prepared_worker_launch(prepared)
+
+
+_WORKER_ARGUMENT_KINDS = {
+    "-p": "prompt_stdin",
+    "--output-format": "output_format_flag",
+    "json": "json_format",
+    "stream-json": "stream_json_format",
+    "--permission-mode": "permission_mode_flag",
+    "plan": "plan_permission",
+    "acceptEdits": "accept_edits_permission",
+    "--no-session-persistence": "no_session_persistence",
+    "--verbose": "verbose",
+    "--include-partial-messages": "include_partial_messages",
+}
+
+
+def _runtime_not_trusted(message: str) -> RuntimeSecurityError:
+    return _security_error(
+        "runtime_not_trusted",
+        message,
+        suggested_action="Start a fresh launch through the controller.",
+    )
+
+
+def _read_exact(stream: Any, length: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = length
+    while remaining:
+        chunk = stream.read(remaining)
+        if not chunk:
+            raise _runtime_not_trusted("Internal worker launch payload is incomplete.")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _read_bounded_payload(stream: Any, limit: int, label: str) -> bytes:
+    raw_length = _read_exact(stream, 8)
+    length = struct.unpack("!Q", raw_length)[0]
+    if length > limit:
+        raise _runtime_not_trusted(f"Internal worker {label} exceeds its size limit.")
+    return _read_exact(stream, length)
+
+
+def _wait_for_controller_worker_identity(run_dir: Path) -> dict[str, Any]:
+    deadline = time.monotonic() + 5.0
+    latest: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        latest = read_metadata(run_dir)
+        if latest.get("worker_process_identity") is not None:
+            return latest
+        if str(latest.get("status") or "").startswith("blocked_"):
+            break
+        time.sleep(0.01)
+    raise _runtime_not_trusted("Controller worker identity was not published in time.")
+
+
+def _parse_worker_frame(
+    run_dir: Path, frame: bytes
+) -> tuple[dict[str, Any], ExecutableIdentity, tuple[str, ...]]:
+    metadata = _wait_for_controller_worker_identity(run_dir)
+    public = metadata.get("runtime_launch")
+    if not isinstance(public, dict):
+        raise _runtime_not_trusted("Public runtime launch metadata is missing.")
+    worker_launch = metadata.get("worker_launch")
+    if not isinstance(worker_launch, dict) or worker_launch.get("nonce_consumed") is not False:
+        raise _runtime_not_trusted("Internal worker launch nonce is missing or consumed.")
+    if hashlib.sha256(frame).hexdigest() != public.get("launch_contract_sha256"):
+        raise _runtime_not_trusted("Private launch frame does not match its public contract.")
+    try:
+        payload = json.loads(frame.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _runtime_not_trusted("Private launch frame is invalid.") from exc
+    expected_fields = {
+        "runtime_id",
+        "protocol_version",
+        "executable_identity",
+        "arguments",
+        "cwd",
+        "permission_mode",
+        "timeout_seconds",
+        "environment_keys",
+        "trust_level",
+        "policy_decision_id",
+        "launch_nonce",
     }
+    if not isinstance(payload, dict) or set(payload) != expected_fields:
+        raise _runtime_not_trusted("Private launch frame has an invalid shape.")
+    nonce = os.environ.get(INTERNAL_WORKER_NONCE_ENV)
+    if (
+        not nonce
+        or payload.get("launch_nonce") != nonce
+        or public.get("launch_nonce") != nonce
+    ):
+        raise _runtime_not_trusted("Internal worker launch nonce is missing or forged.")
+    for key in (
+        "runtime_id",
+        "protocol_version",
+        "cwd",
+        "permission_mode",
+        "timeout_seconds",
+        "trust_level",
+        "policy_decision_id",
+    ):
+        if payload.get(key) != public.get(key):
+            raise _runtime_not_trusted("Private launch frame conflicts with public metadata.")
+    if payload.get("protocol_version") != 1:
+        raise _runtime_not_trusted("Internal worker protocol version is unsupported.")
+    if payload.get("executable_identity") != public.get("executable_identity"):
+        raise _runtime_not_trusted("Executable identity contract does not match metadata.")
+    try:
+        identity = ExecutableIdentity.from_public_dict(payload["executable_identity"])
+    except (TypeError, ValueError) as exc:
+        raise _runtime_not_trusted("Executable identity contract is invalid.") from exc
+    arguments_value = payload.get("arguments")
+    if not isinstance(arguments_value, list) or not all(
+        isinstance(item, str) and item in _WORKER_ARGUMENT_KINDS
+        for item in arguments_value
+    ):
+        raise _runtime_not_trusted("Runtime argument contract is invalid.")
+    arguments = tuple(arguments_value)
+    if [_WORKER_ARGUMENT_KINDS[item] for item in arguments] != public.get(
+        "argument_kinds"
+    ):
+        raise _runtime_not_trusted("Runtime argument kinds do not match metadata.")
+    environment_keys = payload.get("environment_keys")
+    if (
+        not isinstance(environment_keys, list)
+        or environment_keys != public.get("environment_keys")
+        or not all(isinstance(key, str) and key in os.environ for key in environment_keys)
+    ):
+        raise _runtime_not_trusted("Validated runtime environment is unavailable.")
+    worker_identity_data = metadata.get("worker_process_identity")
+    try:
+        worker_identity = ProcessIdentity.from_dict(worker_identity_data)
+    except (TypeError, ValueError) as exc:
+        raise _runtime_not_trusted("Controller worker identity is invalid.") from exc
+    if worker_identity.pid != os.getpid() or worker_identity.launch_nonce != nonce:
+        raise _runtime_not_trusted("Controller worker identity is not bound to this process.")
+    _validate_worker_process_identity(worker_identity)
+    return metadata, identity, arguments
+
+
+def _consume_worker_nonce(run_dir: Path, nonce: str) -> dict[str, Any]:
+    with artifact_lock(run_dir):
+        metadata = read_metadata(run_dir)
+        public = metadata.get("runtime_launch")
+        worker_launch = metadata.get("worker_launch")
+        if (
+            not isinstance(public, dict)
+            or not isinstance(worker_launch, dict)
+            or public.get("launch_nonce") != nonce
+            or worker_launch.get("nonce_consumed") is not False
+        ):
+            raise _runtime_not_trusted("Internal worker launch nonce is unavailable.")
+        expires_raw = worker_launch.get("nonce_expires_at")
+        try:
+            expires_at = datetime.fromisoformat(str(expires_raw))
+        except ValueError as exc:
+            raise _runtime_not_trusted("Internal worker launch nonce expiry is invalid.") from exc
+        if expires_at.tzinfo is None or expires_at <= datetime.now(timezone.utc):
+            raise _runtime_not_trusted("Internal worker launch nonce has expired.")
+        worker_launch = dict(worker_launch)
+        worker_launch.update(
+            {"nonce_consumed": True, "nonce_consumed_at": utc_now_iso()}
+        )
+        metadata["worker_launch"] = worker_launch
+        _atomic_write_bytes(run_dir / "metadata.json", _metadata_bytes(metadata))
+        return metadata
+
+
+def _worker_security_failure(
+    run_dir: Path, error: RuntimeSecurityError
+) -> dict[str, Any]:
+    status = (
+        "blocked_runtime_identity"
+        if error.code == "runtime_identity_changed"
+        else "blocked_runtime_security"
+    )
+    response = {
+        "ok": False,
+        "run_id": run_dir.name,
+        "status": status,
+        "security_error": error.to_dict(),
+    }
+    try:
+        metadata = read_metadata(run_dir)
+        if (
+            metadata.get("status") in {"starting", "running"}
+            and metadata.get("worker_pid") in {None, os.getpid()}
+        ):
+            _record_blocked_launch(
+                run_dir,
+                metadata,
+                status=status,
+                error=error,
+                worker_pid=os.getpid(),
+            )
+    except Exception:
+        pass
+    return response
 
 
 def stream_worker(run_id: str) -> dict[str, Any]:
-    """Internal worker process. It owns Claude Code pipes for a streaming run."""
+    """Consume one controller-approved launch and own the runtime child handle."""
     run_dir = safe_run_dir(run_id)
-    metadata = update_metadata(run_dir, worker_pid=os.getpid())
-    prompt = (run_dir / "prompt.txt").read_text(encoding="utf-8", errors="replace")
-    permission_mode = str(metadata.get("permission_mode", "plan"))
-    output_format = str(metadata.get("output_format", "stream-json"))
-    include_partial_messages = bool(metadata.get("include_partial_messages", True))
+    try:
+        frame = _read_bounded_payload(
+            sys.stdin.buffer, PRIVATE_LAUNCH_FRAME_LIMIT, "frame"
+        )
+        prompt_bytes = _read_bounded_payload(
+            sys.stdin.buffer, PROMPT_BYTES_LIMIT, "prompt"
+        )
+        metadata, executable_identity, arguments = _parse_worker_frame(
+            run_dir, frame
+        )
+        nonce = str(metadata["runtime_launch"]["launch_nonce"])
+        metadata = _consume_worker_nonce(run_dir, nonce)
+        if not executable_identity.matches_current_file():
+            raise _runtime_identity_changed(executable_identity.canonical_path)
+    except RuntimeSecurityError as error:
+        return _worker_security_failure(run_dir, error)
+
     timeout = int(metadata.get("timeout_seconds") or 1800)
     cwd = Path(str(metadata.get("cwd") or Path.cwd()))
-    cmd = [
-        claude_bin_path(),
-        "-p",
-        "--output-format",
-        output_format,
-    ]
-    if output_format == "stream-json":
-        cmd.append("--verbose")
-    if include_partial_messages:
-        cmd.append("--include-partial-messages")
-    cmd.extend(
-        [
-            "--permission-mode",
-            permission_mode,
-            "--no-session-persistence",
-            prompt,
-        ]
-    )
-    append_event(run_dir, {"type": "stream_worker_ready", "worker_pid": os.getpid()})
+    command = _runtime_command(executable_identity, arguments)
+    environment_keys = json.loads(frame.decode("utf-8"))["environment_keys"]
+    runtime_env = {key: os.environ[key] for key in environment_keys}
+    try:
+        append_event(
+            run_dir, {"type": "stream_worker_ready", "worker_pid": os.getpid()}
+        )
+    except Exception:
+        return _record_blocked_launch(
+            run_dir,
+            metadata,
+            status="blocked_runtime_launch",
+            error=_launch_failure_error(
+                "artifact_write_failed", "Worker readiness metadata could not be persisted."
+            ),
+        )
     creationflags = 0
     popen_kwargs: dict[str, Any] = {}
     if os.name == "nt":
@@ -3077,21 +4153,96 @@ def stream_worker(run_id: str) -> dict[str, Any]:
     else:
         popen_kwargs["start_new_session"] = True
     started = time.time()
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(cwd),
-        env=force_utf8_env(dict(os.environ)),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        creationflags=creationflags,
-        **popen_kwargs,
-    )
-    update_metadata(run_dir, status="running", child_pid=proc.pid, command=redact(cmd))
-    (run_dir / "pid.txt").write_text(str(proc.pid), encoding="utf-8")
-    append_event(run_dir, {"type": "process_started", "pid": proc.pid, "status": "running"})
+    try:
+        proc = subprocess.Popen(
+            command,
+            cwd=str(cwd),
+            env=runtime_env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=creationflags,
+            **popen_kwargs,
+        )
+    except OSError:
+        return _record_blocked_launch(
+            run_dir,
+            metadata,
+            status="blocked_runtime_launch",
+            error=_launch_failure_error(
+                "runtime_launch_failed", "The approved runtime process could not be started."
+            ),
+        )
+    try:
+        try:
+            child_identity = capture_process_identity(proc.pid, launch_nonce=nonce)
+            _validate_started_identity(
+                child_identity, executable_identity, process_kind="runtime child"
+            )
+            if not executable_identity.matches_current_file():
+                raise _runtime_identity_changed(executable_identity.canonical_path)
+            metadata = update_metadata(
+                run_dir,
+                status="running",
+                child_pid=proc.pid,
+                child_process_identity=child_identity.to_dict(),
+            )
+            _atomic_write_text(run_dir / "pid.txt", str(proc.pid))
+            append_event(
+                run_dir,
+                {"type": "process_started", "pid": proc.pid, "status": "running"},
+            )
+            if proc.stdin is None:
+                raise BrokenPipeError("runtime stdin is unavailable")
+            _write_pipe_chunk(proc.stdin, prompt_bytes)
+            proc.stdin.flush()
+            proc.stdin.close()
+            proc.stdin = None
+        except RuntimeSecurityError as error:
+            _terminate_owned_process(proc)
+            status = (
+                "blocked_runtime_identity"
+                if error.code == "runtime_identity_changed"
+                else "blocked_process_identity"
+            )
+            return _record_blocked_launch(
+                run_dir,
+                metadata,
+                status=status,
+                error=error,
+                child_pid=proc.pid,
+            )
+        except (BrokenPipeError, OSError, TypeError, ValueError) as exc:
+            _terminate_owned_process(proc)
+            error = (
+                _process_identity_unverified(proc.pid, "runtime child")
+                if isinstance(exc, (TypeError, ValueError))
+                else _launch_failure_error(
+                    "worker_protocol_failed", "The runtime prompt pipe failed."
+                )
+            )
+            return _record_blocked_launch(
+                run_dir,
+                metadata,
+                status=(
+                    "blocked_process_identity"
+                    if error.code == "process_identity_unverified"
+                    else "blocked_runtime_launch"
+                ),
+                error=error,
+                child_pid=proc.pid,
+            )
+    except Exception:
+        _terminate_owned_process(proc)
+        return _record_blocked_launch(
+            run_dir,
+            metadata,
+            status="blocked_runtime_launch",
+            error=_launch_failure_error(
+                "artifact_write_failed", "Child process metadata could not be persisted."
+            ),
+            child_pid=proc.pid,
+        )
     event_lock = threading.Lock()
     budget_lock = threading.Lock()
     budget = output_budget_from_metadata(metadata, run_dir)
@@ -3100,11 +4251,10 @@ def stream_worker(run_id: str) -> dict[str, Any]:
     route_mismatch_recorded = threading.Event()
 
     def persist_budget_unlocked(stop_reason: str | None = None) -> None:
-        latest = read_metadata(run_dir)
-        latest["output_budget"] = dict(budget)
+        updates: dict[str, Any] = {"output_budget": dict(budget)}
         if stop_reason:
-            latest["stop_reason"] = stop_reason
-        write_metadata(run_dir, latest)
+            updates["stop_reason"] = stop_reason
+        update_metadata(run_dir, **updates)
 
     def trigger_budget(reason: str, source: str) -> None:
         with budget_lock:
@@ -3204,8 +4354,13 @@ def stream_worker(run_id: str) -> dict[str, Any]:
     def pump(stream: Any, out_path: Path, source: str) -> None:
         try:
             with out_path.open("a", encoding="utf-8", errors="replace") as out:
-                for line in iter(stream.readline, ""):
-                    raw_bytes = len(line.encode("utf-8", errors="replace"))
+                for raw_line in iter(stream.readline, b""):
+                    line = (
+                        raw_line.decode("utf-8", errors="replace")
+                        if isinstance(raw_line, bytes)
+                        else str(raw_line)
+                    )
+                    raw_bytes = len(raw_line) if isinstance(raw_line, bytes) else len(line.encode("utf-8", errors="replace"))
                     safe_line = str(redact(line))
                     raw_payload: Any | None = None
                     if source == "stdout":
@@ -3280,30 +4435,29 @@ def stream_worker(run_id: str) -> dict[str, Any]:
                 break
             if (run_dir / "stop-requested.json").exists():
                 stopped = True
-                terminate_process_tree(proc.pid, force=False, wait_seconds=5)
+                _terminate_owned_process(proc)
             if budget_stop.is_set():
                 stopped = True
-                terminate_process_tree(proc.pid, force=False, wait_seconds=5)
-                if pid_alive(proc.pid):
-                    terminate_process_tree(proc.pid, force=True, wait_seconds=2)
+                _terminate_owned_process(proc)
             if time.time() - started > timeout:
                 timed_out = True
                 safe_append({"type": "timeout", "timeout_seconds": timeout})
                 with budget_lock:
                     budget["stop_reason"] = "timeout"
                     persist_budget_unlocked("timeout")
-                terminate_process_tree(proc.pid, force=False, wait_seconds=5)
-                if pid_alive(proc.pid):
-                    terminate_process_tree(proc.pid, force=True, wait_seconds=2)
+                _terminate_owned_process(proc)
             time.sleep(0.2)
         try:
             exit_code = proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            terminate_process_tree(proc.pid, force=True, wait_seconds=2)
+            _terminate_owned_process(proc)
             exit_code = proc.poll()
     finally:
+        if proc.poll() is None:
+            _terminate_owned_process(proc)
         for thread in threads:
             thread.join(timeout=2)
+        _terminate_owned_process(proc)
 
     duration_ms = int((time.time() - started) * 1000)
     latest_metadata = read_metadata(run_dir)
@@ -3396,9 +4550,7 @@ def single_run_status(run_id: str, include_output_tail: bool = True, tail_chars:
     stdout_bytes = stdout_path.stat().st_size if stdout_path.exists() else 0
     stderr_bytes = stderr_path.stat().st_size if stderr_path.exists() else 0
     events_bytes = events_path.stat().st_size if events_path.exists() else 0
-    prompt_path = run_dir / "prompt.txt"
-    prompt_text = prompt_path.read_text(encoding="utf-8", errors="replace") if prompt_path.exists() else ""
-    input_tokens_est = max(0, int(len(prompt_text) / 4))
+    input_tokens_est = max(0, int(metadata.get("prompt_tokens_est") or 0))
     output_tokens_est = max(0, int((stdout_bytes + stderr_bytes) / 4))
     output_budget = output_budget_from_metadata(metadata, run_dir)
     route_drift = route_drift_summary(metadata)
@@ -5010,7 +6162,6 @@ def estimate_tokens_from_text(text: str) -> int:
 def estimate_run_usage(run_id: str) -> dict[str, Any]:
     run_dir = safe_run_dir(run_id)
     metadata = read_metadata(run_dir)
-    prompt = (run_dir / "prompt.txt").read_text(encoding="utf-8", errors="replace") if (run_dir / "prompt.txt").exists() else ""
     stdout_path = run_dir / "stdout.txt"
     stderr_path = run_dir / "stderr.txt"
     events_path = run_dir / "events.ndjson"
@@ -5021,7 +6172,7 @@ def estimate_run_usage(run_id: str) -> dict[str, Any]:
     actual_route = actual_route_summary(metadata)
     declared_model = profile.get("model")
     actual_model = actual_route.get("actual_model")
-    input_tokens = estimate_tokens_from_text(prompt)
+    input_tokens = max(0, int(metadata.get("prompt_tokens_est") or 0))
     output_tokens = max(0, int((stdout_bytes + stderr_bytes) / 4))
     if actual_route.get("actual_total_tokens") is not None:
         input_tokens = int(actual_route.get("actual_input_tokens") or 0)
