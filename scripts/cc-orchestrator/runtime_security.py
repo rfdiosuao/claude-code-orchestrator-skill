@@ -504,6 +504,12 @@ def authorize_runtime(
             Path.cwd(),
         )
     executable = canonical_path(candidate.canonical_path)
+    if type(allow_unsafe_runtime) is not bool:
+        raise _runtime_error(
+            "unsafe_runtime_request_invalid",
+            "Unsafe runtime request approval must be a boolean.",
+            executable,
+        )
     if candidate.trust_class not in {
         "trusted_default",
         "discovered_unpinned",

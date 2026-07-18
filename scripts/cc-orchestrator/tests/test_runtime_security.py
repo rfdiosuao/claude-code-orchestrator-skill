@@ -346,6 +346,32 @@ class RuntimeAuthorizationTests(unittest.TestCase):
             self.assertEqual(decision.runtime_id, "local-fixture")
             self.assertEqual(decision.trust_level, "local_unsafe")
 
+    def test_unsafe_runtime_request_approval_requires_a_literal_bool(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            executable = Path(temp_dir) / "runtime.exe"
+            executable.write_text("fixture", encoding="utf-8")
+            identity = self.identity_chain(executable, 1)
+            candidate = self.candidate(executable, "local_configured")
+            policy = RuntimeSecurityPolicy(
+                unsafe_runtimes=(ApprovedUnsafeRuntime("local-fixture", identity),)
+            )
+
+            for request_flag in ("false", "true", 1, 0, None, [], {}):
+                with self.subTest(request_flag=repr(request_flag)), self.assertRaises(
+                    RuntimeSecurityError
+                ) as raised:
+                    authorize_runtime(
+                        candidate=candidate,
+                        identity=identity,
+                        policy=policy,
+                        allow_unsafe_runtime=request_flag,
+                    )
+                self.assertEqual(raised.exception.code, "unsafe_runtime_request_invalid")
+                self.assertEqual(
+                    raised.exception.safe_details["canonical_path"], str(executable.resolve())
+                )
+                self.assertNotIn("local_unsafe", json.dumps(raised.exception.to_dict()))
+
     def test_trust_class_is_not_inferred_from_a_matching_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             executable = Path(temp_dir) / "runtime.exe"
