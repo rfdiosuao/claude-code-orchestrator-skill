@@ -27,6 +27,7 @@ _EXITED_REASON = "process exited"
 _ACCESS_DENIED_REASON = "access denied"
 _QUERY_FAILED_REASON = "process query failed"
 _MALFORMED_REASON = "process information malformed"
+_UNSTABLE_REASON = "process identity changed during capture"
 
 
 def _is_int(value: object) -> bool:
@@ -71,6 +72,34 @@ class ProcessIdentity:
     supported: bool
     unsupported_reason: str | None = None
 
+    def __post_init__(self) -> None:
+        if not _is_int(self.pid):
+            raise TypeError("pid must be an integer")
+        if self.pid <= 0:
+            raise ValueError("pid must be positive")
+        _require_optional_string(self.creation_token, "creation_token")
+        _require_optional_string(self.executable_path, "executable_path")
+        _require_optional_int(self.parent_pid, "parent_pid", allow_zero=False)
+        _require_optional_int(
+            self.process_group_id, "process_group_id", allow_zero=True
+        )
+        _require_optional_int(self.session_id, "session_id", allow_zero=True)
+        if not isinstance(self.launch_nonce, str):
+            raise TypeError("launch_nonce must be a string")
+        if not self.launch_nonce:
+            raise ValueError("launch_nonce must not be empty")
+        if not isinstance(self.supported, bool):
+            raise TypeError("supported must be a boolean")
+        _require_optional_string(self.unsupported_reason, "unsupported_reason")
+
+        has_minimum = self.creation_token is not None and self.executable_path is not None
+        if self.supported and (not has_minimum or self.unsupported_reason is not None):
+            raise ValueError("supported identity has inconsistent evidence")
+        if not self.supported and self.unsupported_reason is None:
+            raise ValueError("unsupported identity requires a reason")
+        if not self.supported and has_minimum:
+            raise ValueError("unsupported identity contains complete minimum evidence")
+
     def to_dict(self) -> dict[str, Any]:
         return {field: getattr(self, field) for field in _IDENTITY_FIELDS}
 
@@ -85,56 +114,16 @@ class ProcessIdentity:
         if not all(isinstance(key, str) for key in data.keys()):
             raise TypeError("process identity field names must be strings")
 
-        pid = data["pid"]
-        if not _is_int(pid):
-            raise TypeError("pid must be an integer")
-        if pid <= 0:
-            raise ValueError("pid must be positive")
-        creation_token = _require_optional_string(
-            data["creation_token"], "creation_token"
-        )
-        executable_path = _require_optional_string(
-            data["executable_path"], "executable_path"
-        )
-        parent_pid = _require_optional_int(
-            data["parent_pid"], "parent_pid", allow_zero=False
-        )
-        process_group_id = _require_optional_int(
-            data["process_group_id"], "process_group_id", allow_zero=True
-        )
-        session_id = _require_optional_int(
-            data["session_id"], "session_id", allow_zero=True
-        )
-        launch_nonce = data["launch_nonce"]
-        if not isinstance(launch_nonce, str):
-            raise TypeError("launch_nonce must be a string")
-        if not launch_nonce:
-            raise ValueError("launch_nonce must not be empty")
-        supported = data["supported"]
-        if not isinstance(supported, bool):
-            raise TypeError("supported must be a boolean")
-        unsupported_reason = _require_optional_string(
-            data["unsupported_reason"], "unsupported_reason"
-        )
-
-        has_minimum = creation_token is not None and executable_path is not None
-        if supported and (not has_minimum or unsupported_reason is not None):
-            raise ValueError("supported identity has inconsistent evidence")
-        if not supported and unsupported_reason is None:
-            raise ValueError("unsupported identity requires a reason")
-        if not supported and has_minimum:
-            raise ValueError("unsupported identity contains complete minimum evidence")
-
         return cls(
-            pid=pid,
-            creation_token=creation_token,
-            executable_path=executable_path,
-            parent_pid=parent_pid,
-            process_group_id=process_group_id,
-            session_id=session_id,
-            launch_nonce=launch_nonce,
-            supported=supported,
-            unsupported_reason=unsupported_reason,
+            pid=data["pid"],
+            creation_token=data["creation_token"],
+            executable_path=data["executable_path"],
+            parent_pid=data["parent_pid"],
+            process_group_id=data["process_group_id"],
+            session_id=data["session_id"],
+            launch_nonce=data["launch_nonce"],
+            supported=data["supported"],
+            unsupported_reason=data["unsupported_reason"],
         )
 
 
@@ -182,17 +171,13 @@ def capture_process_identity(pid: int, *, launch_nonce: str) -> ProcessIdentity:
     return _unsupported(pid, launch_nonce, "platform unsupported")
 
 
-def _is_windows() -> bool:
-    return sys.platform == "win32"
-
-
 def _path_for_comparison(path: str) -> str:
-    if _is_windows():
+    if sys.platform == "win32":
         path = _strip_windows_extended_prefix(path)
         return ntpath.normcase(ntpath.normpath(path))
-    if path.endswith(" (deleted)"):
+    if sys.platform.startswith("linux") and path.endswith(" (deleted)"):
         path = path[: -len(" (deleted)")]
-    return os.path.normpath(path)
+    return posixpath.normpath(path)
 
 
 def compare_process_identity(
@@ -226,6 +211,8 @@ def compare_process_identity(
         )
     except (OSError, ValueError, TypeError):
         return ProcessIdentityCheck(state="unverified")
+    if not isinstance(live, ProcessIdentity):
+        return ProcessIdentityCheck(state="unverified")
     if not live.supported:
         state = "exited" if live.unsupported_reason == _EXITED_REASON else "unverified"
         return ProcessIdentityCheck(state=state, live=live)
@@ -233,6 +220,8 @@ def compare_process_identity(
         return ProcessIdentityCheck(state="unverified", live=live)
 
     differing: list[str] = []
+    if expected.pid != live.pid:
+        differing.append("pid")
     if expected.creation_token != live.creation_token:
         differing.append("creation_token")
     if _path_for_comparison(expected.executable_path) != _path_for_comparison(
@@ -299,6 +288,8 @@ def _capture_linux(
         return _unsupported(pid, launch_nonce, _EXITED_REASON)
     except PermissionError:
         return _unsupported(pid, launch_nonce, _ACCESS_DENIED_REASON)
+    except UnicodeError:
+        return _unsupported(pid, launch_nonce, _MALFORMED_REASON)
     except OSError:
         return _unsupported(pid, launch_nonce, _QUERY_FAILED_REASON)
     try:
@@ -309,14 +300,6 @@ def _capture_linux(
         return _unsupported(pid, launch_nonce, _MALFORMED_REASON)
 
     try:
-        boot_id = boot_id_path.read_text(encoding="ascii", errors="strict").strip()
-        if not boot_id or any(character.isspace() for character in boot_id):
-            raise ValueError("invalid boot id")
-    except PermissionError:
-        return _unsupported(pid, launch_nonce, _ACCESS_DENIED_REASON)
-    except (OSError, UnicodeError, ValueError):
-        return _unsupported(pid, launch_nonce, _QUERY_FAILED_REASON)
-    try:
         executable_path = os.readlink(executable_link)
     except FileNotFoundError:
         return _unsupported(pid, launch_nonce, _EXITED_REASON)
@@ -324,8 +307,39 @@ def _capture_linux(
         return _unsupported(pid, launch_nonce, _ACCESS_DENIED_REASON)
     except OSError:
         return _unsupported(pid, launch_nonce, _QUERY_FAILED_REASON)
-    if not executable_path:
+    if not isinstance(executable_path, str) or not executable_path:
         return _unsupported(pid, launch_nonce, _MALFORMED_REASON)
+
+    try:
+        verify_stat_text = stat_path.read_text(encoding="utf-8", errors="strict")
+    except FileNotFoundError:
+        return _unsupported(pid, launch_nonce, _EXITED_REASON)
+    except PermissionError:
+        return _unsupported(pid, launch_nonce, _ACCESS_DENIED_REASON)
+    except UnicodeError:
+        return _unsupported(pid, launch_nonce, _MALFORMED_REASON)
+    except OSError:
+        return _unsupported(pid, launch_nonce, _QUERY_FAILED_REASON)
+    try:
+        verified_fields = _parse_linux_stat(verify_stat_text, expected_pid=pid)
+    except (TypeError, ValueError):
+        return _unsupported(pid, launch_nonce, _MALFORMED_REASON)
+    if verified_fields != (
+        parent_pid,
+        process_group_id,
+        session_id,
+        start_ticks,
+    ):
+        return _unsupported(pid, launch_nonce, _UNSTABLE_REASON)
+
+    try:
+        boot_id = boot_id_path.read_text(encoding="ascii", errors="strict").strip()
+        if not boot_id or any(character.isspace() for character in boot_id):
+            raise ValueError("invalid boot id")
+    except PermissionError:
+        return _unsupported(pid, launch_nonce, _ACCESS_DENIED_REASON)
+    except (OSError, UnicodeError, ValueError):
+        return _unsupported(pid, launch_nonce, _QUERY_FAILED_REASON)
 
     return ProcessIdentity(
         pid=pid,
@@ -373,6 +387,8 @@ class _WindowsApi:
     ERROR_NO_MORE_FILES = 18
     ERROR_INVALID_PARAMETER = 87
     WAIT_OBJECT_0 = 0
+    WAIT_TIMEOUT = 258
+    WAIT_FAILED = 0xFFFFFFFF
 
     def __init__(self) -> None:
         from ctypes import wintypes
@@ -450,8 +466,15 @@ class _WindowsApi:
     def close_handle(self, handle: int) -> None:
         self._kernel32.CloseHandle(handle)
 
-    def is_exited(self, handle: int) -> bool:
-        return self._kernel32.WaitForSingleObject(handle, 0) == self.WAIT_OBJECT_0
+    def assert_running(self, handle: int) -> None:
+        result = self._kernel32.WaitForSingleObject(handle, 0)
+        if result == self.WAIT_TIMEOUT:
+            return
+        if result == self.WAIT_OBJECT_0:
+            raise ProcessLookupError(errno.ESRCH, "process unavailable")
+        if result == self.WAIT_FAILED:
+            raise self._error()
+        raise OSError(errno.EIO, "unexpected process wait result")
 
     def creation_filetime(self, handle: int) -> tuple[int, int]:
         creation = _FILETIME()
@@ -519,10 +542,12 @@ def _capture_windows(
     handle: int | None = None
     try:
         handle = native.open_process(pid)
+        native.assert_running(handle)
         high, low = native.creation_filetime(handle)
         executable_path = native.executable_path(handle)
         parent_pid = native.parent_pid(pid)
         session_id = native.session_id(pid)
+        native.assert_running(handle)
         if not executable_path:
             raise ValueError("empty executable path")
     except ProcessLookupError:
@@ -530,8 +555,6 @@ def _capture_windows(
     except PermissionError:
         return _unsupported(pid, launch_nonce, _ACCESS_DENIED_REASON)
     except OSError:
-        if handle is not None and getattr(native, "is_exited", lambda _: False)(handle):
-            return _unsupported(pid, launch_nonce, _EXITED_REASON)
         return _unsupported(pid, launch_nonce, _QUERY_FAILED_REASON)
     except (TypeError, ValueError, OverflowError):
         return _unsupported(pid, launch_nonce, _QUERY_FAILED_REASON)
@@ -625,6 +648,7 @@ class _MacApi:
                 self._raise_last_error()
             raise OSError(errno.EIO, "incomplete process information")
         return SimpleNamespace(
+            pid=int(info.pbi_pid),
             start_sec=int(info.pbi_start_tvsec),
             start_usec=int(info.pbi_start_tvusec),
             parent_pid=int(info.pbi_ppid),
@@ -643,14 +667,27 @@ def _capture_macos(
     except (AttributeError, OSError):
         return _unsupported(pid, launch_nonce, _QUERY_FAILED_REASON)
     try:
+        first_info = native.bsd_info(pid)
         executable_path = native.executable_path(pid)
-        info = native.bsd_info(pid)
-        start_sec = int(info.start_sec)
-        start_usec = int(info.start_usec)
-        parent_pid = int(info.parent_pid)
-        process_group_id = int(info.process_group_id)
+        second_info = native.bsd_info(pid)
+        first_fields = (
+            int(first_info.pid),
+            int(first_info.start_sec),
+            int(first_info.start_usec),
+            int(first_info.parent_pid),
+            int(first_info.process_group_id),
+        )
+        second_fields = (
+            int(second_info.pid),
+            int(second_info.start_sec),
+            int(second_info.start_usec),
+            int(second_info.parent_pid),
+            int(second_info.process_group_id),
+        )
+        native_pid, start_sec, start_usec, parent_pid, process_group_id = first_fields
         if (
             not executable_path
+            or native_pid != pid
             or start_sec < 0
             or start_usec < 0
             or start_usec >= 1_000_000
@@ -658,6 +695,8 @@ def _capture_macos(
             or process_group_id < 0
         ):
             raise ValueError("invalid native process information")
+        if second_fields != first_fields:
+            return _unsupported(pid, launch_nonce, _UNSTABLE_REASON)
     except ProcessLookupError:
         return _unsupported(pid, launch_nonce, _EXITED_REASON)
     except PermissionError:

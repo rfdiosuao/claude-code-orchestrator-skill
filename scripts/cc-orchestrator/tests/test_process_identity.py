@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import errno
 import os
 import subprocess
@@ -8,7 +9,7 @@ import unittest
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 TESTS_DIR = Path(__file__).resolve().parent
 if str(TESTS_DIR) not in sys.path:
@@ -108,6 +109,33 @@ class ProcessIdentityContractTests(unittest.TestCase):
             with self.subTest(nonce=nonce), self.assertRaises((TypeError, ValueError)):
                 capture_process_identity(1, launch_nonce=nonce)  # type: ignore[arg-type]
 
+    def test_direct_construction_rejects_every_unserializable_state(self) -> None:
+        valid = supported_identity().to_dict()
+        invalid = (
+            {**valid, "pid": True},
+            {**valid, "pid": 0},
+            {**valid, "creation_token": ""},
+            {**valid, "executable_path": 3},
+            {**valid, "parent_pid": True},
+            {**valid, "parent_pid": 0},
+            {**valid, "process_group_id": -1},
+            {**valid, "session_id": -1},
+            {**valid, "launch_nonce": ""},
+            {**valid, "supported": 1},
+            {**valid, "unsupported_reason": "unexpected"},
+            {
+                **valid,
+                "supported": False,
+                "unsupported_reason": "query failed",
+            },
+        )
+
+        for values in invalid:
+            with self.subTest(values=values), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                ProcessIdentity(**values)
+
 
 class ProcessIdentityComparisonTests(unittest.TestCase):
     def test_exact_minimum_tuple_matches_with_missing_optional_live_fields(self) -> None:
@@ -151,6 +179,17 @@ class ProcessIdentityComparisonTests(unittest.TestCase):
                 "session_id",
             ),
         )
+        self.assertEqual(check.live, live)
+
+    def test_live_pid_mismatch_is_reported_deterministically(self) -> None:
+        expected = supported_identity(pid=4321)
+        live = supported_identity(pid=9999)
+
+        with patch.object(process_identity, "capture_process_identity", return_value=live):
+            check = compare_process_identity(expected)
+
+        self.assertEqual(check.state, "mismatch")
+        self.assertEqual(check.differing_fields, ("pid",))
         self.assertEqual(check.live, live)
 
     def test_controller_nonce_mismatch_short_circuits_without_live_capture(self) -> None:
@@ -204,20 +243,26 @@ class ProcessIdentityComparisonTests(unittest.TestCase):
         self.assertEqual(check.state, "exited")
         self.assertEqual(check.live, live)
 
-    def test_windows_and_linux_path_display_variants_compare_equal(self) -> None:
+    def test_path_display_normalization_is_platform_specific(self) -> None:
         windows_expected = supported_identity(executable_path=r"C:\Python\PYTHON.EXE")
         windows_live = supported_identity(executable_path=r"\\?\c:\python\python.exe")
         linux_expected = supported_identity(executable_path="/tmp/python")
         linux_live = supported_identity(executable_path="/tmp/python (deleted)")
 
-        with patch.object(process_identity, "_is_windows", return_value=True), patch.object(
+        with patch.object(process_identity.sys, "platform", "win32"), patch.object(
             process_identity, "capture_process_identity", return_value=windows_live
         ):
             self.assertEqual(compare_process_identity(windows_expected).state, "match")
-        with patch.object(process_identity, "_is_windows", return_value=False), patch.object(
+        with patch.object(process_identity.sys, "platform", "linux"), patch.object(
             process_identity, "capture_process_identity", return_value=linux_live
         ):
             self.assertEqual(compare_process_identity(linux_expected).state, "match")
+        with patch.object(process_identity.sys, "platform", "darwin"), patch.object(
+            process_identity, "capture_process_identity", return_value=linux_live
+        ):
+            check = compare_process_identity(linux_expected)
+            self.assertEqual(check.state, "mismatch")
+            self.assertEqual(check.differing_fields, ("executable_path",))
 
 
 class LinuxProcessReaderTests(unittest.TestCase):
@@ -249,10 +294,12 @@ class LinuxProcessReaderTests(unittest.TestCase):
         self.assertTrue(identity.supported)
 
     def test_linux_reader_distinguishes_exit_permission_and_malformed_proc(self) -> None:
+        decode_error = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid")
         cases = (
             (FileNotFoundError(), "process exited"),
             (PermissionError(), "access denied"),
             ("bad stat", "process information malformed"),
+            (decode_error, "process information malformed"),
         )
         for result, reason in cases:
             side_effect = result if isinstance(result, BaseException) else None
@@ -268,12 +315,57 @@ class LinuxProcessReaderTests(unittest.TestCase):
             self.assertFalse(identity.supported)
             self.assertEqual(identity.unsupported_reason, reason)
 
+    def test_linux_reader_rejects_torn_pid_reuse_evidence(self) -> None:
+        def stat(start: str, parent: str = "7") -> str:
+            tail = ["S", parent, "8", "9", *(["0"] * 15), start]
+            return f"321 (worker) {' '.join(tail)}"
+
+        stat_values = iter((stat("12345"), stat("99999")))
+
+        def read_text(path: Path, **_: object) -> str:
+            if str(path).endswith("stat"):
+                return next(stat_values)
+            return "boot-id-fixture\n"
+
+        with patch.object(Path, "read_text", autospec=True, side_effect=read_text), patch.object(
+            os, "readlink", return_value="/usr/bin/python3"
+        ):
+            identity = process_identity._capture_linux(321, launch_nonce="nonce")
+
+        self.assertFalse(identity.supported)
+        self.assertEqual(
+            identity.unsupported_reason, "process identity changed during capture"
+        )
+
+    def test_linux_second_stat_disappearance_is_exited(self) -> None:
+        tail = ["S", "7", "8", "9", *(["0"] * 15), "12345"]
+        first_stat = f"321 (worker) {' '.join(tail)}"
+        stat_results = iter((first_stat, FileNotFoundError()))
+
+        def read_text(path: Path, **_: object) -> str:
+            if not str(path).endswith("stat"):
+                return "boot-id-fixture\n"
+            result = next(stat_results)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+        with patch.object(Path, "read_text", autospec=True, side_effect=read_text), patch.object(
+            os, "readlink", return_value="/usr/bin/python3"
+        ):
+            identity = process_identity._capture_linux(321, launch_nonce="nonce")
+
+        self.assertFalse(identity.supported)
+        self.assertEqual(identity.unsupported_reason, "process exited")
+
 
 class FakeWindowsApi:
     def __init__(self) -> None:
         self.closed: list[int] = []
         self.open_error: BaseException | None = None
         self.query_error: BaseException | None = None
+        self.wait_effects: list[BaseException | None] = [None, None]
+        self.queries: list[str] = []
 
     def open_process(self, pid: int) -> int:
         if self.open_error:
@@ -281,21 +373,30 @@ class FakeWindowsApi:
         return 91
 
     def creation_filetime(self, handle: int) -> tuple[int, int]:
+        self.queries.append("creation_filetime")
         if self.query_error:
             raise self.query_error
         return (0x12345678, 0x9ABCDEF0)
 
     def executable_path(self, handle: int) -> str:
+        self.queries.append("executable_path")
         return r"\\?\C:\Python\python.exe"
 
     def parent_pid(self, pid: int) -> int:
+        self.queries.append("parent_pid")
         return 41
 
     def session_id(self, pid: int) -> int:
+        self.queries.append("session_id")
         return 3
 
     def close_handle(self, handle: int) -> None:
         self.closed.append(handle)
+
+    def assert_running(self, handle: int) -> None:
+        effect = self.wait_effects.pop(0)
+        if effect is not None:
+            raise effect
 
 
 class WindowsProcessReaderTests(unittest.TestCase):
@@ -341,10 +442,121 @@ class WindowsProcessReaderTests(unittest.TestCase):
         self.assertFalse(identity.supported)
         self.assertEqual(identity.unsupported_reason, "process query failed")
 
+    def test_windows_reader_rechecks_same_handle_after_successful_queries(self) -> None:
+        api = FakeWindowsApi()
+        api.wait_effects = [None, ProcessLookupError(errno.ESRCH, "signaled")]
+
+        identity = process_identity._capture_windows(42, launch_nonce="nonce", api=api)
+
+        self.assertFalse(identity.supported)
+        self.assertEqual(identity.unsupported_reason, "process exited")
+        self.assertEqual(
+            api.queries,
+            ["creation_filetime", "executable_path", "parent_pid", "session_id"],
+        )
+        self.assertEqual(api.closed, [91])
+
+    def test_windows_wait_failure_is_unverified_before_or_after_queries(self) -> None:
+        for effects, expected_queries in (
+            ([OSError(errno.EIO, "wait failed")], []),
+            ([None, OSError(errno.EIO, "wait failed")], [
+                "creation_filetime",
+                "executable_path",
+                "parent_pid",
+                "session_id",
+            ]),
+        ):
+            api = FakeWindowsApi()
+            api.wait_effects = effects
+            with self.subTest(effects=len(effects)):
+                identity = process_identity._capture_windows(
+                    42, launch_nonce="nonce", api=api
+                )
+            self.assertFalse(identity.supported)
+            self.assertEqual(identity.unsupported_reason, "process query failed")
+            self.assertEqual(api.queries, expected_queries)
+            self.assertEqual(api.closed, [91])
+
+
+class WindowsNativeApiBoundaryTests(unittest.TestCase):
+    @staticmethod
+    def api_with_kernel(**functions: object) -> process_identity._WindowsApi:
+        api = process_identity._WindowsApi.__new__(process_identity._WindowsApi)
+        api._kernel32 = SimpleNamespace(**functions)
+        from ctypes import wintypes
+
+        api._wintypes = wintypes
+        return api
+
+    def test_kernel32_get_process_times_populates_full_filetime(self) -> None:
+        def get_process_times(
+            _handle: int,
+            creation: object,
+            _exit: object,
+            _kernel: object,
+            _user: object,
+        ) -> int:
+            value = ctypes.cast(
+                creation, ctypes.POINTER(process_identity._FILETIME)
+            ).contents
+            value.dwHighDateTime = 0x12345678
+            value.dwLowDateTime = 0x9ABCDEF0
+            return 1
+
+        api = self.api_with_kernel(GetProcessTimes=Mock(side_effect=get_process_times))
+
+        self.assertEqual(
+            api.creation_filetime(91), (0x12345678, 0x9ABCDEF0)
+        )
+
+    def test_kernel32_snapshot_is_closed_on_success_and_error(self) -> None:
+        def process_first(_snapshot: int, entry_pointer: object) -> int:
+            entry = ctypes.cast(
+                entry_pointer, ctypes.POINTER(process_identity._PROCESSENTRY32W)
+            ).contents
+            entry.th32ProcessID = 42
+            entry.th32ParentProcessID = 41
+            return 1
+
+        close = Mock(return_value=1)
+        api = self.api_with_kernel(
+            CreateToolhelp32Snapshot=Mock(return_value=77),
+            Process32FirstW=Mock(side_effect=process_first),
+            Process32NextW=Mock(return_value=0),
+            CloseHandle=close,
+        )
+        self.assertEqual(api.parent_pid(42), 41)
+        close.assert_called_once_with(77)
+
+        close.reset_mock()
+        api._kernel32.Process32FirstW = Mock(return_value=0)
+        with patch.object(ctypes, "get_last_error", return_value=5), self.assertRaises(
+            PermissionError
+        ):
+            api.parent_pid(42)
+        close.assert_called_once_with(77)
+
+    def test_kernel32_wait_distinguishes_running_signaled_and_failed(self) -> None:
+        wait = Mock(return_value=process_identity._WindowsApi.WAIT_TIMEOUT)
+        api = self.api_with_kernel(WaitForSingleObject=wait)
+        api.assert_running(91)
+
+        wait.return_value = process_identity._WindowsApi.WAIT_OBJECT_0
+        with self.assertRaises(ProcessLookupError):
+            api.assert_running(91)
+
+        wait.return_value = process_identity._WindowsApi.WAIT_FAILED
+        with patch.object(ctypes, "get_last_error", return_value=31), self.assertRaises(
+            OSError
+        ):
+            api.assert_running(91)
+        self.assertEqual(wait.call_args_list, [call(91, 0), call(91, 0), call(91, 0)])
+
 
 class FakeMacApi:
     def __init__(self) -> None:
         self.error: BaseException | None = None
+        self.info_values: list[object] = []
 
     def executable_path(self, pid: int) -> str:
         if self.error:
@@ -354,12 +566,14 @@ class FakeMacApi:
     def bsd_info(self, pid: int) -> object:
         if self.error:
             raise self.error
-        return SimpleNamespace(
+        value = SimpleNamespace(
+            pid=42,
             start_sec=1_725_000_001,
             start_usec=234_567,
             parent_pid=41,
             process_group_id=42,
         )
+        return self.info_values.pop(0) if self.info_values else value
 
 
 class MacProcessReaderTests(unittest.TestCase):
@@ -401,6 +615,103 @@ class MacProcessReaderTests(unittest.TestCase):
 
         self.assertFalse(identity.supported)
         self.assertEqual(identity.unsupported_reason, "process query failed")
+
+    def test_macos_reader_rejects_torn_pid_reuse_evidence(self) -> None:
+        api = FakeMacApi()
+        first = api.bsd_info(42)
+        api.info_values = [first, SimpleNamespace(**{**vars(first), "start_usec": 9})]
+
+        identity = process_identity._capture_macos(42, launch_nonce="nonce", api=api)
+
+        self.assertFalse(identity.supported)
+        self.assertEqual(
+            identity.unsupported_reason, "process identity changed during capture"
+        )
+
+    def test_macos_second_native_read_disappearance_is_exited(self) -> None:
+        class DisappearingMacApi(FakeMacApi):
+            def __init__(self) -> None:
+                super().__init__()
+                self.read_count = 0
+
+            def bsd_info(self, pid: int) -> object:
+                self.read_count += 1
+                if self.read_count == 2:
+                    raise ProcessLookupError(errno.ESRCH, "gone")
+                return super().bsd_info(pid)
+
+        identity = process_identity._capture_macos(
+            42, launch_nonce="nonce", api=DisappearingMacApi()
+        )
+
+        self.assertFalse(identity.supported)
+        self.assertEqual(identity.unsupported_reason, "process exited")
+
+
+class MacNativeApiBoundaryTests(unittest.TestCase):
+    @staticmethod
+    def api_with_libproc(**functions: object) -> process_identity._MacApi:
+        api = process_identity._MacApi.__new__(process_identity._MacApi)
+        api._libproc = SimpleNamespace(**functions)
+        return api
+
+    def test_libproc_populates_path_and_complete_bsd_info(self) -> None:
+        path_bytes = b"/usr/bin/python3"
+
+        def proc_pidpath(_pid: int, buffer: object, _size: int) -> int:
+            ctypes.memmove(buffer, path_bytes, len(path_bytes))
+            return len(path_bytes)
+
+        def proc_pidinfo(
+            _pid: int,
+            _flavor: int,
+            _arg: int,
+            info_pointer: object,
+            size: int,
+        ) -> int:
+            info = ctypes.cast(
+                info_pointer, ctypes.POINTER(process_identity._PROC_BSDINFO)
+            ).contents
+            info.pbi_pid = 42
+            info.pbi_ppid = 41
+            info.pbi_pgid = 40
+            info.pbi_start_tvsec = 1_725_000_001
+            info.pbi_start_tvusec = 234_567
+            return size
+
+        api = self.api_with_libproc(
+            proc_pidpath=Mock(side_effect=proc_pidpath),
+            proc_pidinfo=Mock(side_effect=proc_pidinfo),
+        )
+
+        self.assertEqual(api.executable_path(42), "/usr/bin/python3")
+        info = api.bsd_info(42)
+        self.assertEqual(
+            vars(info),
+            {
+                "pid": 42,
+                "start_sec": 1_725_000_001,
+                "start_usec": 234_567,
+                "parent_pid": 41,
+                "process_group_id": 40,
+            },
+        )
+
+    def test_libproc_errors_classify_errno_and_incomplete_structures(self) -> None:
+        for error_number, error_type in (
+            (errno.ESRCH, ProcessLookupError),
+            (errno.EPERM, PermissionError),
+            (errno.EIO, OSError),
+        ):
+            api = self.api_with_libproc(proc_pidpath=Mock(return_value=0))
+            with self.subTest(error=error_number), patch.object(
+                ctypes, "get_errno", return_value=error_number
+            ), self.assertRaises(error_type):
+                api.executable_path(42)
+
+        api = self.api_with_libproc(proc_pidinfo=Mock(return_value=1))
+        with self.assertRaises(OSError):
+            api.bsd_info(42)
 
 
 class LiveProcessIdentityTests(unittest.TestCase):
