@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import getpass
 import hashlib
 import html as html_lib
 import json
 import os
+import queue
 import re
 import shutil
 import signal
@@ -27,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 def configure_stdio() -> None:
     """Keep JSON output readable on Windows consoles with non-ASCII text."""
@@ -62,7 +65,11 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from process_identity import ProcessIdentity, capture_process_identity
+from process_identity import (
+    ProcessIdentity,
+    capture_process_identity,
+    compare_process_identity,
+)
 from runtime_security import (
     ExecutableIdentity,
     RuntimeExecutableCandidate,
@@ -152,6 +159,21 @@ INTERNAL_WORKER_NONCE_ENV = "CC_ORCHESTRATOR_INTERNAL_WORKER_NONCE"
 PRIVATE_LAUNCH_FRAME_LIMIT = 64 * 1024
 PROMPT_BYTES_LIMIT = 1024 * 1024
 INTERNAL_WORKER_NONCE_TTL_SECONDS = 60
+WORKER_START_GATE_TIMEOUT_SECONDS = 5.0
+SCRUBBED_VALUE = "[REDACTED]"
+CONTROLLER_OS_BASELINE_KEYS = (
+    (
+        "SystemRoot",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+    )
+    if os.name == "nt"
+    else ("HOME", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR")
+)
 _ACTIVE_WORKER_HANDLES: dict[str, subprocess.Popen[Any]] = {}
 _ACTIVE_WORKER_HANDLES_LOCK = threading.Lock()
 CLAUDE_MD_MARKER_BEGIN = "<!-- claude-code-orchestrator:begin -->"
@@ -481,13 +503,13 @@ def _trusted_candidate_source(path: Path) -> str | None:
 def discover_claude_candidate(
     *, ignore_environment_override: bool = True
 ) -> RuntimeExecutableCandidate:
-    candidates: list[Path] = []
+    candidates: list[tuple[Path, str]] = []
     home = user_home()
     direct_names = ("claude.exe", "claude") if os.name == "nt" else ("claude",)
     for name in direct_names:
         candidate = home / ".local" / "bin" / name
         if candidate.is_file():
-            candidates.append(candidate)
+            candidates.append((candidate, "enumerated_root"))
     glob_roots = (
         (
             home,
@@ -502,12 +524,16 @@ def discover_claude_candidate(
         if not str(root) or not root.exists():
             continue
         try:
-            candidates.extend(path for path in root.glob(pattern) if path.is_file())
+            candidates.extend(
+                (path, "enumerated_root")
+                for path in root.glob(pattern)
+                if path.is_file()
+            )
         except OSError:
             continue
     path_hit = shutil.which("claude")
     if path_hit:
-        candidates.append(Path(path_hit))
+        candidates.append((Path(path_hit), "path_discovery"))
     if not ignore_environment_override:
         explicit = os.environ.get("CLAUDE_CODE_BIN")
         if explicit:
@@ -518,19 +544,20 @@ def discover_claude_candidate(
                 else shutil.which(explicit) or ""
             )
             if resolved and Path(resolved).is_file():
-                candidates.insert(0, Path(resolved))
+                candidates.insert(0, (Path(resolved), "environment_override"))
 
-    seen: set[str] = set()
-    resolved_candidates: list[Path] = []
-    for candidate in candidates:
+    resolved_candidates: dict[str, tuple[Path, str]] = {}
+    for candidate, provenance in candidates:
         try:
             resolved = canonical_path(candidate)
         except (OSError, ValueError):
             continue
         key = os.path.normcase(str(resolved))
-        if key not in seen:
-            seen.add(key)
-            resolved_candidates.append(resolved)
+        previous = resolved_candidates.get(key)
+        if previous is None or (
+            provenance == "enumerated_root" and previous[1] != "enumerated_root"
+        ):
+            resolved_candidates[key] = (resolved, provenance)
     if not resolved_candidates:
         ambient = os.environ.get("CLAUDE_CODE_BIN")
         action = (
@@ -546,17 +573,24 @@ def discover_claude_candidate(
             suggested_action=action,
         )
 
-    selected = sorted(
-        resolved_candidates,
+    selected, provenance = sorted(
+        resolved_candidates.values(),
         key=lambda item: (
-            0 if _trusted_candidate_source(item) is not None else 1,
-            _claude_candidate_rank(str(item)),
+            0
+            if item[1] == "enumerated_root"
+            and _trusted_candidate_source(item[0]) is not None
+            else 1,
+            _claude_candidate_rank(str(item[0])),
         ),
     )[0]
-    trusted_source = _trusted_candidate_source(selected)
+    trusted_source = (
+        _trusted_candidate_source(selected)
+        if provenance == "enumerated_root"
+        else None
+    )
     return RuntimeExecutableCandidate(
         canonical_path=str(selected),
-        source=trusted_source or "path_discovery",
+        source=trusted_source or provenance,
         trust_class="trusted_default" if trusted_source else "discovered_unpinned",
     )
 
@@ -579,12 +613,45 @@ def load_json(path: Path) -> dict[str, Any]:
         raise OrchestratorError(f"Invalid JSON in {path}: {exc}") from exc
 
 
+def _long_text_may_contain_secret(value: str) -> bool:
+    lowered = value.casefold()
+    if any(
+        marker in lowered
+        for marker in (
+            "sk-",
+            "ghp_",
+            "github_pat_",
+            "npm_",
+            "akia",
+            "aiza",
+            "bearer ",
+            "-----begin ",
+        )
+    ):
+        return True
+    if "." not in value:
+        return False
+    for match in re.finditer(r"[A-Za-z0-9_.-]+", value):
+        token = match.group(0)
+        if "." not in token:
+            continue
+        parts = token.split(".")
+        for left, right in zip(parts, parts[1:]):
+            left_length = len(left) - len(left.rstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"))
+            right_length = len(right) - len(right.lstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"))
+            if left_length >= 20 and right_length >= 8:
+                return True
+    return False
+
+
 def redact(value: Any) -> Any:
     if isinstance(value, dict):
         return {k: ("***REDACTED***" if should_redact_key(str(k), v) else redact(v)) for k, v in value.items()}
     if isinstance(value, list):
         return [redact(v) for v in value]
     if isinstance(value, str):
+        if len(value) > 64 * 1024:
+            return SCRUBBED_VALUE if _long_text_may_contain_secret(value) else value
         return SECRET_VALUE_RE.sub(lambda match: match.group(0)[:6] + "..." + match.group(0)[-4:], value)
     return value
 
@@ -631,6 +698,31 @@ def validate_env_key(key: str) -> str:
     return key
 
 
+def _controller_os_environment_baseline() -> dict[str, str]:
+    baseline: dict[str, str] = {}
+    for key in CONTROLLER_OS_BASELINE_KEYS:
+        value = os.environ.get(key)
+        if isinstance(value, str) and value and "\x00" not in value:
+            baseline[key] = value
+    return baseline
+
+
+def _reject_provider_baseline_overrides(provider_env: Mapping[str, str]) -> None:
+    baseline_names = {key.casefold() for key in CONTROLLER_OS_BASELINE_KEYS}
+    forbidden = sorted(
+        str(key)
+        for key in provider_env
+        if isinstance(key, str) and key.casefold() in baseline_names
+    )
+    if forbidden:
+        raise RuntimeSecurityError(
+            code="provider_env_forbidden",
+            message="Provider environment contains a controller-owned OS key.",
+            safe_details={"keys": forbidden},
+            suggested_action="Remove controller-owned OS keys from the provider profile.",
+        )
+
+
 def build_worker_env(
     provider_env: dict[str, str],
     model_override: str | None = None,
@@ -638,6 +730,7 @@ def build_worker_env(
     artifact_root: str | Path | None = None,
 ) -> dict[str, str]:
     policy = load_runtime_security_policy()
+    _reject_provider_baseline_overrides(provider_env)
     env = dict(policy.validate_provider_env(provider_env))
     if model_override is not None:
         if not isinstance(model_override, str) or not model_override or "\x00" in model_override:
@@ -651,6 +744,7 @@ def build_worker_env(
     if os.name != "nt":
         env["LANG"] = "C.UTF-8"
         env["LC_ALL"] = "C.UTF-8"
+    env.update(_controller_os_environment_baseline())
     return env
 
 
@@ -1279,6 +1373,76 @@ def artifact_lock(run_dir: Path, timeout_seconds: float = 10.0) -> _ArtifactLock
     return _ArtifactLock(run_dir, timeout_seconds)
 
 
+def _enforce_windows_private_acl(path: Path, *, is_dir: bool) -> None:
+    system_root = Path(os.environ.get("SystemRoot") or os.environ.get("WINDIR") or r"C:\Windows")
+    bundled = system_root / "System32" / "icacls.exe"
+    icacls = str(bundled) if bundled.is_file() else shutil.which("icacls.exe")
+    if not icacls:
+        raise OrchestratorError("Windows ACL enforcement tool is unavailable.")
+    principal = getpass.getuser()
+    domain = os.environ.get("USERDOMAIN")
+    if domain and "\\" not in principal:
+        principal = f"{domain}\\{principal}"
+    grant = f"{principal}:{'(OI)(CI)F' if is_dir else 'F'}"
+    commands = (
+        [icacls, str(path), "/inheritance:r", "/grant:r", grant],
+        [icacls, str(path), "/verify"],
+    )
+    for command in commands:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+        if completed.returncode != 0:
+            raise OrchestratorError(
+                f"Could not enforce a private Windows ACL for {path.name}."
+            )
+
+
+def _set_private_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path, 0o700)
+    if os.name == "nt":
+        _enforce_windows_private_acl(path, is_dir=True)
+
+
+def _set_private_file(path: Path) -> None:
+    os.chmod(path, 0o600)
+
+
+def _secure_run_artifacts(run_dir: Path) -> None:
+    os.chmod(run_dir, 0o700)
+    for path in run_dir.rglob("*"):
+        if path.is_file():
+            _set_private_file(path)
+
+
+def _scrub_run_artifacts(
+    run_dir: Path, sensitive_values: tuple[str, ...]
+) -> None:
+    replacements: set[bytes] = set()
+    for value in sensitive_values:
+        replacements.add(value.encode("utf-8"))
+        escaped = json.dumps(value, ensure_ascii=False)[1:-1]
+        replacements.add(escaped.encode("utf-8"))
+    replacements.discard(b"")
+    marker = SCRUBBED_VALUE.encode("utf-8")
+    with artifact_lock(run_dir):
+        for path in run_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            payload = path.read_bytes()
+            scrubbed = payload
+            for value in sorted(replacements, key=len, reverse=True):
+                scrubbed = scrubbed.replace(value, marker)
+            if scrubbed != payload:
+                _atomic_write_bytes(path, scrubbed)
+
+
 def _atomic_write_bytes(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
@@ -1291,6 +1455,7 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
             delete=False,
         ) as handle:
             temporary_path = Path(handle.name)
+            _set_private_file(temporary_path)
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
@@ -1304,6 +1469,7 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
                     raise
                 time.sleep(0.005)
         temporary_path = None
+        _set_private_file(path)
     finally:
         if temporary_path is not None:
             try:
@@ -1699,16 +1865,29 @@ def extract_tool_calls_from_payload(payload: Any) -> list[dict[str, Any]]:
 def append_event(run_dir: Path, event: dict[str, Any]) -> None:
     with artifact_lock(run_dir):
         seq_path = run_dir / "event_seq.txt"
+        last_seq = 0
+        path = run_dir / "events.ndjson"
         try:
-            seq = int(seq_path.read_text(encoding="utf-8").strip() or "0") + 1
-        except (FileNotFoundError, ValueError):
-            seq = 1
+            for line in path.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    candidate = json.loads(line).get("seq")
+                except (AttributeError, json.JSONDecodeError):
+                    continue
+                if isinstance(candidate, int) and not isinstance(candidate, bool):
+                    last_seq = max(last_seq, candidate)
+        except FileNotFoundError:
+            pass
+        seq = last_seq + 1
         persisted_event = dict(event)
-        persisted_event.setdefault("seq", seq)
+        persisted_event["seq"] = seq
         persisted_event.setdefault("ts", utc_now_iso())
         persisted_event.setdefault("run_id", run_dir.name)
-        path = run_dir / "events.ndjson"
         with path.open("a", encoding="utf-8", errors="replace") as handle:
+            _set_private_file(path)
             handle.write(
                 json.dumps(
                     sanitize_for_json(redact(persisted_event)), ensure_ascii=False
@@ -2976,6 +3155,132 @@ def _thaw_route_value(value: Any) -> Any:
     return value
 
 
+def _endpoint_sensitive_values(value: str) -> tuple[str, ...]:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return ()
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
+        return ()
+    sensitive: list[str] = []
+    if parsed.username:
+        sensitive.append(parsed.username)
+    if parsed.password:
+        sensitive.append(parsed.password)
+    try:
+        query = parse_qsl(parsed.query, keep_blank_values=True)
+    except ValueError:
+        query = []
+    sensitive.extend(
+        query_value
+        for query_key, query_value in query
+        if query_value and should_redact_key(query_key, query_value)
+    )
+    return tuple(sensitive)
+
+
+def _sanitize_endpoint(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return value
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
+        return value
+    hostname = parsed.hostname
+    if not hostname:
+        return value
+    host = f"[{hostname}]" if ":" in hostname and not hostname.startswith("[") else hostname
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    netloc = f"{host}:{port}" if port is not None else host
+    query = []
+    try:
+        for key, item in parse_qsl(parsed.query, keep_blank_values=True):
+            query.append(
+                (key, SCRUBBED_VALUE if should_redact_key(key, item) else item)
+            )
+    except ValueError:
+        return value
+    return urlunsplit(
+        (parsed.scheme, netloc, parsed.path, urlencode(query), parsed.fragment)
+    )
+
+
+def _collect_route_sensitive_values(value: Any) -> tuple[str, ...]:
+    collected: list[str] = []
+    if isinstance(value, Mapping):
+        for item in value.values():
+            collected.extend(_collect_route_sensitive_values(item))
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            collected.extend(_collect_route_sensitive_values(item))
+    elif isinstance(value, str):
+        collected.extend(_endpoint_sensitive_values(value))
+    return tuple(collected)
+
+
+def _prompt_sensitive_values(prompt: bytes | str) -> tuple[str, ...]:
+    text = (
+        prompt.decode("utf-8", errors="strict")
+        if isinstance(prompt, bytes)
+        else prompt
+    )
+    values = [text] if text else []
+    task_marker = "\nTask:\n"
+    context_marker = "\n\nAdditional context:\n"
+    if task_marker in text:
+        task_and_context = text.rsplit(task_marker, 1)[1]
+        if context_marker in task_and_context:
+            task, context = task_and_context.split(context_marker, 1)
+            values.extend([task.strip(), context.strip()])
+        else:
+            values.append(task_and_context.strip())
+    return tuple(value for value in values if value)
+
+
+def _normalize_sensitive_values(values: Any) -> tuple[str, ...]:
+    unique = {
+        str(value)
+        for value in values
+        if isinstance(value, str) and value
+    }
+    return tuple(sorted(unique, key=lambda item: (-len(item), item)))
+
+
+def _scrub_exact_text(text: str, sensitive_values: tuple[str, ...]) -> str:
+    safe = _sanitize_endpoint(text)
+    for value in sensitive_values:
+        safe = safe.replace(value, SCRUBBED_VALUE)
+    return str(redact(safe))
+
+
+def _scrub_output_text(text: str, sensitive_values: tuple[str, ...]) -> str:
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return _scrub_exact_text(text, sensitive_values)
+    scrubbed = _scrub_guarded_value(parsed, sensitive_values)
+    ending = "\n" if text.endswith(("\n", "\r")) else ""
+    return json.dumps(scrubbed, ensure_ascii=False) + ending
+
+
+def _scrub_guarded_value(value: Any, sensitive_values: tuple[str, ...]) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            _scrub_exact_text(str(key), sensitive_values): _scrub_guarded_value(
+                item, sensitive_values
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_scrub_guarded_value(item, sensitive_values) for item in value]
+    if isinstance(value, str):
+        return _scrub_exact_text(value, sensitive_values)
+    return value
+
+
 @dataclass(frozen=True)
 class PreparedWorkerLaunch:
     mode: str
@@ -2983,6 +3288,9 @@ class PreparedWorkerLaunch:
     prompt_bytes: bytes
     safe_route_metadata: Mapping[str, Any]
     expected_child_launches: int
+    selected_model: str | None = None
+    skip_cost_guard: bool = False
+    sensitive_values: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.mode not in {"one_shot", "streaming"}:
@@ -3009,9 +3317,39 @@ class PreparedWorkerLaunch:
             or self.expected_child_launches < 1
         ):
             raise TypeError("expected_child_launches must be a positive integer")
+        if self.selected_model is not None and not isinstance(
+            self.selected_model, str
+        ):
+            raise TypeError("selected_model must be a string or null")
+        if not isinstance(self.skip_cost_guard, bool):
+            raise TypeError("skip_cost_guard must be a boolean")
+        object.__setattr__(
+            self,
+            "sensitive_values",
+            _normalize_sensitive_values(self.sensitive_values),
+        )
 
     def metadata(self) -> dict[str, Any]:
         return _thaw_route_value(self.safe_route_metadata)
+
+
+def _with_controller_environment_baseline(
+    launch_spec: RuntimeLaunchSpec,
+) -> RuntimeLaunchSpec:
+    environment = dict(launch_spec.environment)
+    environment.update(_controller_os_environment_baseline())
+    return RuntimeLaunchSpec.create(
+        runtime_id=launch_spec.runtime_id,
+        protocol_version=launch_spec.protocol_version,
+        executable_identity=launch_spec.executable_identity,
+        arguments=launch_spec.arguments,
+        cwd=launch_spec.cwd,
+        permission_mode=launch_spec.permission_mode,
+        timeout_seconds=launch_spec.timeout_seconds,
+        environment=environment,
+        trust_level=launch_spec.trust_level,
+        policy_decision_id=launch_spec.policy_decision_id,
+    )
 
 
 def prepare_worker_launch(
@@ -3029,6 +3367,9 @@ def prepare_worker_launch(
     safe_route_metadata: Mapping[str, Any],
     expected_child_launches: int = 1,
     allow_unsafe_runtime: bool = False,
+    selected_model: str | None = None,
+    skip_cost_guard: bool = False,
+    sensitive_values: tuple[str, ...] = (),
 ) -> PreparedWorkerLaunch:
     if mode not in {"one_shot", "streaming"}:
         raise OrchestratorError("Launch mode must be one_shot or streaming.")
@@ -3050,6 +3391,7 @@ def prepare_worker_launch(
     workspace = Path(workspace_root).expanduser().resolve()
     artifacts = Path(artifact_root).expanduser().resolve()
     policy = load_runtime_security_policy()
+    _reject_provider_baseline_overrides(provider_env)
     candidate = resolve_runtime_candidate(policy)
     launch_spec = build_runtime_launch_spec(
         runtime_candidate=candidate,
@@ -3064,10 +3406,24 @@ def prepare_worker_launch(
         policy=policy,
         allow_unsafe_runtime=allow_unsafe_runtime,
     )
+    launch_spec = _with_controller_environment_baseline(launch_spec)
     frame = launch_spec.private_frame()
     if len(frame) > PRIVATE_LAUNCH_FRAME_LIMIT:
         raise OrchestratorError("Private launch frame exceeds the 64 KiB limit.")
-    metadata = dict(safe_route_metadata)
+    provider_secrets = tuple(
+        str(value)
+        for key, value in provider_env.items()
+        if value and should_redact_key(str(key), value)
+    )
+    exact_values = _normalize_sensitive_values(
+        (
+            *_prompt_sensitive_values(prompt_bytes),
+            *provider_secrets,
+            *_collect_route_sensitive_values(safe_route_metadata),
+            *sensitive_values,
+        )
+    )
+    metadata = _scrub_guarded_value(dict(safe_route_metadata), exact_values)
     metadata.update(
         {
             "run_id": new_run_id(),
@@ -3083,12 +3439,17 @@ def prepare_worker_launch(
             "prompt_tokens_est": max(0, (len(prompt_bytes) + 3) // 4),
         }
     )
+    if launch_spec.trust_level == "local_unsafe":
+        metadata["acceptance_status"] = "pending_controller_review"
     return PreparedWorkerLaunch(
         mode=mode,
         launch_spec=launch_spec,
         prompt_bytes=prompt_bytes,
         safe_route_metadata=metadata,
         expected_child_launches=expected_child_launches,
+        selected_model=selected_model,
+        skip_cost_guard=skip_cost_guard,
+        sensitive_values=exact_values,
     )
 
 
@@ -3239,9 +3600,9 @@ def _record_blocked_launch(
     error: RuntimeSecurityError,
     **updates: Any,
 ) -> dict[str, Any]:
-    blocked = dict(metadata)
-    blocked.update(updates)
-    blocked.update(
+    proposed = dict(metadata)
+    proposed.update(updates)
+    proposed.update(
         {
             "status": status,
             "finished_at": utc_now_iso(),
@@ -3251,10 +3612,41 @@ def _record_blocked_launch(
         }
     )
     try:
-        write_metadata(run_dir, blocked)
+        with artifact_lock(run_dir):
+            try:
+                current = read_metadata(run_dir)
+            except (FileNotFoundError, OrchestratorError):
+                current = {}
+            if int(current.get("terminal_state_count") or 0) >= 1:
+                return {
+                    **current,
+                    "persisted": True,
+                    "persistence_state": "persisted",
+                }
+            blocked = dict(metadata)
+            blocked.update(current)
+            blocked.update(updates)
+            blocked.update(
+                {
+                    "status": status,
+                    "finished_at": utc_now_iso(),
+                    "exit_code": None,
+                    "security_error": error.to_dict(),
+                    "terminal_state_count": 1,
+                    "persisted": True,
+                    "persistence_state": "persisted",
+                }
+            )
+            _atomic_write_bytes(
+                run_dir / "metadata.json", _metadata_bytes(blocked)
+            )
+            return blocked
     except Exception:
-        _atomic_write_bytes(run_dir / "metadata.json", _metadata_bytes(blocked))
-    return blocked
+        return {
+            **proposed,
+            "persisted": False,
+            "persistence_state": "degraded",
+        }
 
 
 def _terminate_owned_process(process: subprocess.Popen[Any]) -> None:
@@ -3272,6 +3664,47 @@ def _terminate_owned_process(process: subprocess.Popen[Any]) -> None:
                 stream.close()
             except OSError:
                 pass
+
+
+def _output_bytes(value: Any) -> bytes:
+    if value is None:
+        return b""
+    if isinstance(value, bytes):
+        return value
+    return str(value).encode("utf-8", errors="replace")
+
+
+def _prefer_complete_output(partial: Any, drained: Any) -> bytes:
+    partial_bytes = _output_bytes(partial)
+    drained_bytes = _output_bytes(drained)
+    if not partial_bytes:
+        return drained_bytes
+    if not drained_bytes:
+        return partial_bytes
+    if partial_bytes in drained_bytes:
+        return drained_bytes
+    if drained_bytes in partial_bytes:
+        return partial_bytes
+    return partial_bytes + drained_bytes
+
+
+def _terminate_and_drain_owned_process(
+    process: subprocess.Popen[Any],
+) -> tuple[bytes, bytes]:
+    if process.poll() is None:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+    try:
+        stdout, stderr = process.communicate(timeout=5)
+    except subprocess.TimeoutExpired as timeout_error:
+        if process.poll() is None:
+            process.kill()
+        stdout, stderr = process.communicate()
+        stdout = _prefer_complete_output(timeout_error.output, stdout)
+        stderr = _prefer_complete_output(timeout_error.stderr, stderr)
+    return _output_bytes(stdout), _output_bytes(stderr)
 
 
 def _retain_worker_handle(run_id: str, worker: subprocess.Popen[Any]) -> None:
@@ -3306,7 +3739,9 @@ def _initialize_prepared_run(
     run_id = str(metadata["run_id"])
     artifact_root = Path(str(metadata["artifact_root"]))
     run_dir = artifact_root / "runs" / run_id
-    run_dir.mkdir(parents=True, exist_ok=False)
+    if run_dir.exists():
+        raise FileExistsError(run_dir)
+    _set_private_directory(run_dir)
     metadata.update(
         {
             "status": "starting" if prepared.mode == "streaming" else metadata.get("status"),
@@ -3327,7 +3762,9 @@ def _initialize_prepared_run(
                 datetime.now(timezone.utc)
                 + timedelta(seconds=INTERNAL_WORKER_NONCE_TTL_SECONDS)
             ).isoformat(),
+            "start_gate": "closed",
         }
+        metadata["controller_pid"] = os.getpid()
     for name in ("stdout.txt", "stderr.txt", "events.ndjson"):
         _atomic_write_text(run_dir / name, "")
     register_run_dir(
@@ -3339,6 +3776,8 @@ def _initialize_prepared_run(
     metadata["git_before"] = capture_git_snapshot(
         run_dir, Path(str(metadata["cwd"])), "before"
     )
+    _scrub_run_artifacts(run_dir, prepared.sensitive_values)
+    _secure_run_artifacts(run_dir)
     write_metadata(run_dir, metadata)
     if prepared.mode == "streaming":
         append_event(
@@ -3379,6 +3818,13 @@ def _start_one_shot_launch(
     command = _runtime_command(identity, spec.arguments)
     started = time.time()
     process: subprocess.Popen[bytes] | None = None
+    if not identity.matches_current_file():
+        return _record_blocked_launch(
+            run_dir,
+            metadata,
+            status="blocked_runtime_identity",
+            error=_runtime_identity_changed(identity.canonical_path),
+        )
     try:
         process = subprocess.Popen(
             command,
@@ -3415,7 +3861,7 @@ def _start_one_shot_launch(
             return _record_blocked_launch(
                 run_dir,
                 metadata,
-                status="blocked_process_identity",
+                status="blocked_runtime_identity",
                 error=error,
                 child_pid=process.pid,
             )
@@ -3454,30 +3900,42 @@ def _start_one_shot_launch(
             )
             timed_out = False
             exit_code = process.returncode
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as timeout_error:
             timed_out = True
-            _terminate_owned_process(process)
-            stdout_bytes = b""
-            stderr_bytes = b""
+            drained_stdout, drained_stderr = _terminate_and_drain_owned_process(
+                process
+            )
+            stdout_bytes = _prefer_complete_output(
+                timeout_error.output, drained_stdout
+            )
+            stderr_bytes = _prefer_complete_output(
+                timeout_error.stderr, drained_stderr
+            )
             exit_code = 124
     finally:
         if process.poll() is None:
             _terminate_owned_process(process)
     stdout = stdout_bytes.decode("utf-8", errors="replace")
     stderr = stderr_bytes.decode("utf-8", errors="replace")
-    safe_stdout = str(redact(stdout))
-    safe_stderr = str(redact(stderr))
+    safe_stdout = _scrub_output_text(stdout, prepared.sensitive_values)
+    safe_stderr = _scrub_output_text(stderr, prepared.sensitive_values)
     _atomic_write_text(run_dir / "stdout.txt", safe_stdout)
     _atomic_write_text(run_dir / "stderr.txt", safe_stderr)
-    actual_route = actual_route_from_text(
-        stdout, declared_model=(metadata.get("profile") or {}).get("model")
+    actual_route = _scrub_guarded_value(
+        actual_route_from_text(
+            stdout, declared_model=(metadata.get("profile") or {}).get("model")
+        ),
+        prepared.sensitive_values,
     )
+    git_after = capture_git_snapshot(run_dir, Path(spec.cwd), "after")
+    _scrub_run_artifacts(run_dir, prepared.sensitive_values)
+    _secure_run_artifacts(run_dir)
     updates: dict[str, Any] = {
         "finished_at": utc_now_iso(),
         "duration_ms": int((time.time() - started) * 1000),
         "exit_code": exit_code,
         "timed_out": timed_out,
-        "git_after": capture_git_snapshot(run_dir, Path(spec.cwd), "after"),
+        "git_after": git_after,
     }
     if actual_route.get("actual_model") or actual_route.get("actual_model_usage"):
         updates.update(
@@ -3516,11 +3974,11 @@ def _start_one_shot_launch(
             child_pid=process.pid,
             child_process_identity=child_identity.to_dict(),
         )
-    return {
+    return _scrub_guarded_value({
         **metadata,
         "stdout_tail": safe_stdout[-4000:],
         "stderr_tail": safe_stderr[-2000:],
-    }
+    }, prepared.sensitive_values)
 
 
 def start_prepared_worker_launch(
@@ -3537,7 +3995,10 @@ def start_prepared_worker_launch(
     try:
         run_dir, metadata = _initialize_prepared_run(prepared)
     except Exception:
-        run_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            _set_private_directory(run_dir)
+        except Exception:
+            pass
         metadata.update(
             {
                 "runtime_launch": prepared.launch_spec.public_metadata(),
@@ -3548,7 +4009,10 @@ def start_prepared_worker_launch(
         )
         for name in ("stdout.txt", "stderr.txt", "events.ndjson"):
             if not (run_dir / name).exists():
-                _atomic_write_text(run_dir / name, "")
+                try:
+                    _atomic_write_text(run_dir / name, "")
+                except Exception:
+                    pass
         return _record_blocked_launch(
             run_dir,
             metadata,
@@ -3630,6 +4094,8 @@ def run_agent(
             "output_format": output_format,
         },
         allow_unsafe_runtime=allow_unsafe_runtime,
+        selected_model=selected_model,
+        sensitive_values=(task, context or ""),
     )
     return start_prepared_worker_launch(prepared)
 
@@ -3648,6 +4114,21 @@ def _write_pipe_chunk(pipe: Any, payload: bytes) -> None:
     written = pipe.write(payload)
     if written != len(payload):
         raise BrokenPipeError("short write to internal worker protocol")
+
+
+def _open_worker_start_gate(run_dir: Path) -> dict[str, Any]:
+    with artifact_lock(run_dir):
+        metadata = read_metadata(run_dir)
+        worker_launch = metadata.get("worker_launch")
+        if not isinstance(worker_launch, dict):
+            raise OrchestratorError("Worker start gate metadata is unavailable.")
+        if worker_launch.get("start_gate") != "closed":
+            raise OrchestratorError("Worker start gate is not closed.")
+        opened = dict(worker_launch)
+        opened.update({"start_gate": "open", "gate_opened_at": utc_now_iso()})
+        metadata["worker_launch"] = opened
+        _atomic_write_bytes(run_dir / "metadata.json", _metadata_bytes(metadata))
+        return metadata
 
 
 def _start_streaming_controller(
@@ -3673,120 +4154,143 @@ def _start_streaming_controller(
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     else:
         popen_kwargs["start_new_session"] = True
+    try:
+        admission = launch_lock()
+        admission.__enter__()
+    except Exception:
+        return _record_blocked_launch(
+            run_dir,
+            metadata,
+            status="blocked_runtime_launch",
+            error=_launch_failure_error(
+                "cost_guard_blocked", "Streaming launch admission could not be acquired."
+            ),
+        )
     worker: subprocess.Popen[bytes] | None = None
     try:
-        worker = subprocess.Popen(
-            worker_command,
-            cwd=str(ROOT),
-            env=worker_env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creationflags,
-            **popen_kwargs,
-        )
-    except OSError:
-        return _record_blocked_launch(
-            run_dir,
-            metadata,
-            status="blocked_runtime_launch",
-            error=_launch_failure_error(
-                "runtime_launch_failed", "The isolated internal worker could not be started."
-            ),
-        )
+        try:
+            if not prepared.skip_cost_guard:
+                enforce_cost_guard(
+                    prepared.selected_model, spec.timeout_seconds
+                )
+        except Exception:
+            return _record_blocked_launch(
+                run_dir,
+                metadata,
+                status="blocked_runtime_launch",
+                error=_launch_failure_error(
+                    "cost_guard_blocked", "Streaming launch admission was denied."
+                ),
+            )
+        try:
+            worker = subprocess.Popen(
+                worker_command,
+                cwd=str(ROOT),
+                env=worker_env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+                **popen_kwargs,
+            )
+        except OSError:
+            return _record_blocked_launch(
+                run_dir,
+                metadata,
+                status="blocked_runtime_launch",
+                error=_launch_failure_error(
+                    "runtime_launch_failed",
+                    "The isolated internal worker could not be started.",
+                ),
+            )
 
-    try:
-        frame = spec.private_frame()
-        if len(frame) > PRIVATE_LAUNCH_FRAME_LIMIT:
-            raise BrokenPipeError("private launch frame exceeds limit")
-        if len(prepared.prompt_bytes) > PROMPT_BYTES_LIMIT:
-            raise BrokenPipeError("prompt exceeds limit")
-        if worker.stdin is None:
-            raise BrokenPipeError("internal worker stdin is unavailable")
-        _write_pipe_chunk(worker.stdin, struct.pack("!Q", len(frame)))
-        _write_pipe_chunk(worker.stdin, frame)
-        _write_pipe_chunk(worker.stdin, struct.pack("!Q", len(prepared.prompt_bytes)))
-        _write_pipe_chunk(worker.stdin, prepared.prompt_bytes)
-        worker.stdin.flush()
-        worker.stdin.close()
-        worker.stdin = None
-    except (BrokenPipeError, OSError):
-        _terminate_owned_process(worker)
-        return _record_blocked_launch(
-            run_dir,
-            metadata,
-            status="blocked_runtime_launch",
-            error=_launch_failure_error(
-                "worker_protocol_failed", "The private worker launch pipe failed."
-            ),
-            worker_pid=worker.pid,
-        )
+        try:
+            frame = spec.private_frame()
+            if len(frame) > PRIVATE_LAUNCH_FRAME_LIMIT:
+                raise BrokenPipeError("private launch frame exceeds limit")
+            if len(prepared.prompt_bytes) > PROMPT_BYTES_LIMIT:
+                raise BrokenPipeError("prompt exceeds limit")
+            if worker.stdin is None:
+                raise BrokenPipeError("internal worker stdin is unavailable")
+            _write_pipe_chunk(worker.stdin, struct.pack("!Q", len(frame)))
+            _write_pipe_chunk(worker.stdin, frame)
+            _write_pipe_chunk(
+                worker.stdin, struct.pack("!Q", len(prepared.prompt_bytes))
+            )
+            _write_pipe_chunk(worker.stdin, prepared.prompt_bytes)
+            worker.stdin.flush()
+            worker.stdin.close()
+            worker.stdin = None
+        except (BrokenPipeError, OSError):
+            _terminate_owned_process(worker)
+            return _record_blocked_launch(
+                run_dir,
+                metadata,
+                status="blocked_runtime_launch",
+                error=_launch_failure_error(
+                    "worker_protocol_failed", "The private worker launch pipe failed."
+                ),
+                worker_pid=worker.pid,
+            )
 
-    try:
-        worker_identity = capture_process_identity(
-            worker.pid, launch_nonce=spec.launch_nonce
-        )
-        _validate_worker_process_identity(worker_identity)
-        metadata = update_metadata(
-            run_dir,
-            worker_pid=worker.pid,
-            worker_process_identity=worker_identity.to_dict(),
-        )
-        append_event(
-            run_dir, {"type": "stream_worker_started", "worker_pid": worker.pid}
-        )
-    except (OSError, TypeError, ValueError, RuntimeSecurityError) as exc:
-        _terminate_owned_process(worker)
-        error = (
-            exc
-            if isinstance(exc, RuntimeSecurityError)
-            else _process_identity_unverified(worker.pid, "internal worker")
-        )
-        return _record_blocked_launch(
-            run_dir,
-            metadata,
-            status="blocked_process_identity",
-            error=error,
-            worker_pid=worker.pid,
-        )
-    except Exception:
-        _terminate_owned_process(worker)
-        return _record_blocked_launch(
-            run_dir,
-            metadata,
-            status="blocked_runtime_launch",
-            error=_launch_failure_error(
-                "artifact_write_failed", "Worker identity metadata could not be persisted."
-            ),
-            worker_pid=worker.pid,
-        )
-
-    _retain_worker_handle(str(metadata["run_id"]), worker)
-    try:
-        _publish_latest_run(metadata)
-    except Exception:
-        _terminate_owned_process(worker)
-        return _record_blocked_launch(
-            run_dir,
-            metadata,
-            status="blocked_runtime_launch",
-            error=_launch_failure_error(
-                "artifact_write_failed", "Latest-run metadata could not be persisted."
-            ),
-            worker_pid=worker.pid,
-        )
-    return {
-        **metadata,
-        "status": "starting",
-        "worker_pid": worker.pid,
-        "poll": {
-            "tool": "cc_poll_run",
-            "run_id": metadata["run_id"],
-            "event_offset": 0,
-            "stdout_offset": 0,
-            "stderr_offset": 0,
-        },
-    }
+        try:
+            worker_identity = capture_process_identity(
+                worker.pid, launch_nonce=spec.launch_nonce
+            )
+            _validate_worker_process_identity(worker_identity)
+        except (OSError, TypeError, ValueError, RuntimeSecurityError) as exc:
+            _terminate_owned_process(worker)
+            error = (
+                exc
+                if isinstance(exc, RuntimeSecurityError)
+                else _process_identity_unverified(worker.pid, "internal worker")
+            )
+            return _record_blocked_launch(
+                run_dir,
+                metadata,
+                status="blocked_process_identity",
+                error=error,
+                worker_pid=worker.pid,
+            )
+        try:
+            metadata = update_metadata(
+                run_dir,
+                worker_pid=worker.pid,
+                worker_process_identity=worker_identity.to_dict(),
+            )
+            append_event(
+                run_dir,
+                {"type": "stream_worker_started", "worker_pid": worker.pid},
+            )
+            _publish_latest_run(metadata)
+            _retain_worker_handle(str(metadata["run_id"]), worker)
+            metadata = _open_worker_start_gate(run_dir)
+        except Exception:
+            _terminate_owned_process(worker)
+            return _record_blocked_launch(
+                run_dir,
+                metadata,
+                status="blocked_runtime_launch",
+                error=_launch_failure_error(
+                    "artifact_write_failed",
+                    "Streaming launch metadata could not be persisted before gate opening.",
+                ),
+                worker_pid=worker.pid,
+            )
+        return {
+            **metadata,
+            "status": "starting",
+            "worker_pid": worker.pid,
+            "poll": {
+                "tool": "cc_poll_run",
+                "run_id": metadata["run_id"],
+                "event_offset": 0,
+                "stdout_offset": 0,
+                "stderr_offset": 0,
+            },
+        }
+    finally:
+        admission.__exit__(None, None, None)
 
 
 def run_streaming_agent(
@@ -3827,11 +4331,7 @@ def run_streaming_agent(
         int(model_policy.get("safety", {}).get("max_timeout_seconds", 1800)),
     )
     selected_model = model_override or route.get("model_override") or provider.model
-    timeout = (
-        clamp_timeout_for_model(selected_model, timeout)
-        if skip_cost_guard
-        else enforce_cost_guard(selected_model, timeout)
-    )
+    timeout = clamp_timeout_for_model(selected_model, timeout)
     if output_format != "stream-json":
         raise OrchestratorError("run_streaming_agent requires output_format='stream-json'.")
     budget = resolve_output_budget(
@@ -3903,6 +4403,9 @@ def run_streaming_agent(
             "route_reason": route.get("reason", ""),
         },
         allow_unsafe_runtime=allow_unsafe_runtime,
+        selected_model=selected_model,
+        skip_cost_guard=skip_cost_guard,
+        sensitive_values=(task, context or ""),
     )
     return start_prepared_worker_launch(prepared)
 
@@ -4049,6 +4552,20 @@ def _parse_worker_frame(
 
 
 def _consume_worker_nonce(run_dir: Path, nonce: str) -> dict[str, Any]:
+    deadline = time.monotonic() + WORKER_START_GATE_TIMEOUT_SECONDS
+    while True:
+        latest = read_metadata(run_dir)
+        worker_launch = latest.get("worker_launch")
+        if (
+            isinstance(worker_launch, dict)
+            and worker_launch.get("start_gate") == "open"
+        ):
+            break
+        if str(latest.get("status") or "").startswith("blocked_"):
+            raise _runtime_not_trusted("Controller closed the worker start gate.")
+        if time.monotonic() >= deadline:
+            raise _runtime_not_trusted("Worker start gate did not open in time.")
+        time.sleep(0.01)
     with artifact_lock(run_dir):
         metadata = read_metadata(run_dir)
         public = metadata.get("runtime_launch")
@@ -4058,8 +4575,54 @@ def _consume_worker_nonce(run_dir: Path, nonce: str) -> dict[str, Any]:
             or not isinstance(worker_launch, dict)
             or public.get("launch_nonce") != nonce
             or worker_launch.get("nonce_consumed") is not False
+            or worker_launch.get("start_gate") != "open"
         ):
             raise _runtime_not_trusted("Internal worker launch nonce is unavailable.")
+        try:
+            recorded_identity = ProcessIdentity.from_dict(
+                metadata.get("worker_process_identity")
+            )
+        except (TypeError, ValueError) as exc:
+            raise _runtime_not_trusted(
+                "Controller worker identity evidence is invalid."
+            ) from exc
+        controller_pid = metadata.get("controller_pid")
+        worker_pid = metadata.get("worker_pid")
+        if (
+            not isinstance(controller_pid, int)
+            or isinstance(controller_pid, bool)
+            or controller_pid <= 0
+            or worker_pid != os.getpid()
+            or recorded_identity.pid != os.getpid()
+            or recorded_identity.parent_pid != controller_pid
+            or recorded_identity.launch_nonce != nonce
+        ):
+            raise _runtime_not_trusted(
+                "Controller worker identity ownership does not match this process."
+            )
+        identity_check = compare_process_identity(
+            recorded_identity, expected_launch_nonce=nonce
+        )
+        live_identity = identity_check.live
+        if (
+            identity_check.state != "match"
+            or live_identity is None
+            or live_identity.parent_pid != controller_pid
+            or live_identity.pid != os.getpid()
+            or live_identity.launch_nonce != nonce
+        ):
+            raise _runtime_not_trusted(
+                "Controller worker process identity is no longer stable."
+            )
+        for field_name in ("process_group_id", "session_id"):
+            expected_value = getattr(recorded_identity, field_name)
+            if (
+                expected_value is not None
+                and getattr(live_identity, field_name) != expected_value
+            ):
+                raise _runtime_not_trusted(
+                    "Controller worker process ownership evidence changed."
+                )
         expires_raw = worker_launch.get("nonce_expires_at")
         try:
             expires_at = datetime.fromisoformat(str(expires_raw))
@@ -4121,18 +4684,48 @@ def stream_worker(run_id: str) -> dict[str, Any]:
         metadata, executable_identity, arguments = _parse_worker_frame(
             run_dir, frame
         )
+        expected_prompt_bytes = metadata.get("prompt_bytes")
+        if (
+            not isinstance(expected_prompt_bytes, int)
+            or isinstance(expected_prompt_bytes, bool)
+            or expected_prompt_bytes != len(prompt_bytes)
+        ):
+            raise _runtime_not_trusted(
+                "Internal worker prompt length does not match metadata."
+            )
+        if sys.stdin.buffer.read(1) != b"":
+            raise _runtime_not_trusted(
+                "Internal worker launch payload has trailing data."
+            )
         nonce = str(metadata["runtime_launch"]["launch_nonce"])
         metadata = _consume_worker_nonce(run_dir, nonce)
         if not executable_identity.matches_current_file():
             raise _runtime_identity_changed(executable_identity.canonical_path)
     except RuntimeSecurityError as error:
         return _worker_security_failure(run_dir, error)
+    except (OSError, OrchestratorError, TypeError, ValueError):
+        return _worker_security_failure(
+            run_dir,
+            _runtime_not_trusted(
+                "Internal worker launch state could not be verified."
+            ),
+        )
 
     timeout = int(metadata.get("timeout_seconds") or 1800)
     cwd = Path(str(metadata.get("cwd") or Path.cwd()))
     command = _runtime_command(executable_identity, arguments)
     environment_keys = json.loads(frame.decode("utf-8"))["environment_keys"]
     runtime_env = {key: os.environ[key] for key in environment_keys}
+    sensitive_values = _normalize_sensitive_values(
+        (
+            *_prompt_sensitive_values(prompt_bytes),
+            *(
+                value
+                for key, value in runtime_env.items()
+                if value and should_redact_key(key, value)
+            ),
+        )
+    )
     try:
         append_event(
             run_dir, {"type": "stream_worker_ready", "worker_pid": os.getpid()}
@@ -4152,7 +4745,17 @@ def stream_worker(run_id: str) -> dict[str, Any]:
         creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     else:
         popen_kwargs["start_new_session"] = True
+    event_lock = threading.Lock()
+    budget_lock = threading.Lock()
+    budget = output_budget_from_metadata(metadata, run_dir)
+    budget_stop = threading.Event()
+    actual_route_recorded = threading.Event()
+    route_mismatch_recorded = threading.Event()
     started = time.time()
+    if not executable_identity.matches_current_file():
+        return _worker_security_failure(
+            run_dir, _runtime_identity_changed(executable_identity.canonical_path)
+        )
     try:
         proc = subprocess.Popen(
             command,
@@ -4173,6 +4776,117 @@ def stream_worker(run_id: str) -> dict[str, Any]:
                 "runtime_launch_failed", "The approved runtime process could not be started."
             ),
         )
+    io_cancel = threading.Event()
+    io_errors: queue.Queue[tuple[str, BaseException]] = queue.Queue()
+    stdout_queue: queue.Queue[bytes | None] = queue.Queue()
+    stderr_queue: queue.Queue[bytes | None] = queue.Queue()
+    termination_lock = threading.Lock()
+    termination_requested = threading.Event()
+    raw_io_lock = threading.Lock()
+    raw_io_observed = 0
+    raw_io_limit = budget.get("max_output_bytes")
+    raw_io_limit_exceeded = threading.Event()
+
+    def terminate_child_once() -> None:
+        with termination_lock:
+            if termination_requested.is_set():
+                return
+            termination_requested.set()
+            _terminate_owned_process(proc)
+
+    def drain_output(
+        stream: Any, destination: queue.Queue[bytes | None], source: str
+    ) -> None:
+        nonlocal raw_io_observed
+        try:
+            pending = b""
+            read_chunk = getattr(stream, "read1", stream.read)
+            while True:
+                chunk = read_chunk(64 * 1024)
+                if not chunk:
+                    break
+                pending += (
+                    chunk
+                    if isinstance(chunk, bytes)
+                    else str(chunk).encode("utf-8", errors="replace")
+                )
+                with raw_io_lock:
+                    raw_io_observed += len(chunk)
+                    over_limit = bool(
+                        raw_io_limit
+                        and raw_io_observed > int(raw_io_limit)
+                    )
+                while b"\n" in pending:
+                    raw_line, pending = pending.split(b"\n", 1)
+                    destination.put(raw_line + b"\n")
+                if over_limit:
+                    if pending:
+                        destination.put(pending)
+                        pending = b""
+                    raw_io_limit_exceeded.set()
+                    io_cancel.set()
+                    break
+                if io_cancel.is_set():
+                    break
+            if pending:
+                destination.put(pending)
+        except (OSError, ValueError) as exc:
+            if not io_cancel.is_set():
+                io_errors.put((source, exc))
+        finally:
+            destination.put(None)
+
+    def pump_stdin() -> None:
+        pipe = proc.stdin
+        try:
+            if pipe is None:
+                raise BrokenPipeError("runtime stdin is unavailable")
+            for offset in range(0, len(prompt_bytes), 64 * 1024):
+                if io_cancel.is_set():
+                    break
+                _write_pipe_chunk(pipe, prompt_bytes[offset : offset + 64 * 1024])
+            pipe.flush()
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            if not io_cancel.is_set():
+                io_errors.put(("stdin", exc))
+        finally:
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+            proc.stdin = None
+
+    drain_threads = [
+        threading.Thread(
+            target=drain_output,
+            args=(proc.stdout, stdout_queue, "stdout"),
+            name=f"cc-runtime-stdout-{run_id}",
+            daemon=True,
+        ),
+        threading.Thread(
+            target=drain_output,
+            args=(proc.stderr, stderr_queue, "stderr"),
+            name=f"cc-runtime-stderr-{run_id}",
+            daemon=True,
+        ),
+    ]
+    stdin_thread = threading.Thread(
+        target=pump_stdin,
+        name=f"cc-runtime-stdin-{run_id}",
+        daemon=True,
+    )
+    for thread in drain_threads:
+        thread.start()
+    stdin_thread.start()
+
+    def cleanup_initial_io() -> None:
+        io_cancel.set()
+        terminate_child_once()
+        stdin_thread.join(timeout=5)
+        for thread in drain_threads:
+            thread.join(timeout=5)
+
     try:
         try:
             child_identity = capture_process_identity(proc.pid, launch_nonce=nonce)
@@ -4192,14 +4906,8 @@ def stream_worker(run_id: str) -> dict[str, Any]:
                 run_dir,
                 {"type": "process_started", "pid": proc.pid, "status": "running"},
             )
-            if proc.stdin is None:
-                raise BrokenPipeError("runtime stdin is unavailable")
-            _write_pipe_chunk(proc.stdin, prompt_bytes)
-            proc.stdin.flush()
-            proc.stdin.close()
-            proc.stdin = None
         except RuntimeSecurityError as error:
-            _terminate_owned_process(proc)
+            cleanup_initial_io()
             status = (
                 "blocked_runtime_identity"
                 if error.code == "runtime_identity_changed"
@@ -4213,7 +4921,7 @@ def stream_worker(run_id: str) -> dict[str, Any]:
                 child_pid=proc.pid,
             )
         except (BrokenPipeError, OSError, TypeError, ValueError) as exc:
-            _terminate_owned_process(proc)
+            cleanup_initial_io()
             error = (
                 _process_identity_unverified(proc.pid, "runtime child")
                 if isinstance(exc, (TypeError, ValueError))
@@ -4233,7 +4941,7 @@ def stream_worker(run_id: str) -> dict[str, Any]:
                 child_pid=proc.pid,
             )
     except Exception:
-        _terminate_owned_process(proc)
+        cleanup_initial_io()
         return _record_blocked_launch(
             run_dir,
             metadata,
@@ -4243,13 +4951,6 @@ def stream_worker(run_id: str) -> dict[str, Any]:
             ),
             child_pid=proc.pid,
         )
-    event_lock = threading.Lock()
-    budget_lock = threading.Lock()
-    budget = output_budget_from_metadata(metadata, run_dir)
-    budget_stop = threading.Event()
-    actual_route_recorded = threading.Event()
-    route_mismatch_recorded = threading.Event()
-
     def persist_budget_unlocked(stop_reason: str | None = None) -> None:
         updates: dict[str, Any] = {"output_budget": dict(budget)}
         if stop_reason:
@@ -4291,11 +4992,12 @@ def stream_worker(run_id: str) -> dict[str, Any]:
         return False
 
     def safe_append(event: dict[str, Any]) -> None:
+        event = _scrub_guarded_value(event, sensitive_values)
         if not event_is_final_or_control(event):
             with budget_lock:
                 budget["dropped_event_count"] = int(budget.get("dropped_event_count") or 0) + 1
             return
-        encoded = (json.dumps(sanitize_for_json(redact(event)), ensure_ascii=False) + "\n").encode("utf-8", errors="replace")
+        encoded = (json.dumps(sanitize_for_json(event), ensure_ascii=False) + "\n").encode("utf-8", errors="replace")
         max_events = budget.get("max_events_bytes")
         events_path = run_dir / "events.ndjson"
         with event_lock:
@@ -4313,7 +5015,10 @@ def stream_worker(run_id: str) -> dict[str, Any]:
 
     def record_actual_route(payload: Any) -> None:
         declared_model = (metadata.get("profile") or {}).get("model")
-        summary = actual_route_from_payload(payload, declared_model=declared_model)
+        summary = _scrub_guarded_value(
+            actual_route_from_payload(payload, declared_model=declared_model),
+            sensitive_values,
+        )
         if not summary.get("actual_model") and not summary.get("actual_model_usage"):
             return
         update_metadata(
@@ -4351,22 +5056,33 @@ def stream_worker(run_id: str) -> dict[str, Any]:
                 }
             )
 
-    def pump(stream: Any, out_path: Path, source: str) -> None:
+    def pump(
+        source_queue: queue.Queue[bytes | None], out_path: Path, source: str
+    ) -> None:
         try:
             with out_path.open("a", encoding="utf-8", errors="replace") as out:
-                for raw_line in iter(stream.readline, b""):
+                _set_private_file(out_path)
+                while True:
+                    raw_line = source_queue.get()
+                    if raw_line is None:
+                        break
                     line = (
                         raw_line.decode("utf-8", errors="replace")
                         if isinstance(raw_line, bytes)
                         else str(raw_line)
                     )
                     raw_bytes = len(raw_line) if isinstance(raw_line, bytes) else len(line.encode("utf-8", errors="replace"))
-                    safe_line = str(redact(line))
+                    safe_line = _scrub_exact_text(line, sensitive_values)
                     raw_payload: Any | None = None
                     if source == "stdout":
                         try:
                             raw_payload = json.loads(line)
-                            parsed_payload: Any = redact(raw_payload)
+                            parsed_payload: Any = _scrub_guarded_value(
+                                raw_payload, sensitive_values
+                            )
+                            safe_line = json.dumps(
+                                parsed_payload, ensure_ascii=False
+                            ) + ("\n" if line.endswith(("\n", "\r")) else "")
                             parsed_event_type = "claude_stream"
                         except json.JSONDecodeError:
                             parsed_payload = {"text": safe_line.rstrip("\r\n")}
@@ -4383,7 +5099,9 @@ def stream_worker(run_id: str) -> dict[str, Any]:
                             budget["dropped_output_bytes"] = int(budget.get("dropped_output_bytes") or 0) + raw_bytes
                         continue
                     if budget.get("final_only") and isinstance(parsed_payload, dict) and parsed_payload.get("type") == "result" and parsed_payload.get("result") is not None:
-                        safe_line = str(redact(str(parsed_payload.get("result")))).rstrip("\r\n") + "\n"
+                        safe_line = _scrub_exact_text(
+                            str(parsed_payload.get("result")), sensitive_values
+                        ).rstrip("\r\n") + "\n"
                     safe_line_bytes = len(safe_line.encode("utf-8", errors="replace"))
                     write_line = True
                     with budget_lock:
@@ -4416,48 +5134,96 @@ def stream_worker(run_id: str) -> dict[str, Any]:
                     if budget_stop.is_set():
                         break
         except Exception as exc:
-            safe_append({"type": "stream_pump_error", "source": source, "error": str(exc)})
+            io_cancel.set()
+            io_errors.put((source, exc))
 
     threads = [
-        threading.Thread(target=pump, args=(proc.stdout, run_dir / "stdout.txt", "stdout"), daemon=True),
-        threading.Thread(target=pump, args=(proc.stderr, run_dir / "stderr.txt", "stderr"), daemon=True),
+        threading.Thread(target=pump, args=(stdout_queue, run_dir / "stdout.txt", "stdout"), daemon=True),
+        threading.Thread(target=pump, args=(stderr_queue, run_dir / "stderr.txt", "stderr"), daemon=True),
     ]
     for thread in threads:
         thread.start()
 
     timed_out = False
     stopped = False
+    io_failed = False
+    raw_limit_reported = False
     exit_code: int | None = None
     try:
         while True:
+            if raw_io_limit_exceeded.is_set() and not raw_limit_reported:
+                raw_limit_reported = True
+                trigger_budget("output_budget_exceeded", "runtime_io")
+            try:
+                io_source, io_error = io_errors.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                io_failed = True
+                io_cancel.set()
+                safe_append(
+                    {
+                        "type": "stream_pump_error",
+                        "source": io_source,
+                        "error": str(io_error),
+                    }
+                )
+                terminate_child_once()
             exit_code = proc.poll()
             if exit_code is not None:
                 break
             if (run_dir / "stop-requested.json").exists():
                 stopped = True
-                _terminate_owned_process(proc)
+                io_cancel.set()
+                terminate_child_once()
             if budget_stop.is_set():
                 stopped = True
-                _terminate_owned_process(proc)
-            if time.time() - started > timeout:
+                io_cancel.set()
+                terminate_child_once()
+            if not timed_out and time.time() - started > timeout:
                 timed_out = True
                 safe_append({"type": "timeout", "timeout_seconds": timeout})
                 with budget_lock:
                     budget["stop_reason"] = "timeout"
                     persist_budget_unlocked("timeout")
-                _terminate_owned_process(proc)
+                io_cancel.set()
+                terminate_child_once()
             time.sleep(0.2)
         try:
             exit_code = proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            _terminate_owned_process(proc)
+            io_cancel.set()
+            terminate_child_once()
             exit_code = proc.poll()
     finally:
         if proc.poll() is None:
-            _terminate_owned_process(proc)
+            io_cancel.set()
+            terminate_child_once()
+        stdin_thread.join(timeout=5)
+        for thread in drain_threads:
+            thread.join(timeout=5)
         for thread in threads:
-            thread.join(timeout=2)
-        _terminate_owned_process(proc)
+            thread.join(timeout=5)
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+    while True:
+        try:
+            io_source, io_error = io_errors.get_nowait()
+        except queue.Empty:
+            break
+        io_failed = True
+        safe_append(
+            {
+                "type": "stream_pump_error",
+                "source": io_source,
+                "error": str(io_error),
+            }
+        )
 
     duration_ms = int((time.time() - started) * 1000)
     latest_metadata = read_metadata(run_dir)
@@ -4468,6 +5234,9 @@ def stream_worker(run_id: str) -> dict[str, Any]:
     elif stopped:
         status = "stopped"
         final_exit = -15 if exit_code is None else exit_code
+    elif io_failed:
+        status = "failed"
+        final_exit = 1 if exit_code in {None, 0} else exit_code
     else:
         final_exit = 0 if exit_code is None else exit_code
         status = "succeeded" if final_exit == 0 else "failed"
@@ -4476,30 +5245,38 @@ def stream_worker(run_id: str) -> dict[str, Any]:
         if stopped and not budget.get("stop_reason"):
             budget["stop_reason"] = "user_requested"
         persist_budget_unlocked(str(budget.get("stop_reason") or "") or None)
+    git_after = capture_git_snapshot(run_dir, cwd, "after")
+    _scrub_run_artifacts(run_dir, sensitive_values)
+    _secure_run_artifacts(run_dir)
     final_metadata = update_metadata(
         run_dir,
-        status=status,
-        finished_at=utc_now_iso(),
         duration_ms=duration_ms,
-        exit_code=final_exit,
         timed_out=timed_out,
         stdout_path=str(run_dir / "stdout.txt"),
         stderr_path=str(run_dir / "stderr.txt"),
         events_path=str(run_dir / "events.ndjson"),
         output_budget=budget,
         stop_reason=budget.get("stop_reason") or ("timeout" if timed_out else "user_requested" if stopped else None),
-        git_after=capture_git_snapshot(run_dir, cwd, "after"),
+        git_after=git_after,
     )
-    scope_check = check_write_scope(run_id=run_id)
+    scope_check = _scrub_guarded_value(
+        check_write_scope(run_id=run_id), sensitive_values
+    )
     final_metadata = update_metadata(
         run_dir,
         write_scope_check=scope_check,
         acceptance_status="blocked_write_scope" if not scope_check.get("ok", True) else "pending_controller_review",
     )
     if not scope_check.get("ok", True):
-        append_event(run_dir, {"type": "write_scope_blocked", "status": "blocked", "violations": scope_check.get("violations", [])})
-    append_event(run_dir, {"type": "process_exited", "status": status, "exit_code": final_exit, "duration_ms": duration_ms})
-    return final_metadata
+        safe_append({"type": "write_scope_blocked", "status": "blocked", "violations": scope_check.get("violations", [])})
+    safe_append({"type": "process_exited", "status": status, "exit_code": final_exit, "duration_ms": duration_ms})
+    final_metadata = update_metadata(
+        run_dir,
+        status=status,
+        finished_at=utc_now_iso(),
+        exit_code=final_exit,
+    )
+    return _scrub_guarded_value(final_metadata, sensitive_values)
 
 
 def single_run_status(run_id: str, include_output_tail: bool = True, tail_chars: int = 4000) -> dict[str, Any]:
@@ -4569,6 +5346,7 @@ def single_run_status(run_id: str, include_output_tail: bool = True, tail_chars:
         "elapsed_ms": elapsed_ms,
         "exit_code": metadata.get("exit_code"),
         "timed_out": bool(metadata.get("timed_out", False)),
+        "acceptance_status": metadata.get("acceptance_status"),
         "stop_reason": metadata.get("stop_reason") or output_budget.get("stop_reason"),
         "role": metadata.get("role"),
         "task_type": metadata.get("task_type"),
