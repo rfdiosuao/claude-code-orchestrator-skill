@@ -183,6 +183,12 @@ class GuardedLaunchFixture(unittest.TestCase):
                 chunks.append(path.read_bytes())
         return b"\n".join(chunks)
 
+    def _wait_for_pid_exit(self, pid: int, timeout: float = 5.0) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline and orchestrator.pid_alive(pid):
+            time.sleep(0.02)
+        self.assertFalse(orchestrator.pid_alive(pid), f"process {pid} is still alive")
+
     def _prepare(self, mode: str, prompt: str = "private fixture prompt") -> object:
         output_format = "json" if mode == "one_shot" else "stream-json"
         arguments = ["-p", "--output-format", output_format]
@@ -653,6 +659,13 @@ class GuardedLaunchFailureTests(GuardedLaunchFixture):
         self.assertFalse(orchestrator.pid_alive(int(metadata["child_pid"])))
 
     def test_stream_worker_child_identity_failure_uses_owned_handle(self) -> None:
+        self.fake_runtime.write_text(
+            "import sys, time\n"
+            "sys.stdout.buffer.write(b'Q' * (4 * 1024 * 1024))\n"
+            "sys.stdout.buffer.flush()\n"
+            "time.sleep(2)\n",
+            encoding="utf-8",
+        )
         prepared = self._prepare("streaming", prompt="")
         metadata = prepared.metadata()
         run_dir = self.runs_dir / str(metadata["run_id"])
@@ -684,6 +697,7 @@ class GuardedLaunchFailureTests(GuardedLaunchFixture):
         )
 
         def unsupported(pid: int, *, launch_nonce: str) -> ProcessIdentity:
+            time.sleep(0.2)
             return _unsupported_identity(pid, launch_nonce)
 
         environment = dict(prepared.launch_spec.environment)
@@ -701,6 +715,12 @@ class GuardedLaunchFailureTests(GuardedLaunchFixture):
         )
         self.assertFalse(orchestrator.pid_alive(int(latest["child_pid"])))
         self.assertEqual(result["status"], "blocked_process_identity")
+        self.assertFalse(
+            any(
+                str(metadata["run_id"]) in thread.name
+                for thread in threading.enumerate()
+            )
+        )
 
 
 class ReviewFixResolverAndEnvironmentTests(GuardedLaunchFixture):
@@ -796,16 +816,52 @@ class ReviewFixArtifactTests(GuardedLaunchFixture):
             self.assertTrue(temporary_modes)
             self.assertTrue(all(mode == 0o600 for mode in temporary_modes))
 
+    @unittest.skipUnless(os.name == "nt", "Windows DACL regression")
     def test_windows_private_acl_is_enforced_and_verified(self) -> None:
         target = self.workspace / "acl-target"
         target.mkdir()
-        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
-        with patch.object(orchestrator.subprocess, "run", return_value=completed) as run:
-            orchestrator._enforce_windows_private_acl(target, is_dir=True)
-        commands = [call.args[0] for call in run.call_args_list]
-        self.assertTrue(any("/inheritance:r" in command for command in commands))
-        self.assertTrue(any("/grant:r" in command for command in commands))
-        self.assertTrue(any("/verify" in command for command in commands))
+        target_file = target / "artifact.txt"
+        target_file.write_text("private", encoding="utf-8")
+        icacls = Path(os.environ["SystemRoot"]) / "System32" / "icacls.exe"
+        for path in (target, target_file):
+            granted = subprocess.run(
+                [str(icacls), str(path), "/grant", "*S-1-1-0:F"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(granted.returncode, 0, granted.stderr)
+            orchestrator._enforce_windows_private_acl(
+                path, is_dir=path.is_dir()
+            )
+            acl = orchestrator._inspect_windows_private_acl(
+                path, is_dir=path.is_dir()
+            )
+            self.assertTrue(acl["protected"])
+            self.assertEqual(acl["ace_sids"], [acl["current_user_sid"]])
+            self.assertFalse(acl["has_inherited_aces"])
+            self.assertTrue(acl["exact"])
+
+        observed_replacements: list[dict[str, object]] = []
+        real_replace = os.replace
+
+        def inspect_replacement(source: str, destination: str) -> None:
+            observed_replacements.append(
+                orchestrator._inspect_windows_private_acl(
+                    Path(source), is_dir=False
+                )
+            )
+            real_replace(source, destination)
+
+        with patch.object(orchestrator.os, "replace", side_effect=inspect_replacement):
+            orchestrator._atomic_write_text(target_file, "replacement")
+        self.assertTrue(observed_replacements)
+        self.assertTrue(all(item["exact"] for item in observed_replacements))
+        self.assertTrue(
+            orchestrator._inspect_windows_private_acl(
+                target_file, is_dir=False
+            )["exact"]
+        )
 
     def test_blocked_transition_merges_current_metadata_or_degrades(self) -> None:
         run_id = orchestrator.new_run_id()
@@ -1253,6 +1309,502 @@ class ReviewFixContractTests(GuardedLaunchFixture):
             for line in (run_dir / "events.ndjson").read_text(encoding="utf-8").splitlines()
         ]
         self.assertEqual([event["seq"] for event in events], [1, 2])
+
+
+class SecondReviewPublicationTests(GuardedLaunchFixture):
+    def test_gate_publication_has_no_post_replace_permission_step(self) -> None:
+        prepared = self._prepare("streaming", prompt="")
+        run_dir, metadata = orchestrator._initialize_prepared_run(prepared)
+        target = run_dir / "metadata.json"
+        real_set_private = orchestrator._set_private_file
+
+        def reject_post_publication(path: Path) -> None:
+            if Path(path) == target:
+                raise OSError("post-publication permission fault")
+            real_set_private(Path(path))
+
+        with patch.object(
+            orchestrator, "_set_private_file", side_effect=reject_post_publication
+        ):
+            opened = orchestrator._open_worker_start_gate(run_dir)
+        self.assertEqual(opened["worker_launch"]["start_gate"], "open")
+        self.assertEqual(
+            orchestrator.read_metadata(run_dir)["worker_launch"]["start_gate"],
+            "open",
+        )
+
+    def test_gate_is_not_published_when_lock_release_fails(self) -> None:
+        prepared = self._prepare("streaming", prompt="")
+        run_dir, _metadata = orchestrator._initialize_prepared_run(prepared)
+
+        class FaultingRelease:
+            def __enter__(self) -> None:
+                return None
+
+            def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+                raise OSError("lock release fault")
+
+        with patch.object(
+            orchestrator, "artifact_lock", return_value=FaultingRelease()
+        ):
+            with self.assertRaises(OSError):
+                orchestrator._open_worker_start_gate(run_dir)
+        self.assertEqual(
+            orchestrator.read_metadata(run_dir)["worker_launch"]["start_gate"],
+            "closed",
+        )
+
+    def test_gate_verification_fault_keeps_controller_worker_agreement(self) -> None:
+        def reject_open_gate(path: Path, *, is_dir: bool = False) -> None:
+            candidate = Path(path)
+            if not is_dir and candidate.is_file():
+                payload = candidate.read_bytes()
+                if b'"start_gate": "open"' in payload:
+                    raise OSError("pre-publication verification fault")
+
+        with patch.object(
+            orchestrator,
+            "_verify_private_path",
+            side_effect=reject_open_gate,
+            create=True,
+        ):
+            result = orchestrator.run_streaming_agent(
+                "gate publication fault", cwd=self.workspace
+            )
+        self.assertEqual(result["status"], "blocked_runtime_launch", result)
+        self._wait_for_pid_exit(int(result["worker_pid"]))
+        metadata = orchestrator.read_metadata(
+            self.runs_dir / str(result["run_id"])
+        )
+        self.assertNotEqual(
+            (metadata.get("worker_launch") or {}).get("start_gate"), "open"
+        )
+        self.assertIsNone(metadata.get("child_pid"))
+
+    def test_admission_release_fault_keeps_gate_closed_and_worker_owned(self) -> None:
+        class FaultingAdmissionRelease:
+            def __enter__(self) -> None:
+                return None
+
+            def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+                raise OSError("admission release fault")
+
+        with patch.object(
+            orchestrator,
+            "launch_lock",
+            return_value=FaultingAdmissionRelease(),
+        ):
+            result = orchestrator.run_streaming_agent(
+                "admission release before gate", cwd=self.workspace
+            )
+        self.assertEqual(result["status"], "blocked_runtime_launch", result)
+        self._wait_for_pid_exit(int(result["worker_pid"]))
+        metadata = orchestrator.read_metadata(
+            self.runs_dir / str(result["run_id"])
+        )
+        self.assertEqual(
+            metadata["worker_launch"]["start_gate"], "closed"
+        )
+        self.assertIsNone(metadata.get("child_pid"))
+
+
+class SecondReviewTransportTests(GuardedLaunchFixture):
+    def _write_pressure_runtime(
+        self, *, newline: bool, marker: Path, sleep_after_input: float = 0.0
+    ) -> None:
+        chunk = "(b'X' * 4095 + b'\\n')" if newline else "(b'Y' * 4096)"
+        self.fake_runtime.write_text(
+            "\n".join(
+                [
+                    "import pathlib, sys, time",
+                    f"chunk = {chunk}",
+                    "for _ in range(768):",
+                    "    sys.stdout.buffer.write(chunk)",
+                    "sys.stdout.buffer.flush()",
+                    "prompt = sys.stdin.buffer.read()",
+                    f"pathlib.Path({str(marker)!r}).write_text(str(len(prompt)), encoding='utf-8')",
+                    f"time.sleep({sleep_after_input!r})",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def test_truncate_drains_newline_pressure_and_finishes_stdin(self) -> None:
+        marker = self.workspace / "newline-stdin-complete.txt"
+        self._write_pressure_runtime(newline=True, marker=marker)
+        launch = orchestrator.run_streaming_agent(
+            "truncate newline pressure",
+            cwd=self.workspace,
+            timeout_seconds=6,
+            max_output_bytes=64 * 1024,
+            max_events_bytes=512 * 1024,
+            output_budget_policy="truncate",
+        )
+        metadata = self._wait_for_terminal_metadata(
+            self.runs_dir / str(launch["run_id"]), timeout=12
+        )
+        self.assertEqual(metadata["status"], "succeeded", metadata)
+        self.assertEqual(metadata["output_budget"]["state"], "truncated")
+        self.assertTrue(marker.is_file())
+        self.assertGreater(int(marker.read_text(encoding="utf-8")), 0)
+        self._wait_for_pid_exit(int(metadata["child_pid"]))
+        self._wait_for_pid_exit(int(metadata["worker_pid"]))
+
+    def test_truncate_drains_no_newline_pressure_and_finishes_stdin(self) -> None:
+        marker = self.workspace / "no-newline-stdin-complete.txt"
+        self._write_pressure_runtime(newline=False, marker=marker)
+        launch = orchestrator.run_streaming_agent(
+            "truncate no-newline pressure",
+            cwd=self.workspace,
+            timeout_seconds=6,
+            max_output_bytes=64 * 1024,
+            max_events_bytes=512 * 1024,
+            output_budget_policy="truncate",
+        )
+        metadata = self._wait_for_terminal_metadata(
+            self.runs_dir / str(launch["run_id"]), timeout=12
+        )
+        self.assertEqual(metadata["status"], "succeeded", metadata)
+        self.assertEqual(metadata["output_budget"]["state"], "truncated")
+        self.assertTrue(marker.is_file())
+        self._wait_for_pid_exit(int(metadata["child_pid"]))
+        self._wait_for_pid_exit(int(metadata["worker_pid"]))
+
+    def test_stop_policy_terminates_once_under_no_newline_pressure(self) -> None:
+        marker = self.workspace / "stop-policy-stdin.txt"
+        self._write_pressure_runtime(
+            newline=False, marker=marker, sleep_after_input=3.0
+        )
+        launch = orchestrator.run_streaming_agent(
+            "stop no-newline pressure",
+            cwd=self.workspace,
+            timeout_seconds=6,
+            max_output_bytes=64 * 1024,
+            max_events_bytes=512 * 1024,
+            output_budget_policy="stop",
+        )
+        metadata = self._wait_for_terminal_metadata(
+            self.runs_dir / str(launch["run_id"]), timeout=12
+        )
+        self.assertEqual(metadata["status"], "stopped", metadata)
+        self.assertEqual(metadata["stop_reason"], "output_budget_exceeded")
+        self._wait_for_pid_exit(int(metadata["child_pid"]))
+        self._wait_for_pid_exit(int(metadata["worker_pid"]))
+
+    def test_truncate_pressure_does_not_disable_deadline(self) -> None:
+        marker = self.workspace / "deadline-stdin.txt"
+        self._write_pressure_runtime(
+            newline=False, marker=marker, sleep_after_input=3.0
+        )
+        started = time.monotonic()
+        launch = orchestrator.run_streaming_agent(
+            "truncate deadline pressure",
+            cwd=self.workspace,
+            timeout_seconds=1,
+            max_output_bytes=64 * 1024,
+            max_events_bytes=512 * 1024,
+            output_budget_policy="truncate",
+        )
+        metadata = self._wait_for_terminal_metadata(
+            self.runs_dir / str(launch["run_id"]), timeout=8
+        )
+        self.assertEqual(metadata["status"], "timed_out", metadata)
+        self.assertLess(time.monotonic() - started, 6.0)
+        self._wait_for_pid_exit(int(metadata["child_pid"]))
+        self._wait_for_pid_exit(int(metadata["worker_pid"]))
+
+
+class SecondReviewScrubAndScannerTests(GuardedLaunchFixture):
+    def test_terminal_snapshots_scope_filenames_and_errors_are_scrubbed(self) -> None:
+        task_secret = "terminal-task-secret-z5"
+        context_secret = "terminal-context-secret-y6"
+
+        def snapshot(_run_dir: Path, _cwd: Path, label: str) -> dict[str, object]:
+            if label == "after":
+                return {
+                    "ok": False,
+                    "changed_paths": [f"src/{task_secret}.py"],
+                    "untracked_paths": [f"reports/{context_secret}.txt"],
+                    "error": f"git error includes {task_secret}",
+                }
+            return {"ok": True, "changed_paths": []}
+
+        scope = {
+            "ok": False,
+            "violations": [f"forbidden/{context_secret}.txt"],
+            "error": f"scope error includes {task_secret}",
+        }
+        with patch.object(
+            orchestrator, "capture_git_snapshot", side_effect=snapshot
+        ), patch.object(orchestrator, "check_write_scope", return_value=scope):
+            result = orchestrator.run_agent(
+                task_secret, context=context_secret, cwd=self.workspace
+            )
+        run_dir = self.runs_dir / str(result["run_id"])
+        for secret in (task_secret, context_secret):
+            self.assertNotIn(secret.encode(), self._scan_run(run_dir))
+            self.assertNotIn(secret, json.dumps(result, ensure_ascii=False))
+        metadata = orchestrator.read_metadata(run_dir)
+        self.assertIn(
+            orchestrator.SCRUBBED_VALUE,
+            json.dumps(metadata["git_after"], ensure_ascii=False),
+        )
+        self.assertIn(
+            orchestrator.SCRUBBED_VALUE,
+            json.dumps(metadata["write_scope_check"], ensure_ascii=False),
+        )
+
+    def test_endpoint_environment_components_are_scrubbed_inside_prose(self) -> None:
+        endpoint_user = "endpoint-user-u7"
+        endpoint_password = "endpoint-password-p8"
+        endpoint_query = "endpoint-query-q9"
+        endpoint = (
+            f"https://{endpoint_user}:{endpoint_password}@example.invalid/api"
+            f"?token={endpoint_query}&region=test"
+        )
+        provider = orchestrator.Provider(
+            id="endpoint-env-provider",
+            name="Endpoint Env Provider",
+            app_type="claude",
+            settings={
+                "env": {
+                    "ANTHROPIC_API_KEY": FAKE_PROVIDER_SECRET,
+                    "ANTHROPIC_MODEL": "fixture-model",
+                    "ANTHROPIC_BASE_URL": endpoint,
+                }
+            },
+            category=None,
+            provider_type=None,
+            is_current=True,
+            endpoints=[],
+        )
+        self.fake_runtime.write_text(
+            "\n".join(
+                [
+                    "import os, sys",
+                    "sys.stdin.buffer.read()",
+                    "print('endpoint prose is ' + os.environ['ANTHROPIC_BASE_URL'], flush=True)",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with patch.object(orchestrator, "get_provider", return_value=provider):
+            one_shot = orchestrator.run_agent("endpoint prose", cwd=self.workspace)
+            streaming = orchestrator.run_streaming_agent(
+                "endpoint prose", cwd=self.workspace
+            )
+        stream_dir = self.runs_dir / str(streaming["run_id"])
+        self._wait_for_terminal_metadata(stream_dir)
+        for run_dir in (
+            self.runs_dir / str(one_shot["run_id"]),
+            stream_dir,
+        ):
+            payload = self._scan_run(run_dir)
+            for secret in (endpoint_user, endpoint_password, endpoint_query):
+                self.assertNotIn(secret.encode(), payload)
+            self.assertIn(orchestrator.SCRUBBED_VALUE.encode(), payload)
+
+    def test_secret_scanner_is_bounded_on_long_delimiter_free_lines(self) -> None:
+        script = "\n".join(
+            [
+                "import sys, time",
+                f"sys.path.insert(0, {str(ORCHESTRATOR_DIR)!r})",
+                "import cc_orchestrator as c",
+                "started = time.monotonic()",
+                "for size in (64 * 1024, 256 * 1024):",
+                "    value = 'A' * size",
+                "    assert c.redact(value) == value",
+                "    assert c.classify_secret_line(value, 'fixture', 1) is None",
+                "value = 'sk-' * (128 * 1024 // 3)",
+                "assert c.classify_secret_line(value, 'fixture', 1) is not None",
+                "assert '...' in c.redact(value)",
+                "print(time.monotonic() - started)",
+            ]
+        )
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-I", "-B", "-c", script],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail("secret scanner exceeded the two-second wall-clock bound")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertLess(float(completed.stdout.strip()), 1.5)
+        self.assertIsNotNone(
+            orchestrator.classify_secret_line(
+                "prefix sk-abcdefghijklmnopqrstuvwxyz", "fixture", 1
+            )
+        )
+
+
+class SecondReviewSecurityEventTests(GuardedLaunchFixture):
+    def _unsafe_policy(self) -> tuple[RuntimeSecurityPolicy, RuntimeExecutableCandidate]:
+        observed = ExecutableIdentity.capture(self.fake_runtime)
+        policy = RuntimeSecurityPolicy(
+            runtime_executable=str(self.fake_runtime.resolve()),
+            unsafe_runtimes=(
+                ApprovedUnsafeRuntime(
+                    runtime_id="fixture-unsafe-event",
+                    identity=_pinned_identity(observed),
+                ),
+            ),
+        )
+        candidate = RuntimeExecutableCandidate(
+            canonical_path=str(self.fake_runtime.resolve()),
+            source="runtime_security.override.json",
+            trust_class="local_configured",
+        )
+        return policy, candidate
+
+    def test_local_unsafe_event_precedes_one_shot_popen_and_stream_gate(self) -> None:
+        policy, candidate = self._unsafe_policy()
+        one_shot_observation: list[list[dict[str, object]]] = []
+        real_popen = subprocess.Popen
+
+        def observe_one_shot(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+            run_dir = self._run_dirs()[-1]
+            one_shot_observation.append(
+                [
+                    json.loads(line)
+                    for line in (run_dir / "events.ndjson").read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                    if line.strip()
+                ]
+            )
+            return real_popen(*args, **kwargs)
+
+        common = (
+            patch.object(orchestrator, "load_runtime_security_policy", return_value=policy),
+            patch.object(orchestrator, "resolve_runtime_candidate", return_value=candidate),
+        )
+        with common[0], common[1], patch.object(
+            orchestrator.subprocess, "Popen", side_effect=observe_one_shot
+        ):
+            orchestrator.run_agent(
+                "unsafe event one shot",
+                cwd=self.workspace,
+                allow_unsafe_runtime=True,
+            )
+        self.assertTrue(one_shot_observation)
+        unsafe = one_shot_observation[0][-1]
+        self.assertEqual(unsafe["type"], "unsafe_runtime_approved")
+        self.assertEqual(unsafe["severity"], "high")
+        self.assertEqual(unsafe["trust_level"], "local_unsafe")
+
+        gate_observation: list[list[dict[str, object]]] = []
+        real_open_gate = orchestrator._open_worker_start_gate
+
+        def observe_gate(run_dir: Path) -> dict[str, object]:
+            gate_observation.append(
+                [
+                    json.loads(line)
+                    for line in (run_dir / "events.ndjson").read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                    if line.strip()
+                ]
+            )
+            return real_open_gate(run_dir)
+
+        with patch.object(
+            orchestrator, "load_runtime_security_policy", return_value=policy
+        ), patch.object(
+            orchestrator, "resolve_runtime_candidate", return_value=candidate
+        ), patch.object(
+            orchestrator, "_open_worker_start_gate", side_effect=observe_gate
+        ):
+            launch = orchestrator.run_streaming_agent(
+                "unsafe event streaming",
+                cwd=self.workspace,
+                allow_unsafe_runtime=True,
+            )
+        self._wait_for_terminal_metadata(self.runs_dir / str(launch["run_id"]))
+        self.assertTrue(gate_observation)
+        event_types = [event["type"] for event in gate_observation[0]]
+        self.assertIn("unsafe_runtime_approved", event_types)
+        stream_unsafe = next(
+            event
+            for event in gate_observation[0]
+            if event["type"] == "unsafe_runtime_approved"
+        )
+        self.assertEqual(stream_unsafe["severity"], "high")
+
+
+class SecondReviewArtifactWalkTests(GuardedLaunchFixture):
+    def test_scrub_walk_rejects_links_and_oversized_files(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        run_dir.mkdir(parents=True)
+        outside = self.workspace / "outside-secret.txt"
+        outside.write_text("outside", encoding="utf-8")
+        link = run_dir / "linked.txt"
+        try:
+            os.symlink(outside, link)
+        except OSError:
+            link = None
+        if link is not None:
+            with self.assertRaises(orchestrator.OrchestratorError):
+                orchestrator._scrub_run_artifacts(run_dir, ("outside",))
+            link.unlink()
+
+        oversized = run_dir / "oversized.bin"
+        with oversized.open("wb") as handle:
+            handle.seek(32 * 1024 * 1024)
+            handle.write(b"x")
+        with self.assertRaises(orchestrator.OrchestratorError):
+            orchestrator._scrub_run_artifacts(run_dir, ("secret",))
+
+
+class SecondReviewEventSequenceTests(GuardedLaunchFixture):
+    def test_event_sequence_uses_sidecar_without_full_log_scan(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        run_dir.mkdir(parents=True)
+        events_path = run_dir / "events.ndjson"
+        events_path.write_text(
+            "".join(
+                json.dumps({"seq": seq, "type": "fixture"}) + "\n"
+                for seq in range(1, 5001)
+            ),
+            encoding="utf-8",
+        )
+        (run_dir / "event_seq.txt").write_text(
+            json.dumps({"seq": 5000, "events_bytes": events_path.stat().st_size}),
+            encoding="utf-8",
+        )
+        real_read_text = Path.read_text
+
+        def reject_event_read(path: Path, *args: object, **kwargs: object) -> str:
+            if Path(path) == events_path:
+                raise AssertionError("events log was fully rescanned")
+            return real_read_text(path, *args, **kwargs)
+
+        with patch.object(Path, "read_text", reject_event_read), patch.object(
+            orchestrator,
+            "_last_complete_event",
+            side_effect=AssertionError("sidecar fast path was not used"),
+        ):
+            orchestrator.append_event(run_dir, {"type": "next", "seq": 999})
+        last = json.loads(events_path.read_text(encoding="utf-8").splitlines()[-1])
+        self.assertEqual(last["seq"], 5001)
+
+    def test_event_sequence_recovers_last_complete_event_and_truncates_tail(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        run_dir.mkdir(parents=True)
+        events_path = run_dir / "events.ndjson"
+        events_path.write_bytes(
+            json.dumps({"seq": 7, "type": "complete"}).encode() + b"\n{\"seq\": 8"
+        )
+        orchestrator.append_event(run_dir, {"type": "recovered"})
+        events = [
+            json.loads(line)
+            for line in events_path.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual([event["seq"] for event in events], [7, 8])
 
 
 class ReviewFixWrapperChecks(GuardedLaunchFixture):

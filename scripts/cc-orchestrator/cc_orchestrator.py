@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import getpass
 import hashlib
 import html as html_lib
 import json
@@ -15,6 +14,7 @@ import re
 import shutil
 import signal
 import sqlite3
+import stat
 import struct
 import subprocess
 import sys
@@ -200,19 +200,21 @@ MODEL_USAGE_ALLOWED_KEYS = TOKEN_USAGE_KEYS | {
     "contextwindow",
     "websearchrequests",
 }
-SECRET_VALUE_RE = re.compile(
-    r"("
-    r"sk-[A-Za-z0-9_\-]{8,}|"
-    r"ghp_[A-Za-z0-9_]{20,}|"
-    r"github_pat_[A-Za-z0-9_]{20,}|"
-    r"npm_[A-Za-z0-9]{20,}|"
-    r"AKIA[0-9A-Z]{16}|"
-    r"AIza[0-9A-Za-z_\-]{35}|"
-    r"Bearer\s+[A-Za-z0-9._~+/=\-]{20,}|"
-    r"[A-Za-z0-9]{20,}\.[A-Za-z0-9_\-]{8,}|"
-    r"-----BEGIN (?:RSA|OPENSSH|PRIVATE) KEY-----"
-    r")",
-    re.IGNORECASE,
+_SECRET_PREFIX_SPECS = (
+    ("sk-", frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"), 8, None),
+    ("ghp_", frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"), 20, None),
+    ("github_pat_", frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"), 20, None),
+    ("npm_", frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"), 20, None),
+    ("akia", frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"), 16, 16),
+    ("aiza", frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"), 35, 35),
+)
+_BEARER_VALUE_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._~+/=-"
+)
+_PRIVATE_KEY_MARKERS = (
+    "-----begin rsa key-----",
+    "-----begin openssh key-----",
+    "-----begin private key-----",
 )
 SECRET_ASSIGN_RE = re.compile(
     r"(?i)(?:api[_-]?key|secret|token|authorization|auth)\s*[:=]\s*['\"]?([A-Za-z0-9._~+/=\-]{16,})"
@@ -613,35 +615,106 @@ def load_json(path: Path) -> dict[str, Any]:
         raise OrchestratorError(f"Invalid JSON in {path}: {exc}") from exc
 
 
-def _long_text_may_contain_secret(value: str) -> bool:
+def _secret_value_spans(value: str) -> list[tuple[int, int]]:
+    """Find known token shapes with bounded, forward-only scans."""
     lowered = value.casefold()
-    if any(
-        marker in lowered
-        for marker in (
-            "sk-",
-            "ghp_",
-            "github_pat_",
-            "npm_",
-            "akia",
-            "aiza",
-            "bearer ",
-            "-----begin ",
-        )
-    ):
-        return True
-    if "." not in value:
-        return False
-    for match in re.finditer(r"[A-Za-z0-9_.-]+", value):
-        token = match.group(0)
-        if "." not in token:
+    spans: list[tuple[int, int]] = []
+    for prefix, allowed, minimum, exact in _SECRET_PREFIX_SPECS:
+        offset = 0
+        while True:
+            start = lowered.find(prefix, offset)
+            if start < 0:
+                break
+            body_start = start + len(prefix)
+            end = body_start
+            limit = len(value) if exact is None else min(len(value), body_start + exact)
+            while end < limit and value[end] in allowed:
+                end += 1
+            if end - body_start >= minimum:
+                spans.append((start, end))
+                offset = end
+            else:
+                offset = max(body_start, start + 1)
+
+    offset = 0
+    while True:
+        start = lowered.find("bearer", offset)
+        if start < 0:
+            break
+        body_start = start + len("bearer")
+        while body_start < len(value) and value[body_start].isspace():
+            body_start += 1
+        end = body_start
+        while end < len(value) and value[end] in _BEARER_VALUE_CHARS:
+            end += 1
+        if body_start > start + len("bearer") and end - body_start >= 20:
+            spans.append((start, end))
+            offset = end
+        else:
+            offset = max(body_start, start + 1)
+
+    for marker in _PRIVATE_KEY_MARKERS:
+        offset = 0
+        while True:
+            start = lowered.find(marker, offset)
+            if start < 0:
+                break
+            spans.append((start, start + len(marker)))
+            offset = start + len(marker)
+
+    index = 0
+    while index < len(value):
+        if not value[index].isalnum() or not value[index].isascii():
+            index += 1
             continue
-        parts = token.split(".")
-        for left, right in zip(parts, parts[1:]):
-            left_length = len(left) - len(left.rstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"))
-            right_length = len(right) - len(right.lstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"))
-            if left_length >= 20 and right_length >= 8:
-                return True
-    return False
+        left_start = index
+        while (
+            index < len(value)
+            and value[index].isascii()
+            and value[index].isalnum()
+        ):
+            index += 1
+        if index - left_start < 20 or index >= len(value) or value[index] != ".":
+            continue
+        right_start = index + 1
+        end = right_start
+        while (
+            end < len(value)
+            and value[end].isascii()
+            and (value[end].isalnum() or value[end] in "_-")
+        ):
+            end += 1
+        if end - right_start >= 8:
+            spans.append((left_start, end))
+        index = max(index + 1, end)
+
+    if not spans:
+        return []
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _contains_secret_value(value: str) -> bool:
+    return bool(_secret_value_spans(value))
+
+
+def _redact_secret_values(value: str) -> str:
+    spans = _secret_value_spans(value)
+    if not spans:
+        return value
+    parts: list[str] = []
+    offset = 0
+    for start, end in spans:
+        token = value[start:end]
+        parts.extend((value[offset:start], token[:6], "...", token[-4:]))
+        offset = end
+    parts.append(value[offset:])
+    return "".join(parts)
 
 
 def redact(value: Any) -> Any:
@@ -650,9 +723,7 @@ def redact(value: Any) -> Any:
     if isinstance(value, list):
         return [redact(v) for v in value]
     if isinstance(value, str):
-        if len(value) > 64 * 1024:
-            return SCRUBBED_VALUE if _long_text_may_contain_secret(value) else value
-        return SECRET_VALUE_RE.sub(lambda match: match.group(0)[:6] + "..." + match.group(0)[-4:], value)
+        return _redact_secret_values(value)
     return value
 
 
@@ -1373,51 +1444,336 @@ def artifact_lock(run_dir: Path, timeout_seconds: float = 10.0) -> _ArtifactLock
     return _ArtifactLock(run_dir, timeout_seconds)
 
 
-def _enforce_windows_private_acl(path: Path, *, is_dir: bool) -> None:
-    system_root = Path(os.environ.get("SystemRoot") or os.environ.get("WINDIR") or r"C:\Windows")
-    bundled = system_root / "System32" / "icacls.exe"
-    icacls = str(bundled) if bundled.is_file() else shutil.which("icacls.exe")
-    if not icacls:
-        raise OrchestratorError("Windows ACL enforcement tool is unavailable.")
-    principal = getpass.getuser()
-    domain = os.environ.get("USERDOMAIN")
-    if domain and "\\" not in principal:
-        principal = f"{domain}\\{principal}"
-    grant = f"{principal}:{'(OI)(CI)F' if is_dir else 'F'}"
-    commands = (
-        [icacls, str(path), "/inheritance:r", "/grant:r", grant],
-        [icacls, str(path), "/verify"],
-    )
-    for command in commands:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=15,
+MAX_MANAGED_ARTIFACT_BYTES = 32 * 1024 * 1024
+MAX_MANAGED_ARTIFACT_FILES = 10_000
+EVENT_RECOVERY_TAIL_BYTES = 4 * 1024 * 1024
+_WINDOWS_REPARSE_POINT = 0x400
+
+
+def _lstat_managed_path(path: Path, *, is_dir: bool) -> os.stat_result:
+    try:
+        details = path.lstat()
+    except OSError as exc:
+        raise OrchestratorError(f"Managed artifact is unavailable: {path.name}") from exc
+    attributes = int(getattr(details, "st_file_attributes", 0) or 0)
+    if stat.S_ISLNK(details.st_mode) or attributes & _WINDOWS_REPARSE_POINT:
+        raise OrchestratorError(
+            f"Managed artifact links and reparse points are forbidden: {path.name}"
         )
-        if completed.returncode != 0:
+    expected = stat.S_ISDIR(details.st_mode) if is_dir else stat.S_ISREG(details.st_mode)
+    if not expected:
+        kind = "directory" if is_dir else "regular file"
+        raise OrchestratorError(f"Managed artifact is not a {kind}: {path.name}")
+    if not is_dir and details.st_size > MAX_MANAGED_ARTIFACT_BYTES:
+        raise OrchestratorError(f"Managed artifact exceeds its size limit: {path.name}")
+    return details
+
+
+def _windows_security_apis() -> tuple[Any, Any, Any]:
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32.GetNamedSecurityInfoW.argtypes = (
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+    )
+    advapi32.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    advapi32.GetSecurityDescriptorControl.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.WORD),
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    advapi32.GetSecurityDescriptorControl.restype = wintypes.BOOL
+    advapi32.GetAclInformation.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    )
+    advapi32.GetAclInformation.restype = wintypes.BOOL
+    advapi32.GetAce.argtypes = (
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+    )
+    advapi32.GetAce.restype = wintypes.BOOL
+    advapi32.ConvertSidToStringSidW.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.LPWSTR),
+    )
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+    advapi32.SetFileSecurityW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+    )
+    advapi32.SetFileSecurityW.restype = wintypes.BOOL
+    advapi32.OpenProcessToken.argtypes = (
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+    )
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = (
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    kernel32.GetCurrentProcess.argtypes = ()
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    return ctypes, advapi32, kernel32
+
+
+def _windows_sid_text(ctypes: Any, advapi32: Any, kernel32: Any, sid: Any) -> str:
+    from ctypes import wintypes
+
+    text = wintypes.LPWSTR()
+    if not advapi32.ConvertSidToStringSidW(sid, ctypes.byref(text)):
+        raise OSError(ctypes.get_last_error(), "Could not render a Windows SID")
+    try:
+        return str(text.value)
+    finally:
+        kernel32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+
+
+def _windows_current_user_sid(
+    ctypes: Any, advapi32: Any, kernel32: Any
+) -> str:
+    token = ctypes.c_void_p()
+    if not advapi32.OpenProcessToken(
+        kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)
+    ):
+        raise OSError(ctypes.get_last_error(), "Could not open the process token")
+    try:
+        required = ctypes.c_uint32()
+        advapi32.GetTokenInformation(
+            token, 1, None, 0, ctypes.byref(required)
+        )
+        if required.value == 0:
+            raise OSError(
+                ctypes.get_last_error(), "Could not size the process token user"
+            )
+        buffer = ctypes.create_string_buffer(required.value)
+        if not advapi32.GetTokenInformation(
+            token,
+            1,
+            buffer,
+            required.value,
+            ctypes.byref(required),
+        ):
+            raise OSError(
+                ctypes.get_last_error(), "Could not read the process token user"
+            )
+        sid = ctypes.c_void_p.from_buffer(buffer).value
+        if not sid:
+            raise OrchestratorError("The process token has no user SID.")
+        return _windows_sid_text(
+            ctypes, advapi32, kernel32, ctypes.c_void_p(sid)
+        )
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def _inspect_windows_private_acl(path: Path, *, is_dir: bool) -> dict[str, Any]:
+    if os.name != "nt":
+        raise OrchestratorError("Windows ACL inspection is unavailable on this platform.")
+    _lstat_managed_path(path, is_dir=is_dir)
+    ctypes, advapi32, kernel32 = _windows_security_apis()
+    from ctypes import wintypes
+
+    owner = ctypes.c_void_p()
+    dacl = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    result = advapi32.GetNamedSecurityInfoW(
+        str(path),
+        1,
+        0x00000001 | 0x00000004,
+        ctypes.byref(owner),
+        None,
+        ctypes.byref(dacl),
+        None,
+        ctypes.byref(descriptor),
+    )
+    if result != 0:
+        raise OSError(result, f"Could not inspect the Windows ACL for {path.name}")
+    try:
+        owner_sid = _windows_sid_text(
+            ctypes, advapi32, kernel32, owner
+        )
+        current_user_sid = _windows_current_user_sid(
+            ctypes, advapi32, kernel32
+        )
+        control = wintypes.WORD()
+        revision = wintypes.DWORD()
+        if not advapi32.GetSecurityDescriptorControl(
+            descriptor, ctypes.byref(control), ctypes.byref(revision)
+        ):
+            raise OSError(ctypes.get_last_error(), "Could not inspect DACL control")
+
+        class AclSizeInformation(ctypes.Structure):
+            _fields_ = (
+                ("AceCount", wintypes.DWORD),
+                ("AclBytesInUse", wintypes.DWORD),
+                ("AclBytesFree", wintypes.DWORD),
+            )
+
+        info = AclSizeInformation()
+        if not dacl or not advapi32.GetAclInformation(
+            dacl, ctypes.byref(info), ctypes.sizeof(info), 2
+        ):
+            raise OSError(ctypes.get_last_error(), "Could not inspect DACL entries")
+        entries: list[dict[str, Any]] = []
+        for index in range(int(info.AceCount)):
+            ace = ctypes.c_void_p()
+            if not advapi32.GetAce(dacl, index, ctypes.byref(ace)):
+                raise OSError(ctypes.get_last_error(), "Could not inspect a DACL entry")
+            address = int(ace.value)
+            ace_type = ctypes.c_ubyte.from_address(address).value
+            ace_flags = ctypes.c_ubyte.from_address(address + 1).value
+            mask = ctypes.c_uint32.from_address(address + 4).value
+            sid = ctypes.c_void_p(address + 8)
+            entries.append(
+                {
+                    "type": ace_type,
+                    "flags": ace_flags,
+                    "mask": mask,
+                    "sid": _windows_sid_text(
+                        ctypes, advapi32, kernel32, sid
+                    ),
+                }
+            )
+        expected_flags = 0x03 if is_dir else 0
+        exact = bool(control.value & 0x1000) and entries == [
+            {
+                "type": 0,
+                "flags": expected_flags,
+                "mask": 0x001F01FF,
+                "sid": current_user_sid,
+            }
+        ]
+        return {
+            "protected": bool(control.value & 0x1000),
+            "owner_sid": owner_sid,
+            "current_user_sid": current_user_sid,
+            "ace_sids": [str(entry["sid"]) for entry in entries],
+            "has_inherited_aces": any(
+                int(entry["flags"]) & 0x10 for entry in entries
+            ),
+            "entries": entries,
+            "exact": exact,
+        }
+    finally:
+        kernel32.LocalFree(descriptor)
+
+
+def _enforce_windows_private_acl(path: Path, *, is_dir: bool) -> None:
+    _lstat_managed_path(path, is_dir=is_dir)
+    ctypes, advapi32, kernel32 = _windows_security_apis()
+    current_user_sid = _windows_current_user_sid(
+        ctypes, advapi32, kernel32
+    )
+    flags = "OICI" if is_dir else ""
+    sddl = f"D:P(A;{flags};FA;;;{current_user_sid})"
+    descriptor = ctypes.c_void_p()
+    size = ctypes.c_uint32()
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl, 1, ctypes.byref(descriptor), ctypes.byref(size)
+    ):
+        raise OrchestratorError(
+            f"Could not construct a private Windows ACL for {path.name}."
+        )
+    try:
+        if not advapi32.SetFileSecurityW(str(path), 0x00000004, descriptor):
             raise OrchestratorError(
                 f"Could not enforce a private Windows ACL for {path.name}."
             )
+    finally:
+        kernel32.LocalFree(descriptor)
+    if not _inspect_windows_private_acl(path, is_dir=is_dir)["exact"]:
+        raise OrchestratorError(
+            f"Private Windows ACL verification failed for {path.name}."
+        )
+
+
+def _verify_private_path(path: Path, *, is_dir: bool = False) -> None:
+    details = _lstat_managed_path(path, is_dir=is_dir)
+    if os.name == "nt":
+        if not _inspect_windows_private_acl(path, is_dir=is_dir)["exact"]:
+            raise OrchestratorError(
+                f"Private Windows ACL verification failed for {path.name}."
+            )
+        return
+    expected_mode = 0o700 if is_dir else 0o600
+    if stat.S_IMODE(details.st_mode) != expected_mode:
+        raise OrchestratorError(f"Private artifact mode is invalid: {path.name}")
 
 
 def _set_private_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _lstat_managed_path(path, is_dir=True)
     os.chmod(path, 0o700)
     if os.name == "nt":
         _enforce_windows_private_acl(path, is_dir=True)
+    _verify_private_path(path, is_dir=True)
 
 
 def _set_private_file(path: Path) -> None:
+    _lstat_managed_path(path, is_dir=False)
     os.chmod(path, 0o600)
+    if os.name == "nt":
+        _enforce_windows_private_acl(path, is_dir=False)
+    _verify_private_path(path, is_dir=False)
+
+
+def _iter_managed_artifacts(run_dir: Path) -> list[tuple[Path, bool]]:
+    _lstat_managed_path(run_dir, is_dir=True)
+    entries: list[tuple[Path, bool]] = []
+    count = 0
+    for root, directories, filenames in os.walk(run_dir, followlinks=False):
+        root_path = Path(root)
+        for name in directories:
+            path = root_path / name
+            _lstat_managed_path(path, is_dir=True)
+            entries.append((path, True))
+        for name in filenames:
+            path = root_path / name
+            _lstat_managed_path(path, is_dir=False)
+            count += 1
+            if count > MAX_MANAGED_ARTIFACT_FILES:
+                raise OrchestratorError("Managed artifact file-count limit exceeded.")
+            entries.append((path, False))
+    return entries
 
 
 def _secure_run_artifacts(run_dir: Path) -> None:
-    os.chmod(run_dir, 0o700)
-    for path in run_dir.rglob("*"):
-        if path.is_file():
+    entries = _iter_managed_artifacts(run_dir)
+    _set_private_directory(run_dir)
+    for path, is_dir in entries:
+        if is_dir:
+            _set_private_directory(path)
+        else:
             _set_private_file(path)
 
 
@@ -1432,8 +1788,8 @@ def _scrub_run_artifacts(
     replacements.discard(b"")
     marker = SCRUBBED_VALUE.encode("utf-8")
     with artifact_lock(run_dir):
-        for path in run_dir.rglob("*"):
-            if not path.is_file():
+        for path, is_dir in _iter_managed_artifacts(run_dir):
+            if is_dir:
                 continue
             payload = path.read_bytes()
             scrubbed = payload
@@ -1443,7 +1799,9 @@ def _scrub_run_artifacts(
                 _atomic_write_bytes(path, scrubbed)
 
 
-def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+def _prepare_private_atomic_write(path: Path, payload: bytes) -> Path:
+    if len(payload) > MAX_MANAGED_ARTIFACT_BYTES:
+        raise OrchestratorError(f"Atomic artifact exceeds its size limit: {path.name}")
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
     try:
@@ -1459,23 +1817,46 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        replace_deadline = time.monotonic() + 2.0
-        while True:
-            try:
-                os.replace(temporary_path, path)
-                break
-            except PermissionError:
-                if time.monotonic() >= replace_deadline:
-                    raise
-                time.sleep(0.005)
+        _verify_private_path(temporary_path, is_dir=False)
+        prepared = temporary_path
         temporary_path = None
-        _set_private_file(path)
+        return prepared
     finally:
         if temporary_path is not None:
             try:
                 temporary_path.unlink()
             except FileNotFoundError:
                 pass
+
+
+def _replace_prepared_atomic_write(temporary_path: Path, path: Path) -> None:
+    replace_deadline = time.monotonic() + 2.0
+    while True:
+        try:
+            os.replace(temporary_path, path)
+            return
+        except PermissionError:
+            if time.monotonic() >= replace_deadline:
+                raise
+            time.sleep(0.005)
+
+
+def _discard_prepared_atomic_write(temporary_path: Path | None) -> None:
+    if temporary_path is None:
+        return
+    try:
+        temporary_path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    temporary_path = _prepare_private_atomic_write(path, payload)
+    try:
+        _replace_prepared_atomic_write(temporary_path, path)
+    except Exception:
+        _discard_prepared_atomic_write(temporary_path)
+        raise
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -1862,25 +2243,98 @@ def extract_tool_calls_from_payload(payload: Any) -> list[dict[str, Any]]:
     return calls
 
 
+def _read_event_seq_sidecar(path: Path) -> tuple[int, int | None]:
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(256)
+            if handle.read(1):
+                return 0, None
+    except FileNotFoundError:
+        return 0, None
+    text = raw.decode("utf-8", errors="replace").strip()
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        seq = payload.get("seq")
+        events_bytes = payload.get("events_bytes")
+        if (
+            isinstance(seq, int)
+            and not isinstance(seq, bool)
+            and seq >= 0
+            and isinstance(events_bytes, int)
+            and not isinstance(events_bytes, bool)
+            and events_bytes >= 0
+        ):
+            return seq, events_bytes
+    try:
+        value = int(text)
+    except ValueError:
+        return 0, None
+    return (value, None) if value >= 0 else (0, None)
+
+
+def _last_complete_event(path: Path) -> tuple[int, int | None]:
+    """Return the last complete sequence and a partial-tail truncation offset."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            if size == 0:
+                return 0, None
+            start = max(0, size - EVENT_RECOVERY_TAIL_BYTES)
+            handle.seek(start)
+            tail = handle.read()
+    except FileNotFoundError:
+        return 0, None
+    if tail.endswith(b"\n"):
+        complete_end = len(tail) - 1
+        truncate_at = None
+    else:
+        final_newline = tail.rfind(b"\n")
+        if final_newline < 0:
+            if start:
+                raise OrchestratorError("Last event exceeds the recovery bound.")
+            return 0, 0
+        complete_end = final_newline
+        truncate_at = start + final_newline + 1
+    previous_newline = tail.rfind(b"\n", 0, complete_end)
+    line_start = previous_newline + 1
+    if start and previous_newline < 0:
+        raise OrchestratorError("Last event exceeds the recovery bound.")
+    line = tail[line_start:complete_end]
+    if not line.strip():
+        return 0, truncate_at
+    try:
+        candidate = json.loads(line.decode("utf-8")).get("seq")
+    except (AttributeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise OrchestratorError("Last complete event is invalid.") from exc
+    if not isinstance(candidate, int) or isinstance(candidate, bool) or candidate < 0:
+        raise OrchestratorError("Last complete event sequence is invalid.")
+    return candidate, truncate_at
+
+
 def append_event(run_dir: Path, event: dict[str, Any]) -> None:
     with artifact_lock(run_dir):
         seq_path = run_dir / "event_seq.txt"
-        last_seq = 0
         path = run_dir / "events.ndjson"
+        sidecar_seq, sidecar_size = _read_event_seq_sidecar(seq_path)
         try:
-            for line in path.read_text(
-                encoding="utf-8", errors="replace"
-            ).splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    candidate = json.loads(line).get("seq")
-                except (AttributeError, json.JSONDecodeError):
-                    continue
-                if isinstance(candidate, int) and not isinstance(candidate, bool):
-                    last_seq = max(last_seq, candidate)
+            current_size = path.stat().st_size
         except FileNotFoundError:
-            pass
+            current_size = 0
+        if sidecar_size is not None and sidecar_size == current_size:
+            event_seq, truncate_at = sidecar_seq, None
+        else:
+            event_seq, truncate_at = _last_complete_event(path)
+        if truncate_at is not None:
+            with path.open("r+b") as handle:
+                _set_private_file(path)
+                handle.truncate(truncate_at)
+                handle.flush()
+                os.fsync(handle.fileno())
+        last_seq = max(sidecar_seq, event_seq)
         seq = last_seq + 1
         persisted_event = dict(event)
         persisted_event["seq"] = seq
@@ -1896,7 +2350,13 @@ def append_event(run_dir: Path, event: dict[str, Any]) -> None:
             )
             handle.flush()
             os.fsync(handle.fileno())
-        _atomic_write_text(seq_path, str(seq))
+        _atomic_write_text(
+            seq_path,
+            json.dumps(
+                {"seq": seq, "events_bytes": path.stat().st_size},
+                separators=(",", ":"),
+            ),
+        )
 
 
 def parse_events_delta(path: Path, offset: int = 0, max_bytes: int = 20000) -> dict[str, Any]:
@@ -3415,10 +3875,17 @@ def prepare_worker_launch(
         for key, value in provider_env.items()
         if value and should_redact_key(str(key), value)
     )
+    provider_endpoint_secrets = tuple(
+        secret
+        for value in provider_env.values()
+        if value
+        for secret in _endpoint_sensitive_values(str(value))
+    )
     exact_values = _normalize_sensitive_values(
         (
             *_prompt_sensitive_values(prompt_bytes),
             *provider_secrets,
+            *provider_endpoint_secrets,
             *_collect_route_sensitive_values(safe_route_metadata),
             *sensitive_values,
         )
@@ -3598,16 +4065,19 @@ def _record_blocked_launch(
     *,
     status: str,
     error: RuntimeSecurityError,
+    sensitive_values: tuple[str, ...] = (),
     **updates: Any,
 ) -> dict[str, Any]:
-    proposed = dict(metadata)
-    proposed.update(updates)
+    proposed = _scrub_guarded_value(dict(metadata), sensitive_values)
+    proposed.update(_scrub_guarded_value(updates, sensitive_values))
     proposed.update(
         {
             "status": status,
             "finished_at": utc_now_iso(),
             "exit_code": None,
-            "security_error": error.to_dict(),
+            "security_error": _scrub_guarded_value(
+                error.to_dict(), sensitive_values
+            ),
             "terminal_state_count": 1,
         }
     )
@@ -3623,15 +4093,17 @@ def _record_blocked_launch(
                     "persisted": True,
                     "persistence_state": "persisted",
                 }
-            blocked = dict(metadata)
-            blocked.update(current)
-            blocked.update(updates)
+            blocked = _scrub_guarded_value(dict(metadata), sensitive_values)
+            blocked.update(_scrub_guarded_value(current, sensitive_values))
+            blocked.update(_scrub_guarded_value(updates, sensitive_values))
             blocked.update(
                 {
                     "status": status,
                     "finished_at": utc_now_iso(),
                     "exit_code": None,
-                    "security_error": error.to_dict(),
+                    "security_error": _scrub_guarded_value(
+                        error.to_dict(), sensitive_values
+                    ),
                     "terminal_state_count": 1,
                     "persisted": True,
                     "persistence_state": "persisted",
@@ -3773,8 +4245,11 @@ def _initialize_prepared_run(
         Path(str(metadata["workspace_root"])),
         artifact_root,
     )
-    metadata["git_before"] = capture_git_snapshot(
-        run_dir, Path(str(metadata["cwd"])), "before"
+    metadata["git_before"] = _scrub_guarded_value(
+        capture_git_snapshot(
+            run_dir, Path(str(metadata["cwd"])), "before"
+        ),
+        prepared.sensitive_values,
     )
     _scrub_run_artifacts(run_dir, prepared.sensitive_values)
     _secure_run_artifacts(run_dir)
@@ -3801,6 +4276,26 @@ def _publish_latest_run(metadata: Mapping[str, Any]) -> None:
     _atomic_write_text(RUNS_DIR / "latest.txt", run_id)
 
 
+def _append_unsafe_runtime_event(
+    prepared: PreparedWorkerLaunch, run_dir: Path
+) -> None:
+    if prepared.launch_spec.trust_level != "local_unsafe":
+        return
+    append_event(
+        run_dir,
+        _scrub_guarded_value(
+            {
+                "type": "unsafe_runtime_approved",
+                "severity": "high",
+                "trust_level": "local_unsafe",
+                "acceptance_status": "pending_controller_review",
+                "message": "A locally approved unsafe runtime is about to start.",
+            },
+            prepared.sensitive_values,
+        ),
+    )
+
+
 def _start_one_shot_launch(
     prepared: PreparedWorkerLaunch,
     run_dir: Path,
@@ -3812,6 +4307,7 @@ def _start_one_shot_launch(
         return _record_blocked_launch(
             run_dir,
             metadata,
+            sensitive_values=prepared.sensitive_values,
             status="blocked_runtime_identity",
             error=_runtime_identity_changed(identity.canonical_path),
         )
@@ -3822,8 +4318,22 @@ def _start_one_shot_launch(
         return _record_blocked_launch(
             run_dir,
             metadata,
+            sensitive_values=prepared.sensitive_values,
             status="blocked_runtime_identity",
             error=_runtime_identity_changed(identity.canonical_path),
+        )
+    try:
+        _append_unsafe_runtime_event(prepared, run_dir)
+    except Exception:
+        return _record_blocked_launch(
+            run_dir,
+            metadata,
+            sensitive_values=prepared.sensitive_values,
+            status="blocked_runtime_launch",
+            error=_launch_failure_error(
+                "artifact_write_failed",
+                "Unsafe-runtime security event could not be persisted.",
+            ),
         )
     try:
         process = subprocess.Popen(
@@ -3838,6 +4348,7 @@ def _start_one_shot_launch(
         return _record_blocked_launch(
             run_dir,
             metadata,
+            sensitive_values=prepared.sensitive_values,
             status="blocked_runtime_launch",
             error=_launch_failure_error(
                 "runtime_launch_failed", "The approved runtime process could not be started."
@@ -3861,6 +4372,7 @@ def _start_one_shot_launch(
             return _record_blocked_launch(
                 run_dir,
                 metadata,
+                sensitive_values=prepared.sensitive_values,
                 status="blocked_runtime_identity",
                 error=error,
                 child_pid=process.pid,
@@ -3876,6 +4388,7 @@ def _start_one_shot_launch(
             return _record_blocked_launch(
                 run_dir,
                 metadata,
+                sensitive_values=prepared.sensitive_values,
                 status="blocked_runtime_launch",
                 error=_launch_failure_error(
                     "artifact_write_failed",
@@ -3889,6 +4402,7 @@ def _start_one_shot_launch(
             return _record_blocked_launch(
                 run_dir,
                 metadata,
+                sensitive_values=prepared.sensitive_values,
                 status="blocked_runtime_identity",
                 error=_runtime_identity_changed(identity.canonical_path),
                 child_pid=process.pid,
@@ -3927,16 +4441,17 @@ def _start_one_shot_launch(
         ),
         prepared.sensitive_values,
     )
-    git_after = capture_git_snapshot(run_dir, Path(spec.cwd), "after")
-    _scrub_run_artifacts(run_dir, prepared.sensitive_values)
-    _secure_run_artifacts(run_dir)
-    updates: dict[str, Any] = {
+    git_after = _scrub_guarded_value(
+        capture_git_snapshot(run_dir, Path(spec.cwd), "after"),
+        prepared.sensitive_values,
+    )
+    updates: dict[str, Any] = _scrub_guarded_value({
         "finished_at": utc_now_iso(),
         "duration_ms": int((time.time() - started) * 1000),
         "exit_code": exit_code,
         "timed_out": timed_out,
         "git_after": git_after,
-    }
+    }, prepared.sensitive_values)
     if actual_route.get("actual_model") or actual_route.get("actual_model_usage"):
         updates.update(
             {
@@ -3951,7 +4466,10 @@ def _start_one_shot_launch(
             }
         )
     metadata = update_metadata(run_dir, **updates)
-    scope_check = check_write_scope(run_id=str(metadata["run_id"]))
+    scope_check = _scrub_guarded_value(
+        check_write_scope(run_id=str(metadata["run_id"])),
+        prepared.sensitive_values,
+    )
     metadata = update_metadata(
         run_dir,
         write_scope_check=scope_check,
@@ -3964,9 +4482,10 @@ def _start_one_shot_launch(
     try:
         _publish_latest_run(metadata)
     except Exception:
-        return _record_blocked_launch(
+        blocked = _record_blocked_launch(
             run_dir,
             metadata,
+            sensitive_values=prepared.sensitive_values,
             status="blocked_runtime_launch",
             error=_launch_failure_error(
                 "artifact_write_failed", "Latest-run metadata could not be persisted."
@@ -3974,6 +4493,11 @@ def _start_one_shot_launch(
             child_pid=process.pid,
             child_process_identity=child_identity.to_dict(),
         )
+        _scrub_run_artifacts(run_dir, prepared.sensitive_values)
+        _secure_run_artifacts(run_dir)
+        return _scrub_guarded_value(blocked, prepared.sensitive_values)
+    _scrub_run_artifacts(run_dir, prepared.sensitive_values)
+    _secure_run_artifacts(run_dir)
     return _scrub_guarded_value({
         **metadata,
         "stdout_tail": safe_stdout[-4000:],
@@ -4016,6 +4540,7 @@ def start_prepared_worker_launch(
         return _record_blocked_launch(
             run_dir,
             metadata,
+            sensitive_values=prepared.sensitive_values,
             status="blocked_runtime_launch",
             error=_launch_failure_error(
                 "artifact_write_failed", "Run artifacts could not be initialized atomically."
@@ -4117,18 +4642,33 @@ def _write_pipe_chunk(pipe: Any, payload: bytes) -> None:
 
 
 def _open_worker_start_gate(run_dir: Path) -> dict[str, Any]:
-    with artifact_lock(run_dir):
-        metadata = read_metadata(run_dir)
-        worker_launch = metadata.get("worker_launch")
-        if not isinstance(worker_launch, dict):
-            raise OrchestratorError("Worker start gate metadata is unavailable.")
-        if worker_launch.get("start_gate") != "closed":
-            raise OrchestratorError("Worker start gate is not closed.")
-        opened = dict(worker_launch)
-        opened.update({"start_gate": "open", "gate_opened_at": utc_now_iso()})
-        metadata["worker_launch"] = opened
-        _atomic_write_bytes(run_dir / "metadata.json", _metadata_bytes(metadata))
-        return metadata
+    temporary_path: Path | None = None
+    target = run_dir / "metadata.json"
+    try:
+        with artifact_lock(run_dir):
+            metadata = read_metadata(run_dir)
+            worker_launch = metadata.get("worker_launch")
+            if not isinstance(worker_launch, dict):
+                raise OrchestratorError("Worker start gate metadata is unavailable.")
+            if worker_launch.get("start_gate") != "closed":
+                raise OrchestratorError("Worker start gate is not closed.")
+            opened = dict(worker_launch)
+            opened.update(
+                {"start_gate": "open", "gate_opened_at": utc_now_iso()}
+            )
+            metadata["worker_launch"] = opened
+            temporary_path = _prepare_private_atomic_write(
+                target, _metadata_bytes(metadata)
+            )
+    except Exception:
+        _discard_prepared_atomic_write(temporary_path)
+        raise
+    try:
+        _replace_prepared_atomic_write(temporary_path, target)
+    except Exception:
+        _discard_prepared_atomic_write(temporary_path)
+        raise
+    return metadata
 
 
 def _start_streaming_controller(
@@ -4161,11 +4701,13 @@ def _start_streaming_controller(
         return _record_blocked_launch(
             run_dir,
             metadata,
+            sensitive_values=prepared.sensitive_values,
             status="blocked_runtime_launch",
             error=_launch_failure_error(
                 "cost_guard_blocked", "Streaming launch admission could not be acquired."
             ),
         )
+    admission_active = True
     worker: subprocess.Popen[bytes] | None = None
     try:
         try:
@@ -4177,6 +4719,7 @@ def _start_streaming_controller(
             return _record_blocked_launch(
                 run_dir,
                 metadata,
+                sensitive_values=prepared.sensitive_values,
                 status="blocked_runtime_launch",
                 error=_launch_failure_error(
                     "cost_guard_blocked", "Streaming launch admission was denied."
@@ -4197,6 +4740,7 @@ def _start_streaming_controller(
             return _record_blocked_launch(
                 run_dir,
                 metadata,
+                sensitive_values=prepared.sensitive_values,
                 status="blocked_runtime_launch",
                 error=_launch_failure_error(
                     "runtime_launch_failed",
@@ -4226,6 +4770,7 @@ def _start_streaming_controller(
             return _record_blocked_launch(
                 run_dir,
                 metadata,
+                sensitive_values=prepared.sensitive_values,
                 status="blocked_runtime_launch",
                 error=_launch_failure_error(
                     "worker_protocol_failed", "The private worker launch pipe failed."
@@ -4248,6 +4793,7 @@ def _start_streaming_controller(
             return _record_blocked_launch(
                 run_dir,
                 metadata,
+                sensitive_values=prepared.sensitive_values,
                 status="blocked_process_identity",
                 error=error,
                 worker_pid=worker.pid,
@@ -4262,14 +4808,18 @@ def _start_streaming_controller(
                 run_dir,
                 {"type": "stream_worker_started", "worker_pid": worker.pid},
             )
+            _append_unsafe_runtime_event(prepared, run_dir)
             _publish_latest_run(metadata)
             _retain_worker_handle(str(metadata["run_id"]), worker)
+            admission_active = False
+            admission.__exit__(None, None, None)
             metadata = _open_worker_start_gate(run_dir)
         except Exception:
             _terminate_owned_process(worker)
             return _record_blocked_launch(
                 run_dir,
                 metadata,
+                sensitive_values=prepared.sensitive_values,
                 status="blocked_runtime_launch",
                 error=_launch_failure_error(
                     "artifact_write_failed",
@@ -4290,7 +4840,11 @@ def _start_streaming_controller(
             },
         }
     finally:
-        admission.__exit__(None, None, None)
+        if admission_active:
+            try:
+                admission.__exit__(None, None, None)
+            except Exception:
+                pass
 
 
 def run_streaming_agent(
@@ -4724,6 +5278,12 @@ def stream_worker(run_id: str) -> dict[str, Any]:
                 for key, value in runtime_env.items()
                 if value and should_redact_key(key, value)
             ),
+            *(
+                secret
+                for value in runtime_env.values()
+                if value
+                for secret in _endpoint_sensitive_values(value)
+            ),
         )
     )
     try:
@@ -4734,6 +5294,7 @@ def stream_worker(run_id: str) -> dict[str, Any]:
         return _record_blocked_launch(
             run_dir,
             metadata,
+            sensitive_values=sensitive_values,
             status="blocked_runtime_launch",
             error=_launch_failure_error(
                 "artifact_write_failed", "Worker readiness metadata could not be persisted."
@@ -4771,6 +5332,7 @@ def stream_worker(run_id: str) -> dict[str, Any]:
         return _record_blocked_launch(
             run_dir,
             metadata,
+            sensitive_values=sensitive_values,
             status="blocked_runtime_launch",
             error=_launch_failure_error(
                 "runtime_launch_failed", "The approved runtime process could not be started."
@@ -4778,14 +5340,10 @@ def stream_worker(run_id: str) -> dict[str, Any]:
         )
     io_cancel = threading.Event()
     io_errors: queue.Queue[tuple[str, BaseException]] = queue.Queue()
-    stdout_queue: queue.Queue[bytes | None] = queue.Queue()
-    stderr_queue: queue.Queue[bytes | None] = queue.Queue()
+    stdout_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=64)
+    stderr_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=64)
     termination_lock = threading.Lock()
     termination_requested = threading.Event()
-    raw_io_lock = threading.Lock()
-    raw_io_observed = 0
-    raw_io_limit = budget.get("max_output_bytes")
-    raw_io_limit_exceeded = threading.Event()
 
     def terminate_child_once() -> None:
         with termination_lock:
@@ -4797,7 +5355,6 @@ def stream_worker(run_id: str) -> dict[str, Any]:
     def drain_output(
         stream: Any, destination: queue.Queue[bytes | None], source: str
     ) -> None:
-        nonlocal raw_io_observed
         try:
             pending = b""
             read_chunk = getattr(stream, "read1", stream.read)
@@ -4810,24 +5367,14 @@ def stream_worker(run_id: str) -> dict[str, Any]:
                     if isinstance(chunk, bytes)
                     else str(chunk).encode("utf-8", errors="replace")
                 )
-                with raw_io_lock:
-                    raw_io_observed += len(chunk)
-                    over_limit = bool(
-                        raw_io_limit
-                        and raw_io_observed > int(raw_io_limit)
-                    )
-                while b"\n" in pending:
-                    raw_line, pending = pending.split(b"\n", 1)
-                    destination.put(raw_line + b"\n")
-                if over_limit:
-                    if pending:
-                        destination.put(pending)
-                        pending = b""
-                    raw_io_limit_exceeded.set()
-                    io_cancel.set()
-                    break
-                if io_cancel.is_set():
-                    break
+                if b"\n" in pending:
+                    complete_lines = pending.split(b"\n")
+                    pending = complete_lines.pop()
+                    for raw_line in complete_lines:
+                        destination.put(raw_line + b"\n")
+                while len(pending) >= 64 * 1024:
+                    destination.put(pending[: 64 * 1024])
+                    pending = pending[64 * 1024 :]
             if pending:
                 destination.put(pending)
         except (OSError, ValueError) as exc:
@@ -4883,9 +5430,22 @@ def stream_worker(run_id: str) -> dict[str, Any]:
     def cleanup_initial_io() -> None:
         io_cancel.set()
         terminate_child_once()
-        stdin_thread.join(timeout=5)
-        for thread in drain_threads:
-            thread.join(timeout=5)
+        stdin_thread.join()
+        while any(thread.is_alive() for thread in drain_threads):
+            for pending_queue in (stdout_queue, stderr_queue):
+                while True:
+                    try:
+                        pending_queue.get_nowait()
+                    except queue.Empty:
+                        break
+            for thread in drain_threads:
+                thread.join(timeout=0.01)
+        for pending_queue in (stdout_queue, stderr_queue):
+            while True:
+                try:
+                    pending_queue.get_nowait()
+                except queue.Empty:
+                    break
 
     try:
         try:
@@ -4916,6 +5476,7 @@ def stream_worker(run_id: str) -> dict[str, Any]:
             return _record_blocked_launch(
                 run_dir,
                 metadata,
+                sensitive_values=sensitive_values,
                 status=status,
                 error=error,
                 child_pid=proc.pid,
@@ -4932,6 +5493,7 @@ def stream_worker(run_id: str) -> dict[str, Any]:
             return _record_blocked_launch(
                 run_dir,
                 metadata,
+                sensitive_values=sensitive_values,
                 status=(
                     "blocked_process_identity"
                     if error.code == "process_identity_unverified"
@@ -4945,6 +5507,7 @@ def stream_worker(run_id: str) -> dict[str, Any]:
         return _record_blocked_launch(
             run_dir,
             metadata,
+            sensitive_values=sensitive_values,
             status="blocked_runtime_launch",
             error=_launch_failure_error(
                 "artifact_write_failed", "Child process metadata could not be persisted."
@@ -5066,12 +5629,30 @@ def stream_worker(run_id: str) -> dict[str, Any]:
                     raw_line = source_queue.get()
                     if raw_line is None:
                         break
+                    raw_bytes = (
+                        len(raw_line)
+                        if isinstance(raw_line, bytes)
+                        else len(str(raw_line).encode("utf-8", errors="replace"))
+                    )
+                    with budget_lock:
+                        budget["observed_output_bytes"] = int(
+                            budget.get("observed_output_bytes") or 0
+                        ) + raw_bytes
+                        discard_transport = budget.get("state") in {
+                            "truncated",
+                            "stopped",
+                        }
+                        if discard_transport:
+                            budget["dropped_output_bytes"] = int(
+                                budget.get("dropped_output_bytes") or 0
+                            ) + raw_bytes
+                    if discard_transport:
+                        continue
                     line = (
                         raw_line.decode("utf-8", errors="replace")
                         if isinstance(raw_line, bytes)
                         else str(raw_line)
                     )
-                    raw_bytes = len(raw_line) if isinstance(raw_line, bytes) else len(line.encode("utf-8", errors="replace"))
                     safe_line = _scrub_exact_text(line, sensitive_values)
                     raw_payload: Any | None = None
                     if source == "stdout":
@@ -5095,7 +5676,6 @@ def stream_worker(run_id: str) -> dict[str, Any]:
                     event = {"type": parsed_event_type, "source": source, "payload": parsed_payload}
                     if budget.get("final_only") and not event_is_final_or_control(event):
                         with budget_lock:
-                            budget["observed_output_bytes"] = int(budget.get("observed_output_bytes") or 0) + raw_bytes
                             budget["dropped_output_bytes"] = int(budget.get("dropped_output_bytes") or 0) + raw_bytes
                         continue
                     if budget.get("final_only") and isinstance(parsed_payload, dict) and parsed_payload.get("type") == "result" and parsed_payload.get("result") is not None:
@@ -5105,7 +5685,6 @@ def stream_worker(run_id: str) -> dict[str, Any]:
                     safe_line_bytes = len(safe_line.encode("utf-8", errors="replace"))
                     write_line = True
                     with budget_lock:
-                        budget["observed_output_bytes"] = int(budget.get("observed_output_bytes") or 0) + raw_bytes
                         projected_written = int(budget.get("written_output_bytes") or 0) + safe_line_bytes
                         soft = budget.get("soft_output_bytes")
                         if soft and projected_written > int(soft) and budget.get("state") == "within_budget":
@@ -5131,8 +5710,6 @@ def stream_worker(run_id: str) -> dict[str, Any]:
                     if phase:
                         event["phase"] = phase
                     safe_append(event)
-                    if budget_stop.is_set():
-                        break
         except Exception as exc:
             io_cancel.set()
             io_errors.put((source, exc))
@@ -5147,13 +5724,9 @@ def stream_worker(run_id: str) -> dict[str, Any]:
     timed_out = False
     stopped = False
     io_failed = False
-    raw_limit_reported = False
     exit_code: int | None = None
     try:
         while True:
-            if raw_io_limit_exceeded.is_set() and not raw_limit_reported:
-                raw_limit_reported = True
-                trigger_budget("output_budget_exceeded", "runtime_io")
             try:
                 io_source, io_error = io_errors.get_nowait()
             except queue.Empty:
@@ -5199,17 +5772,27 @@ def stream_worker(run_id: str) -> dict[str, Any]:
         if proc.poll() is None:
             io_cancel.set()
             terminate_child_once()
-        stdin_thread.join(timeout=5)
-        for thread in drain_threads:
-            thread.join(timeout=5)
-        for thread in threads:
-            thread.join(timeout=5)
         for stream in (proc.stdin, proc.stdout, proc.stderr):
             if stream is not None:
                 try:
                     stream.close()
                 except OSError:
                     pass
+        stdin_thread.join()
+        io_pairs = tuple(zip(drain_threads, threads, (stdout_queue, stderr_queue)))
+        while any(
+            drain.is_alive() or pump_thread.is_alive()
+            for drain, pump_thread, _pending in io_pairs
+        ):
+            for drain, pump_thread, pending_queue in io_pairs:
+                if not pump_thread.is_alive():
+                    while True:
+                        try:
+                            pending_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                drain.join(timeout=0.01)
+                pump_thread.join(timeout=0.01)
 
     while True:
         try:
@@ -5245,9 +5828,9 @@ def stream_worker(run_id: str) -> dict[str, Any]:
         if stopped and not budget.get("stop_reason"):
             budget["stop_reason"] = "user_requested"
         persist_budget_unlocked(str(budget.get("stop_reason") or "") or None)
-    git_after = capture_git_snapshot(run_dir, cwd, "after")
-    _scrub_run_artifacts(run_dir, sensitive_values)
-    _secure_run_artifacts(run_dir)
+    git_after = _scrub_guarded_value(
+        capture_git_snapshot(run_dir, cwd, "after"), sensitive_values
+    )
     final_metadata = update_metadata(
         run_dir,
         duration_ms=duration_ms,
@@ -5276,7 +5859,9 @@ def stream_worker(run_id: str) -> dict[str, Any]:
         finished_at=utc_now_iso(),
         exit_code=final_exit,
     )
-    return _scrub_guarded_value(final_metadata, sensitive_values)
+    _scrub_run_artifacts(run_dir, sensitive_values)
+    _secure_run_artifacts(run_dir)
+    return _scrub_guarded_value(read_metadata(run_dir), sensitive_values)
 
 
 def single_run_status(run_id: str, include_output_tail: bool = True, tail_chars: int = 4000) -> dict[str, Any]:
@@ -6042,7 +6627,9 @@ def diff_summary(cwd: Path | None = None, limit_chars: int = 200000) -> dict[str
 
 
 def classify_secret_line(line: str, source: str, lineno: int) -> dict[str, Any] | None:
-    has_secret_value = bool(SECRET_VALUE_RE.search(line) or SECRET_ASSIGN_RE.search(line))
+    has_secret_value = bool(
+        _contains_secret_value(line) or SECRET_ASSIGN_RE.search(line)
+    )
     has_secret_name = bool(SECRET_NAME_RE.search(line))
     lower_source = source.lower()
     placeholder = bool(PLACEHOLDER_SECRET_RE.search(line) or any(token in lower_source for token in (".env.example", "example", "fixture", "mock")))
