@@ -1,6 +1,6 @@
 # Guarded Runtime Launch Design
 
-Status: Approved for implementation planning
+Status: Approved; amended after requirements, architecture, security, and test cross-review
 Date: 2026-07-18
 Target branch: `security/guarded-runtime-launch`
 
@@ -37,6 +37,7 @@ The fork will remain compatibility-first. Existing CLI and MCP names, artifact p
 - Security decisions happen before a worker or child process starts.
 - Provider data never selects the executable.
 - Secret-bearing launch state stays in memory or the child environment and is never written to artifacts.
+- Prompt text is sent through anonymous stdin pipes, not command arguments, environment variables, or `prompt.txt` artifacts.
 - Persisted metadata contains only a safe projection and cryptographic or operating-system identity evidence.
 - A force flag may change termination strength, but it may not bypass identity verification.
 - Old run metadata remains readable but cannot authorize a destructive process operation.
@@ -61,7 +62,11 @@ The absolute-deny class includes exact names and platform-aware prefixes for:
 - `LD_PRELOAD`, `LD_LIBRARY_PATH`, and `DYLD_*`;
 - `CC_ORCHESTRATOR_*`.
 
+The absolute-deny class also covers shell startup/module hooks, PowerShell/.NET startup hooks, Java/Ruby/Perl runtime options, Git configuration/SSH command injection, and TLS key logging. Validation rejects case-folded duplicate names, NUL bytes, oversized values, and oversized environment blocks. Unknown keys remain denied unless the local policy names them, and an absolute-deny key can never be locally allowlisted.
+
 Provider data cannot override absolute-deny keys, even through the unsafe-runtime authorization path. A custom runtime executable is configured through the local runtime policy instead of provider environment data.
+
+Trusted-default discovery ignores ambient `CLAUDE_CODE_BIN` and accepts only canonical candidates in recognized Claude Code installation layouts already supported by the project. An arbitrary PATH hit is classified as unpinned and requires double authorization. Identity failure never falls through to another candidate.
 
 The user-owned policy file is `scripts/cc-orchestrator/config/runtime_security.override.json`. It is added to `local_user_owned_files` so upgrades and synchronization preserve it. The repository ships only an example file.
 
@@ -72,7 +77,15 @@ An executable outside the automatically trusted default Claude Code path require
 - a matching local policy entry containing the canonical executable path and expected file identity; and
 - an explicit `allow_unsafe_runtime` value on the individual CLI or MCP request.
 
-Either approval alone is insufficient. Successful use of this path sets the run trust level to `local_unsafe`, emits a high-severity security event, and leaves acceptance pending controller review.
+Either approval alone is insufficient. These are two confirmation channels within the same local-user trust boundary, not independent security principals. Successful use of this path sets the run trust level to `local_unsafe`, emits a high-severity security event, and leaves acceptance pending controller review.
+
+Deferred queue approval is represented by a single-use grant bound to job id, executable identity, policy decision, and expiry. It is consumed atomically at launch and cannot authorize an automatic retry. Follow-ups require a new request approval. Team approval is scoped to the prepared members of that one parent request.
+
+### Secure Deferred Payloads
+
+Immediate task/context text is never persisted by the orchestrator. Team, workflow, run, follow-up, report, and dashboard artifacts retain only safe lengths, route metadata, and status evidence.
+
+Queue execution requires deferred payload storage. Queue task/context bytes are placed in an OS-protected current-user store: Windows DPAPI, native macOS Keychain, or Linux Secret Service. Queue metadata contains only an opaque reference. Secrets are supplied to native stores through memory/stdin, never command arguments. When no protected backend is available, queue submission fails closed with `secure_payload_store_unavailable`; there is no plaintext fallback. Legacy plaintext queue records are blocked until an explicit transactional migration verifies protected retrieval and then scrubs the old fields.
 
 ### RuntimeLaunchSpec
 
@@ -92,7 +105,11 @@ Immutability is deep: arguments and environment entries are stored as immutable 
 
 The controller writes only `RuntimeLaunchSpec.public_metadata()` to `metadata.json`. The safe projection includes environment key names but no environment values, prompt, API key, authorization header, or complete secret-bearing argument list.
 
+A frozen `PreparedWorkerLaunch` combines the launch spec with raw prompt bytes and safe route metadata only in memory. Preparation performs all policy and executable checks without creating artifacts; starting a prepared launch is the only operation that creates a run directory. Follow-up prepares the replacement before stopping the old run, and team launches prepare all members before starting the first worker.
+
 The streaming worker receives the canonical executable path and expected identity from metadata, receives validated secret values through its inherited environment, revalidates the executable immediately before `Popen`, and launches the absolute path. It does not call `claude_bin_path()` again.
+
+The controller starts internal workers with an absolute Python path and isolated mode and associates the request with a controller-owned launch nonce. One anonymous stdin protocol carries a bounded, length-prefixed private launch frame followed by bounded prompt bytes. The private frame contains the exact approved wrapper/interpreter command chain and non-secret arguments; public metadata stores only argument kinds and the frame digest. The worker verifies protocol version, nonce, one-time consumption, frame digest, and executable identities before launch. Metadata stores prompt length/token estimates when needed, never plaintext prompt or an unkeyed prompt digest. Controller/worker metadata updates use a cross-process lock and atomic replacement.
 
 ### ExecutableIdentity
 
@@ -103,6 +120,8 @@ The streaming worker receives the canonical executable path and expected identit
 - file size and nanosecond modification time;
 - SHA-256 digest of the launch target;
 - whether the target is a native executable or a script wrapper.
+
+For wrappers, identity covers both the wrapper and the absolute interpreter actually launched. Windows batch and PowerShell wrappers use verified absolute hosts; POSIX `/usr/bin/env name` shebangs are resolved once to an absolute verified interpreter. Live process identity expects that interpreter image rather than incorrectly comparing it to the wrapper path.
 
 The identity is checked when the launch spec is built, immediately before child launch, and immediately after child start. A mismatch stops the new child if ownership is proven, marks the run `blocked_runtime_identity`, and emits `runtime_identity_changed`.
 
@@ -126,7 +145,7 @@ Platform implementations use:
 - Linux `/proc/<pid>/stat`, `/proc/<pid>/exe`, and process group data;
 - macOS `ps` or native process APIs for start time, executable path, parent, and process group.
 
-If a platform cannot collect the minimum identity tuple of PID, creation time, and executable path, the process may run but destructive stop operations are unavailable for that process. This unsupported state is explicit in metadata and reports.
+If a platform cannot collect the minimum identity tuple of PID, creation time, and executable path, background, visible, queued, team, workflow, and `local_unsafe` launches fail closed. A trusted foreground one-shot launch may proceed because the controller retains the non-reusable `Popen` handle and performs timeout cleanup through that handle. Unsupported states remain explicit in healthcheck and reports.
 
 ## Launch Flow
 
@@ -136,15 +155,15 @@ If a platform cannot collect the minimum identity tuple of PID, creation time, a
 4. Resolve the default or locally configured runtime executable to a canonical absolute path.
 5. Evaluate trusted-path or double-authorization requirements.
 6. Capture `ExecutableIdentity` and build immutable `RuntimeLaunchSpec`.
-7. Create the run directory and write only public launch metadata.
-8. Start the internal stream worker with the validated environment.
-9. Revalidate the runtime identity in the stream worker.
-10. Launch the child by absolute path and capture both process identities.
-11. Use the recorded identities for status, poll, timeout, output-budget termination, and explicit stop.
+7. Create the run directory with current-user-only permissions and write only public launch metadata.
+8. Start the internal stream or visible worker with the validated environment and a prompt stdin pipe.
+9. Revalidate nonce and runtime identity in the worker.
+10. Launch the child by absolute path, send the prompt through stdin, and capture both process identities.
+11. Use owned handles where available and recorded identities for status, poll, timeout, output-budget termination, and explicit stop.
 
 One-shot, streaming, visible-window, follow-up, queue, team, and workflow launches all use the same policy and launch-spec builder. No public launch path may bypass it.
 
-Visible-window launcher scripts contain no provider environment values. The visible helper inherits the already validated environment and receives only safe run identifiers and canonical paths in persisted launcher artifacts.
+The Windows visible helper is the absolute isolated Python worker itself, started with `CREATE_NEW_CONSOLE`. It consumes the controller prompt pipe, reopens the console input for takeover, launches the approved runtime, and records helper/runtime identities. No PowerShell launcher is persisted. Unsupported visible-console platforms return a structured error after security preflight and never fall back to shell or PATH lookup.
 
 ## Stop Flow
 
@@ -155,6 +174,8 @@ Visible-window launcher scripts contain no provider environment values. The visi
 - PID exists but identity differs: return `identity_mismatch`, emit a critical security event, and do not signal it.
 - Identity evidence is missing or unsupported: return `identity_unverified` and do not signal it.
 - `force=true`: use stronger termination only after an exact identity match.
+
+Normal background termination is worker-owned. After controller verification, a nonce-bound cooperative request tells the live worker to stop its child through the worker's `Popen` handle, Windows Job Object, or still-owned POSIX process group. Controller emergency termination is allowed only through a Windows process handle verified from that same handle or a Linux pidfd opened before identity comparison. Controller-side `taskkill`, raw PID signals, and process-group signals are prohibited; platforms without a non-reusable capability fail closed. A stop request artifact or cancelled aggregate status is written only after verification, and unverified/incomplete child stops keep the parent operation blocked.
 
 Legacy runs without `ProcessIdentity` remain readable and reportable. They cannot authorize `stop_run` or rollback behavior that sends process signals.
 
@@ -170,6 +191,8 @@ Security failures return structured error data with a stable code, message, safe
 - `runtime_identity_changed`
 - `process_identity_mismatch`
 - `process_identity_unverified`
+- `secure_payload_store_unavailable`
+- `visible_runtime_unsupported`
 
 Errors identify variable names or paths when safe, never their values. CLI and MCP surfaces preserve their current response envelopes and include the structured security error inside them.
 
@@ -181,12 +204,12 @@ Append-only, secret-free events are written to `<artifact_root>/logs/security-ev
 - severity;
 - run id when one exists;
 - runtime id and trust level;
-- hashed provider id;
+- HMAC-pseudonymized provider id;
 - rejected environment key names or identity mismatch fields;
 - policy decision id;
 - recommended controller action.
 
-Event serialization passes through existing redaction and a dedicated assertion that rejects values matching known secret patterns. File permissions are restricted to the current user where the platform supports it.
+Event serialization uses an explicit field allowlist, exact known-secret rejection plus pattern checks, a per-event size cap, symlink/reparse refusal, cross-process locking, and a local hash chain. The HMAC key is user-owned and preserved during upgrades. Security rejection never becomes allowed because audit writing failed; `local_unsafe` fails closed on audit failure, while trusted-default launches may continue with an explicit degraded audit status. This log is tamper-evident only within the current-user boundary, not an external trusted audit sink.
 
 ## Integration Points
 
@@ -195,12 +218,12 @@ The implementation changes are intentionally centered in the current Python runt
 - `build_worker_env` becomes policy-driven and rejects provider control keys.
 - `run_agent`, `run_streaming_agent`, and `run_visible_agent` build a launch spec.
 - `stream_worker` consumes the absolute executable and expected identity.
-- follow-up, queue, team, and workflow paths pass through the same launch APIs.
+- follow-up, benchmark, queue, team, and future real workflow paths pass through the same launch APIs; current mock workflow launches no process.
 - `single_run_status` reports identity state instead of PID liveness alone.
 - `terminate_process_tree` requires an expected identity.
 - `stop_run` refuses unverified or mismatched processes.
 - CLI and MCP launch inputs gain `allow_unsafe_runtime`, defaulting to false.
-- healthcheck reports runtime path, trust level, and process-identity support without exposing secrets.
+- healthcheck reports runtime path, trust level, audit health, and process-identity support without exposing secrets; it executes `--version` only for a trusted default runtime.
 
 New code may be placed in a focused `runtime_security.py` module to avoid further growth of `cc_orchestrator.py`. The orchestration module remains the integration layer; policy parsing and platform identity collection remain independently testable.
 
@@ -266,6 +289,9 @@ The fork continues to track the upstream repository as a read-only remote. Upstr
 - No identity mismatch or unverified identity test sends a termination signal.
 - Force stop cannot bypass identity verification.
 - Metadata and security events contain no provider secret values or prompt contents.
+- Immediate prompts do not appear in process arguments or run artifacts; controller/worker metadata remains valid under concurrent updates.
+- Task/context text does not appear in team, workflow, follow-up, report, dashboard, or queue metadata; deferred queue bytes use an OS-protected store or fail closed.
+- Unsafe queue grants are single-use, identity-bound, expiring, and unavailable to automatic retries.
 - Safe existing profiles and all existing selftest behavior remain compatible.
 - Windows, Ubuntu, and macOS CI pass on Python 3.10 and 3.12.
 
