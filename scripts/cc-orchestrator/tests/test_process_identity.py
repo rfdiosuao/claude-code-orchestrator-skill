@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import os
+import struct
 import subprocess
 import sys
 import unittest
@@ -23,6 +24,15 @@ from process_identity import (
     compare_process_identity,
     process_identity_support,
 )
+
+
+def _patch_ctypes_last_error(value: int) -> object:
+    return patch.object(
+        ctypes,
+        "get_last_error",
+        return_value=value,
+        create=True,
+    )
 
 
 def supported_identity(**changes: object) -> ProcessIdentity:
@@ -530,9 +540,7 @@ class WindowsNativeApiBoundaryTests(unittest.TestCase):
 
         close.reset_mock()
         api._kernel32.Process32FirstW = Mock(return_value=0)
-        with patch.object(ctypes, "get_last_error", return_value=5), self.assertRaises(
-            PermissionError
-        ):
+        with _patch_ctypes_last_error(5), self.assertRaises(PermissionError):
             api.parent_pid(42)
         close.assert_called_once_with(77)
 
@@ -546,11 +554,22 @@ class WindowsNativeApiBoundaryTests(unittest.TestCase):
             api.assert_running(91)
 
         wait.return_value = process_identity._WindowsApi.WAIT_FAILED
-        with patch.object(ctypes, "get_last_error", return_value=31), self.assertRaises(
-            OSError
-        ):
+        with _patch_ctypes_last_error(31), self.assertRaises(OSError):
             api.assert_running(91)
         self.assertEqual(wait.call_args_list, [call(91, 0), call(91, 0), call(91, 0)])
+
+    def test_last_error_patch_works_when_ctypes_attribute_is_absent(self) -> None:
+        original = getattr(ctypes, "get_last_error", None)
+        had_attribute = hasattr(ctypes, "get_last_error")
+        if had_attribute:
+            delattr(ctypes, "get_last_error")
+        try:
+            with _patch_ctypes_last_error(31):
+                self.assertEqual(ctypes.get_last_error(), 31)
+            self.assertFalse(hasattr(ctypes, "get_last_error"))
+        finally:
+            if had_attribute:
+                ctypes.get_last_error = original
 
 
 class FakeMacApi:
@@ -656,6 +675,12 @@ class MacNativeApiBoundaryTests(unittest.TestCase):
         return api
 
     def test_libproc_populates_path_and_complete_bsd_info(self) -> None:
+        self.assertEqual(ctypes.sizeof(process_identity._PROC_BSDINFO), 136)
+        self.assertEqual(process_identity._PROC_BSDINFO.pbi_pid.offset, 12)
+        self.assertEqual(process_identity._PROC_BSDINFO.pbi_ppid.offset, 16)
+        self.assertEqual(process_identity._PROC_BSDINFO.pbi_pgid.offset, 100)
+        self.assertEqual(process_identity._PROC_BSDINFO.pbi_start_tvsec.offset, 120)
+        self.assertEqual(process_identity._PROC_BSDINFO.pbi_start_tvusec.offset, 128)
         path_bytes = b"/usr/bin/python3"
 
         def proc_pidpath(_pid: int, buffer: object, _size: int) -> int:
@@ -669,15 +694,16 @@ class MacNativeApiBoundaryTests(unittest.TestCase):
             info_pointer: object,
             size: int,
         ) -> int:
-            info = ctypes.cast(
-                info_pointer, ctypes.POINTER(process_identity._PROC_BSDINFO)
-            ).contents
-            info.pbi_pid = 42
-            info.pbi_ppid = 41
-            info.pbi_pgid = 40
-            info.pbi_start_tvsec = 1_725_000_001
-            info.pbi_start_tvusec = 234_567
-            return size
+            self.assertEqual(size, 136)
+            address = ctypes.cast(info_pointer, ctypes.c_void_p).value
+            self.assertIsNotNone(address)
+            raw = (ctypes.c_ubyte * 136).from_address(address)
+            struct.pack_into("<I", raw, 12, 42)
+            struct.pack_into("<I", raw, 16, 41)
+            struct.pack_into("<I", raw, 100, 40)
+            struct.pack_into("<Q", raw, 120, 1_725_000_001)
+            struct.pack_into("<Q", raw, 128, 234_567)
+            return 136
 
         api = self.api_with_libproc(
             proc_pidpath=Mock(side_effect=proc_pidpath),
