@@ -1,0 +1,44 @@
+name: Runtime checks
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - scripts/cc-orchestrator/**
+      - examples/workflows/**
+      - .github/workflows/runtime-checks.yml
+  pull_request:
+    paths:
+      - scripts/cc-orchestrator/**
+      - examples/workflows/**
+      - .github/workflows/runtime-checks.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Setup Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Compile Python entrypoints
+        run: python -m py_compile scripts/cc-orchestrator/cc_orchestrator.py scripts/cc-orchestrator/server.py
+
+      - name: Run orchestrator selftest
+        run: python scripts/cc-orchestrator/cc_orchestrator.py selftest

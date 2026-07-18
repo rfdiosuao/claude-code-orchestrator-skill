@@ -1255,7 +1255,7 @@ async def cc_pressure_report(params: ControllerReportInput) -> str:
         return _error(exc)
 
 
-@mcp.tool(name="cc_decision_review", annotations={"title": "Review Codex Controller Decision", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False})
+@mcp.tool(name="cc_decision_review", annotations={"title": "Review Controller Decision", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False})
 async def cc_decision_review(params: DecisionReviewInput) -> str:
     """Create a supervisor-style decision packet and return approve/revise/block guidance."""
     try:

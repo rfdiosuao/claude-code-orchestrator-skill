@@ -6406,7 +6406,7 @@ def workflow_write_report(workflow_id: str, cwd: Path | None = None) -> dict[str
                 f"- Requires rerun: `{bool(status.get('requires_rerun'))}`",
                 f"- Invalidated nodes: `{', '.join(status.get('invalidated_nodes') or [])}`",
                 "",
-                "> This workflow has been manually invalidated. Pending nodes must run again before Codex accepts it.",
+                "> This workflow has been manually invalidated. Pending nodes must run again before the controller accepts it.",
             ]
         )
     lines.extend(["", "## Nodes"])
@@ -6426,6 +6426,43 @@ def workflow_write_report(workflow_id: str, cwd: Path | None = None) -> dict[str
         lines.append(f"- `{decision.get('ts')}` `{decision.get('node_id')}` -> `{decision.get('decision')}`: {decision.get('reason')}")
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     return {"ok": True, "workflow_id": workflow_id, "status": status.get("status"), "report_path": str(path)}
+
+
+def workflow_decision(
+    node_id: str | None,
+    decision: str,
+    reason: str,
+    *,
+    requires_controller_takeover: bool | None = None,
+    requires_codex_takeover: bool | None = None,
+    **details: Any,
+) -> dict[str, Any]:
+    """Build the agent-neutral workflow decision contract with its legacy alias."""
+    if requires_controller_takeover is not None and type(requires_controller_takeover) is not bool:
+        raise OrchestratorError("requires_controller_takeover must be a boolean.")
+    if requires_codex_takeover is not None and type(requires_codex_takeover) is not bool:
+        raise OrchestratorError("requires_codex_takeover must be a boolean.")
+    if (
+        requires_controller_takeover is not None
+        and requires_codex_takeover is not None
+        and requires_codex_takeover != requires_controller_takeover
+    ):
+        raise OrchestratorError("Conflicting controller takeover aliases.")
+    takeover = (
+        requires_controller_takeover
+        if requires_controller_takeover is not None
+        else requires_codex_takeover if requires_codex_takeover is not None else False
+    )
+    payload = {
+        "ts": utc_now_iso(),
+        "node_id": node_id,
+        "decision": decision,
+        "reason": reason,
+        **details,
+    }
+    payload["requires_controller_takeover"] = takeover
+    payload["requires_codex_takeover"] = takeover
+    return payload
 
 
 def workflow_run(file: str | Path, task: str, cwd: Path | None = None, mock: bool = False, loop_guard: int = 50) -> dict[str, Any]:
@@ -6494,14 +6531,13 @@ def workflow_run(file: str | Path, task: str, cwd: Path | None = None, mock: boo
                 if failed_deps:
                     node_state["state"] = "blocked"
                     status["decisions"].append(
-                        {
-                            "ts": utc_now_iso(),
-                            "node_id": node_id,
-                            "decision": "block",
-                            "reason": "dependency failed or blocked",
-                            "failed_dependencies": failed_deps,
-                            "requires_codex_takeover": True,
-                        }
+                        workflow_decision(
+                            node_id,
+                            "block",
+                            "dependency failed or blocked",
+                            failed_dependencies=failed_deps,
+                            requires_controller_takeover=True,
+                        )
                     )
                     progress = True
                     continue
@@ -6514,7 +6550,7 @@ def workflow_run(file: str | Path, task: str, cwd: Path | None = None, mock: boo
                 node_state["gate"] = gate
                 if gate.get("ok"):
                     node_state["state"] = "done"
-                    decision = {"ts": utc_now_iso(), "node_id": node_id, "decision": "advance", "reason": "gate passed", "next_nodes": []}
+                    decision = workflow_decision(node_id, "advance", "gate passed", next_nodes=[])
                     status["decisions"].append(decision)
                     progress = True
                     continue
@@ -6526,12 +6562,25 @@ def workflow_run(file: str | Path, task: str, cwd: Path | None = None, mock: boo
                     invalidated = {retry_target, *workflow_descendants(nodes, retry_target)}
                     for item in invalidated:
                         invalidate_workflow_node_evidence(status["nodes"][item], reason="gate retry")
-                    decision = {"ts": utc_now_iso(), "node_id": node_id, "decision": "retry", "reason": "gate failed", "next_nodes": [retry_target], "retry_count": node_state["retry_count"], "requires_codex_takeover": False}
+                    decision = workflow_decision(
+                        node_id,
+                        "retry",
+                        "gate failed",
+                        next_nodes=[retry_target],
+                        retry_count=node_state["retry_count"],
+                    )
                     status["decisions"].append(decision)
                     progress = True
                     break
                 node_state["state"] = "blocked"
-                decision = {"ts": utc_now_iso(), "node_id": node_id, "decision": "block", "reason": "gate failed and retries exhausted", "next_nodes": [], "retry_count": node_state.get("retry_count", 0), "requires_codex_takeover": True}
+                decision = workflow_decision(
+                    node_id,
+                    "block",
+                    "gate failed and retries exhausted",
+                    next_nodes=[],
+                    retry_count=node_state.get("retry_count", 0),
+                    requires_controller_takeover=True,
+                )
                 status["decisions"].append(decision)
                 progress = True
                 continue
@@ -6548,7 +6597,7 @@ def workflow_run(file: str | Path, task: str, cwd: Path | None = None, mock: boo
                     max_events_bytes=int((spec.get("defaults") or {}).get("max_events_bytes") or OUTPUT_BUDGET_DEFAULTS["max_events_bytes"]),
                 )
                 node_state.update({"state": "running", "run_id": run["run_id"]})
-                status["decisions"].append({"ts": utc_now_iso(), "node_id": node_id, "decision": "advance", "reason": "worker launched", "next_nodes": []})
+                status["decisions"].append(workflow_decision(node_id, "advance", "worker launched", next_nodes=[]))
                 progress = True
                 continue
             attempt = int(node_state.get("attempts") or 0)
@@ -6564,13 +6613,21 @@ def workflow_run(file: str | Path, task: str, cwd: Path | None = None, mock: boo
             node_state["actual_cost_usd"] = 0.99
             if not result["validation"].get("ok"):
                 node_state["state"] = "blocked"
-                status["decisions"].append({"ts": utc_now_iso(), "node_id": node_id, "decision": "block", "reason": "handoff validation failed", "missing_fields": result["validation"].get("missing_fields"), "requires_codex_takeover": True})
+                status["decisions"].append(
+                    workflow_decision(
+                        node_id,
+                        "block",
+                        "handoff validation failed",
+                        missing_fields=result["validation"].get("missing_fields"),
+                        requires_controller_takeover=True,
+                    )
+                )
             elif result["handoff"].get("status") == "pass":
                 node_state["state"] = "done"
-                status["decisions"].append({"ts": utc_now_iso(), "node_id": node_id, "decision": "advance", "reason": "handoff valid", "next_nodes": []})
+                status["decisions"].append(workflow_decision(node_id, "advance", "handoff valid", next_nodes=[]))
             else:
                 node_state["state"] = "failed"
-                status["decisions"].append({"ts": utc_now_iso(), "node_id": node_id, "decision": "advance", "reason": "handoff status failed; gate may retry", "next_nodes": []})
+                status["decisions"].append(workflow_decision(node_id, "advance", "handoff status failed; gate may retry", next_nodes=[]))
             progress = True
         write_workflow_status(workflow_dir, status)
         if not progress:
@@ -6580,7 +6637,9 @@ def workflow_run(file: str | Path, task: str, cwd: Path | None = None, mock: boo
     if transitions >= loop_guard:
         status["status"] = "blocked"
         status["block_reason"] = "loop_guard_exceeded"
-        status["decisions"].append({"ts": utc_now_iso(), "node_id": None, "decision": "block", "reason": "loop_guard_exceeded", "requires_codex_takeover": True})
+        status["decisions"].append(
+            workflow_decision(None, "block", "loop_guard_exceeded", requires_controller_takeover=True)
+        )
     elif any(item.get("state") == "blocked" for item in status["nodes"].values()):
         status["status"] = "blocked"
     elif any(item.get("state") in {"running", "queued", "pending", "failed"} for item in status["nodes"].values()):
@@ -6614,15 +6673,14 @@ def workflow_retry_node(workflow_id: str, node_id: str, cwd: Path | None = None)
     status["invalidated_nodes"] = sorted(invalidated)
     status["invalidated_at"] = utc_now_iso()
     status.setdefault("decisions", []).append(
-        {
-            "ts": utc_now_iso(),
-            "node_id": node_id,
-            "decision": "retry",
-            "reason": "manual retry requested",
-            "next_nodes": [node_id],
-            "invalidated": sorted(invalidated),
-            "requires_codex_takeover": True,
-        }
+        workflow_decision(
+            node_id,
+            "retry",
+            "manual retry requested",
+            next_nodes=[node_id],
+            invalidated=sorted(invalidated),
+            requires_controller_takeover=True,
+        )
     )
     write_workflow_status(workflow_dir, status)
     return {"ok": True, "workflow_id": workflow_id, "node_id": node_id, "invalidated": sorted(invalidated), "status_path": str(workflow_dir / "status.json")}
@@ -6637,7 +6695,9 @@ def workflow_stop(workflow_id: str, force: bool = False, cwd: Path | None = None
             stopped.append({"node_id": node_id, "stop": stop_run(str(node["run_id"]), force=force)})
             node["state"] = "cancelled"
     status["status"] = "cancelled"
-    status.setdefault("decisions", []).append({"ts": utc_now_iso(), "node_id": None, "decision": "cancel", "reason": "workflow-stop requested", "requires_codex_takeover": True})
+    status.setdefault("decisions", []).append(
+        workflow_decision(None, "cancel", "workflow-stop requested", requires_controller_takeover=True)
+    )
     write_workflow_status(workflow_dir, status)
     return {"ok": True, "workflow_id": workflow_id, "stopped": stopped, "status": "cancelled"}
 
@@ -6887,6 +6947,23 @@ def selftest() -> dict[str, Any]:
     except OrchestratorError:
         run_id_rejected = True
     worker_env = build_worker_env({"ANTHROPIC_API_KEY": sample_api_key})
+    try:
+        workflow_decision(
+            None,
+            "block",
+            "selftest",
+            requires_controller_takeover=True,
+            requires_codex_takeover=False,
+        )
+        conflicting_takeover_alias_rejected = False
+    except OrchestratorError:
+        conflicting_takeover_alias_rejected = True
+    legacy_only_takeover_decision = workflow_decision(
+        None,
+        "block",
+        "selftest legacy alias",
+        requires_codex_takeover=True,
+    )
     secret_findings = secret_scan_text("OPENAI_API_KEY=sk-" + ("1" * 32), "selftest")
     placeholder_findings = secret_scan_text("OPENAI_API_KEY=" + "sk-" + "your-placeholder-token", ".env.example")
     false_findings = secret_scan_text("input_tokens = estimate_tokens_from_text(prompt)", "selftest")
@@ -7009,6 +7086,8 @@ nodes:
         manual_retry_nodes = manual_retry_status.get("nodes") or {}
         manual_retry_report_result = workflow_write_report(manual_retry_id, cwd=Path(tmp))
         manual_retry_report_text = Path(str(manual_retry_report_result.get("report_path"))).read_text(encoding="utf-8")
+        workflow_stop(manual_retry_id, cwd=Path(tmp))
+        stopped_workflow_status = read_workflow_status(manual_retry_id, cwd=Path(tmp))
         source_after = source_file.read_text(encoding="utf-8")
 
         cycle_spec = json.loads(json.dumps(valid_workflow))
@@ -7050,6 +7129,25 @@ nodes:
         max_retry_status = max_retry_run.get("status") or {}
         max_retry_nodes = max_retry_status.get("nodes") or {}
         max_retry_decisions = max_retry_status.get("decisions") or []
+        loop_guard_run = workflow_run(workflow_path, task="mock loop guard", cwd=Path(tmp), mock=True, loop_guard=1)
+        loop_guard_status = loop_guard_run.get("status") or {}
+        decision_sets = [
+            workflow_mock_status.get("decisions") or [],
+            missing_handoff_run.get("status", {}).get("decisions") or [],
+            max_retry_decisions,
+            manual_retry_status.get("decisions") or [],
+            stopped_workflow_status.get("decisions") or [],
+            loop_guard_status.get("decisions") or [],
+        ]
+        workflow_decisions = [decision for decisions in decision_sets for decision in decisions]
+        takeover_reasons = {
+            "dependency failed or blocked",
+            "gate failed and retries exhausted",
+            "handoff validation failed",
+            "loop_guard_exceeded",
+            "manual retry requested",
+            "workflow-stop requested",
+        }
     checks = {
         "utf8_env": env.get("PYTHONIOENCODING") == "utf-8" and env.get("PYTHONUTF8") == "1",
         "timeout_bytes_decode": decoded == "中文✅",
@@ -7112,6 +7210,29 @@ nodes:
         "missing_handoff_blocks_downstream": missing_handoff_run.get("status", {}).get("status") == "blocked" and missing_handoff_nodes.get("requirements", {}).get("state") == "blocked" and not missing_handoff_nodes.get("implementation", {}).get("run_id"),
         "workflow_status_has_gate_details": bool((workflow_mock_status.get("nodes") or {}).get("quality_gate", {}).get("gate")),
         "workflow_report_has_decision_trail": "## Decision Trail" in workflow_report_text and "`retry`" in workflow_report_text,
+        "workflow_decisions_use_neutral_takeover_contract": bool(workflow_decisions)
+        and all(
+            "requires_controller_takeover" in decision
+            and "requires_codex_takeover" in decision
+            and type(decision["requires_controller_takeover"]) is bool
+            and type(decision["requires_codex_takeover"]) is bool
+            and decision["requires_controller_takeover"] == decision["requires_codex_takeover"]
+            for decision in workflow_decisions
+        ),
+        "workflow_takeover_alias_cannot_diverge": conflicting_takeover_alias_rejected,
+        "workflow_legacy_takeover_alias_supported": legacy_only_takeover_decision["requires_controller_takeover"] is True
+        and legacy_only_takeover_decision["requires_codex_takeover"] is True,
+        "workflow_takeover_semantics": all(
+            decision["requires_controller_takeover"] is False
+            for decision in workflow_decisions
+            if decision.get("decision") == "advance" or (decision.get("decision") == "retry" and decision.get("reason") == "gate failed")
+        )
+        and takeover_reasons.issubset({str(decision.get("reason")) for decision in workflow_decisions})
+        and all(
+            decision["requires_controller_takeover"] is True
+            for decision in workflow_decisions
+            if decision.get("reason") in takeover_reasons
+        ),
         "workflow_controller_only_no_source_changes": source_before == source_after,
     }
     return {
@@ -7827,7 +7948,10 @@ def main() -> int:
                 )
             )
         elif args.command == "selftest":
-            print_json(selftest())
+            result = selftest()
+            print_json(result)
+            if not result.get("ok"):
+                return 1
         elif args.command == "last-run":
             print_json(last_run(args.run_id))
         elif args.command == "_stream-worker":
