@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import hashlib
 import html as html_lib
 import json
@@ -1980,12 +1981,148 @@ def _open_windows_managed_file(
 
 
 @contextlib.contextmanager
+def _open_windows_managed_directory(
+    path: Path, *, writable: bool = False, verify_private: bool = True
+) -> Any:
+    if os.name != "nt":
+        raise OrchestratorError("Windows managed-directory handles are unavailable.")
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = (
+            ("dwFileAttributes", wintypes.DWORD),
+            ("ftCreationTime", wintypes.FILETIME),
+            ("ftLastAccessTime", wintypes.FILETIME),
+            ("ftLastWriteTime", wintypes.FILETIME),
+            ("dwVolumeSerialNumber", wintypes.DWORD),
+            ("nFileSizeHigh", wintypes.DWORD),
+            ("nFileSizeLow", wintypes.DWORD),
+            ("nNumberOfLinks", wintypes.DWORD),
+            ("nFileIndexHigh", wintypes.DWORD),
+            ("nFileIndexLow", wintypes.DWORD),
+        )
+
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+    )
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    kernel32.GetFileInformationByHandle.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(ByHandleFileInformation),
+    )
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    desired_access = 0x80000000 | 0x00020000
+    if writable:
+        desired_access |= 0x00040000
+    native_handle = kernel32.CreateFileW(
+        str(path),
+        desired_access,
+        0x00000001 | 0x00000002 | 0x00000004,
+        None,
+        3,
+        0x02000000 | 0x00200000,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if native_handle in {None, invalid_handle}:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        information = ByHandleFileInformation()
+        if not kernel32.GetFileInformationByHandle(
+            native_handle, ctypes.byref(information)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        attributes = int(information.dwFileAttributes)
+        if attributes & _WINDOWS_REPARSE_POINT:
+            raise OrchestratorError(
+                f"Managed artifact links and reparse points are forbidden: {path.name}"
+            )
+        if not attributes & 0x10:
+            raise OrchestratorError(
+                f"Managed artifact is not a directory: {path.name}"
+            )
+        if writable:
+            _enforce_windows_private_acl_handle(native_handle, is_dir=True)
+        elif verify_private and not _inspect_windows_private_acl_handle(
+            native_handle, is_dir=True
+        )["exact"]:
+            raise OrchestratorError(
+                f"Private Windows ACL verification failed for {path.name}."
+            )
+        yield native_handle, {"attributes": attributes}
+    finally:
+        kernel32.CloseHandle(native_handle)
+
+
+def _open_posix_directory_fd(path: Path) -> int:
+    absolute = Path(os.path.abspath(path))
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    anchor = Path(absolute.anchor)
+    fd = os.open(str(anchor), flags)
+    try:
+        for part in absolute.parts[1:]:
+            next_fd = os.open(part, flags, dir_fd=fd)
+            details = os.fstat(next_fd)
+            if not stat.S_ISDIR(details.st_mode):
+                os.close(next_fd)
+                raise OrchestratorError(
+                    f"Managed artifact is not a directory: {part}"
+                )
+            os.close(fd)
+            fd = next_fd
+        return fd
+    except OSError as exc:
+        os.close(fd)
+        if exc.errno == errno.ELOOP:
+            raise OrchestratorError(
+                f"Managed artifact links are forbidden: {path.name}"
+            ) from exc
+        raise
+    except Exception:
+        os.close(fd)
+        raise
+
+
+@contextlib.contextmanager
+def _open_posix_managed_directory(
+    path: Path, *, writable: bool = False, verify_private: bool = True
+) -> Any:
+    fd: int | None = None
+    try:
+        fd = _open_posix_directory_fd(path)
+        if writable:
+            os.fchmod(fd, 0o700)
+        details = os.fstat(fd)
+        if not stat.S_ISDIR(details.st_mode):
+            raise OrchestratorError(
+                f"Managed artifact is not a directory: {path.name}"
+            )
+        if verify_private and stat.S_IMODE(details.st_mode) != 0o700:
+            raise OrchestratorError(
+                f"Private artifact mode is invalid: {path.name}"
+            )
+        yield fd, details
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+@contextlib.contextmanager
 def _open_posix_managed_file(
     path: Path, *, writable: bool = False, verify_private: bool = True
 ) -> Any:
-    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    directory_flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    directory_fd = os.open(path.parent, directory_flags)
+    directory_fd = _open_posix_directory_fd(path.parent)
     fd: int | None = None
     file_handle: Any | None = None
     try:
@@ -2001,13 +2138,16 @@ def _open_posix_managed_file(
             raise OrchestratorError(
                 f"Managed artifact exceeds its size limit: {path.name}"
             )
+        if writable:
+            os.fchmod(fd, 0o600)
+            details = os.fstat(fd)
         if verify_private and stat.S_IMODE(details.st_mode) != 0o600:
             raise OrchestratorError(f"Private artifact mode is invalid: {path.name}")
         file_handle = os.fdopen(fd, "r+b" if writable else "rb")
         fd = None
         yield file_handle, details
     except OSError as exc:
-        if getattr(exc, "errno", None) in {getattr(os, "ELOOP", 40), 40}:
+        if getattr(exc, "errno", None) == errno.ELOOP:
             raise OrchestratorError(
                 f"Managed artifact links are forbidden: {path.name}"
             ) from exc
@@ -2027,62 +2167,157 @@ def _open_managed_file(
     return opener(path, writable=writable, verify_private=verify_private)
 
 
+def _open_managed_directory(
+    path: Path, *, writable: bool = False, verify_private: bool = True
+) -> Any:
+    opener = (
+        _open_windows_managed_directory
+        if os.name == "nt"
+        else _open_posix_managed_directory
+    )
+    return opener(path, writable=writable, verify_private=verify_private)
+
+
 def _verify_private_path(path: Path, *, is_dir: bool = False) -> None:
     if not is_dir:
         with _open_managed_file(path, verify_private=True):
             return
-    details = _lstat_managed_path(path, is_dir=True)
-    if os.name == "nt":
-        if not _inspect_windows_private_acl(path, is_dir=is_dir)["exact"]:
-            raise OrchestratorError(
-                f"Private Windows ACL verification failed for {path.name}."
-            )
+    with _open_managed_directory(path, verify_private=True):
         return
-    expected_mode = 0o700 if is_dir else 0o600
-    if stat.S_IMODE(details.st_mode) != expected_mode:
-        raise OrchestratorError(f"Private artifact mode is invalid: {path.name}")
 
 
 def _set_private_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    _lstat_managed_path(path, is_dir=True)
-    os.chmod(path, 0o700)
-    if os.name == "nt":
-        _enforce_windows_private_acl(path, is_dir=True)
+    with _open_managed_directory(
+        path, writable=True, verify_private=False
+    ):
+        pass
     _verify_private_path(path, is_dir=True)
 
 
 def _set_private_file(path: Path) -> None:
+    with _open_managed_file(path, writable=True, verify_private=False):
+        return
+
+
+def _secure_private_writable_handle(handle: Any, path: Path) -> None:
     if os.name == "nt":
-        with _open_windows_managed_file(
-            path, writable=True, verify_private=False
-        ):
-            return
-    with _open_posix_managed_file(
-        path, writable=True, verify_private=False
-    ) as (handle, _details):
+        import msvcrt
+
+        native_handle = msvcrt.get_osfhandle(handle.fileno())
+        _enforce_windows_private_acl_handle(native_handle, is_dir=False)
+        if not _inspect_windows_private_acl_handle(
+            native_handle, is_dir=False
+        )["exact"]:
+            raise OrchestratorError(
+                f"Private Windows ACL verification failed for {path.name}."
+            )
+    else:
         os.fchmod(handle.fileno(), 0o600)
         if stat.S_IMODE(os.fstat(handle.fileno()).st_mode) != 0o600:
-            raise OrchestratorError(f"Private artifact mode is invalid: {path.name}")
+            raise OrchestratorError(
+                f"Private artifact mode is invalid: {path.name}"
+            )
+
+
+@contextlib.contextmanager
+def _create_windows_private_file(path: Path) -> Any:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+    )
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    native_handle = kernel32.CreateFileW(
+        str(path),
+        0x80000000 | 0x40000000 | 0x00020000 | 0x00040000,
+        0x00000001 | 0x00000002 | 0x00000004,
+        None,
+        1,
+        0x00200000,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if native_handle in {None, invalid_handle}:
+        raise ctypes.WinError(ctypes.get_last_error())
+    file_handle: Any | None = None
+    try:
+        _enforce_windows_private_acl_handle(native_handle, is_dir=False)
+        fd = msvcrt.open_osfhandle(int(native_handle), os.O_RDWR | os.O_BINARY)
+        native_handle = None
+        file_handle = os.fdopen(fd, "w+b")
+        yield file_handle
+    finally:
+        if file_handle is not None:
+            file_handle.close()
+        elif native_handle not in {None, invalid_handle}:
+            kernel32.CloseHandle(native_handle)
 
 
 def _iter_managed_artifacts(run_dir: Path) -> list[tuple[Path, bool]]:
-    _lstat_managed_path(run_dir, is_dir=True)
     entries: list[tuple[Path, bool]] = []
     count = 0
-    for root, directories, filenames in os.walk(run_dir, followlinks=False):
-        root_path = Path(root)
-        for name in directories:
-            path = root_path / name
-            _lstat_managed_path(path, is_dir=True)
-            entries.append((path, True))
-        for name in filenames:
-            path = root_path / name
-            _lstat_managed_path(path, is_dir=False)
-            count += 1
-            if count > MAX_MANAGED_ARTIFACT_FILES:
-                raise OrchestratorError("Managed artifact file-count limit exceeded.")
-            entries.append((path, False))
+
+    def visit(directory: Path) -> None:
+        nonlocal count
+        with _open_managed_directory(directory, verify_private=False) as (handle, _):
+            names = os.listdir(handle) if os.name != "nt" else os.listdir(directory)
+            for name in names:
+                path = directory / name
+                if os.name != "nt":
+                    details = os.stat(
+                        name, dir_fd=handle, follow_symlinks=False
+                    )
+                    attributes = int(
+                        getattr(details, "st_file_attributes", 0) or 0
+                    )
+                    if stat.S_ISLNK(details.st_mode) or attributes & _WINDOWS_REPARSE_POINT:
+                        raise OrchestratorError(
+                            f"Managed artifact links and reparse points are forbidden: {name}"
+                        )
+                    is_dir = stat.S_ISDIR(details.st_mode)
+                    is_file = stat.S_ISREG(details.st_mode)
+                else:
+                    details = path.lstat()
+                    attributes = int(
+                        getattr(details, "st_file_attributes", 0) or 0
+                    )
+                    if stat.S_ISLNK(details.st_mode) or attributes & _WINDOWS_REPARSE_POINT:
+                        raise OrchestratorError(
+                            f"Managed artifact links and reparse points are forbidden: {name}"
+                        )
+                    is_dir = stat.S_ISDIR(details.st_mode)
+                    is_file = stat.S_ISREG(details.st_mode)
+                if is_dir:
+                    with _open_managed_directory(path, verify_private=False):
+                        pass
+                    entries.append((path, True))
+                    visit(path)
+                elif is_file:
+                    count += 1
+                    if count > MAX_MANAGED_ARTIFACT_FILES:
+                        raise OrchestratorError(
+                            "Managed artifact file-count limit exceeded."
+                        )
+                    with _open_managed_file(path, verify_private=False):
+                        pass
+                    entries.append((path, False))
+                else:
+                    raise OrchestratorError(
+                        f"Managed artifact has an unsupported type: {name}"
+                    )
+
+    visit(run_dir)
     return entries
 
 
@@ -2129,15 +2364,21 @@ def _prepare_private_atomic_write(path: Path, payload: bytes) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            dir=str(path.parent),
-            delete=False,
-        ) as handle:
-            temporary_path = Path(handle.name)
-            _set_private_file(temporary_path)
+        if os.name == "nt":
+            temporary_path = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+            handle_context = _create_windows_private_file(temporary_path)
+        else:
+            handle_context = tempfile.NamedTemporaryFile(
+                mode="w+b",
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                dir=str(path.parent),
+                delete=False,
+            )
+        with handle_context as handle:
+            if temporary_path is None:
+                temporary_path = Path(handle.name)
+                _secure_private_writable_handle(handle, temporary_path)
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
@@ -2220,7 +2461,9 @@ def update_metadata(run_dir: Path, **updates: Any) -> dict[str, Any]:
         return metadata
 
 
-def run_git_command(cwd: Path, args: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
+def run_git_command(
+    cwd: Path, args: list[str], timeout: float = 30
+) -> subprocess.CompletedProcess:
     git_command = os.environ.get(INTERNAL_GIT_BIN_ENV) or "git"
     return subprocess.run(
         [git_command, *args],
@@ -2274,22 +2517,36 @@ def safe_relative(root: Path, path: Path) -> str | None:
         return None
 
 
-def file_sha256(path: Path, max_bytes: int = 20_000_000) -> dict[str, Any]:
+def file_sha256(
+    path: Path,
+    max_bytes: int | None = None,
+    *,
+    deadline: float | None = None,
+) -> dict[str, Any]:
     if not path.exists():
         return {"exists": False}
     if path.is_dir():
         return {"exists": True, "type": "directory"}
     size = path.stat().st_size
-    if size > max_bytes:
-        return {"exists": True, "skipped": "too_large", "bytes": size}
     digest = hashlib.sha256()
     with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("Git evidence hashing exceeded the launch deadline.")
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
             digest.update(chunk)
     return {"exists": True, "sha256": digest.hexdigest(), "bytes": size}
 
 
-def workspace_hashes(cwd: Path, paths: list[str], limit: int = 1000) -> dict[str, Any]:
+def workspace_hashes(
+    cwd: Path,
+    paths: list[str],
+    limit: int = 10_000,
+    *,
+    deadline: float | None = None,
+) -> dict[str, Any]:
     important = [
         "README.md",
         "README.zh-CN.md",
@@ -2307,15 +2564,19 @@ def workspace_hashes(cwd: Path, paths: list[str], limit: int = 1000) -> dict[str
         normalized = item.replace("\\", "/").strip("/")
         if normalized and normalized not in selected:
             selected.append(normalized)
-        if len(selected) >= limit:
-            break
+        if len(selected) > limit:
+            raise OrchestratorError(
+                "Git evidence path-count limit exceeded; launch cannot proceed safely."
+            )
     hashes: dict[str, Any] = {}
     for rel in selected:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("Git evidence capture exceeded the launch deadline.")
         candidate = (cwd / rel).resolve()
         if safe_relative(cwd, candidate) is None:
             continue
         try:
-            hashes[rel] = file_sha256(candidate)
+            hashes[rel] = file_sha256(candidate, deadline=deadline)
         except Exception as exc:
             hashes[rel] = {"error": str(exc)}
     return hashes
@@ -2615,19 +2876,15 @@ def _read_event_seq_sidecar(path: Path) -> tuple[int, int | None]:
     return (value, None) if value >= 0 else (0, None)
 
 
-def _last_complete_event(path: Path) -> tuple[int, int | None]:
+def _last_complete_event_handle(handle: Any) -> tuple[int, int | None]:
     """Return the last complete sequence and a partial-tail truncation offset."""
-    try:
-        with path.open("rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            if size == 0:
-                return 0, None
-            start = max(0, size - EVENT_RECOVERY_TAIL_BYTES)
-            handle.seek(start)
-            tail = handle.read()
-    except FileNotFoundError:
+    handle.seek(0, os.SEEK_END)
+    size = handle.tell()
+    if size == 0:
         return 0, None
+    start = max(0, size - EVENT_RECOVERY_TAIL_BYTES)
+    handle.seek(start)
+    tail = handle.read()
     if tail.endswith(b"\n"):
         complete_end = len(tail) - 1
         truncate_at = None
@@ -2655,45 +2912,57 @@ def _last_complete_event(path: Path) -> tuple[int, int | None]:
     return candidate, truncate_at
 
 
+def _last_complete_event(path: Path) -> tuple[int, int | None]:
+    try:
+        with _open_managed_file(path, verify_private=False) as (handle, _details):
+            return _last_complete_event_handle(handle)
+    except FileNotFoundError:
+        return 0, None
+
+
 def append_event(run_dir: Path, event: dict[str, Any]) -> None:
     with artifact_lock(run_dir):
         seq_path = run_dir / "event_seq.txt"
         path = run_dir / "events.ndjson"
         sidecar_seq, sidecar_size = _read_event_seq_sidecar(seq_path)
-        try:
-            current_size = path.stat().st_size
-        except FileNotFoundError:
-            current_size = 0
-        if sidecar_size is not None and sidecar_size == current_size:
-            event_seq, truncate_at = sidecar_seq, None
-        else:
-            event_seq, truncate_at = _last_complete_event(path)
-        if truncate_at is not None:
-            with path.open("r+b") as handle:
-                _set_private_file(path)
+        if not path.exists():
+            _atomic_write_bytes(path, b"")
+        with _open_managed_file(
+            path, writable=True, verify_private=False
+        ) as (handle, _details):
+            handle.seek(0, os.SEEK_END)
+            current_size = handle.tell()
+            if sidecar_size is not None and sidecar_size == current_size:
+                event_seq, truncate_at = sidecar_seq, None
+            else:
+                event_seq, truncate_at = _last_complete_event_handle(handle)
+            if truncate_at is not None:
                 handle.truncate(truncate_at)
                 handle.flush()
                 os.fsync(handle.fileno())
-        last_seq = sidecar_seq if sidecar_size == current_size else event_seq
-        seq = last_seq + 1
-        persisted_event = dict(event)
-        persisted_event["seq"] = seq
-        persisted_event.setdefault("ts", utc_now_iso())
-        persisted_event.setdefault("run_id", run_dir.name)
-        with path.open("a", encoding="utf-8", errors="replace") as handle:
-            _set_private_file(path)
-            handle.write(
+            last_seq = sidecar_seq if sidecar_size == current_size else event_seq
+            seq = last_seq + 1
+            persisted_event = dict(event)
+            persisted_event["seq"] = seq
+            persisted_event.setdefault("ts", utc_now_iso())
+            persisted_event.setdefault("run_id", run_dir.name)
+            encoded = (
                 json.dumps(
                     sanitize_for_json(redact(persisted_event)), ensure_ascii=False
                 )
                 + "\n"
-            )
+            ).encode("utf-8", errors="replace")
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() + len(encoded) > MAX_MANAGED_ARTIFACT_BYTES:
+                raise OrchestratorError("Event log exceeds its size limit.")
+            handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+            events_bytes = handle.tell()
         _atomic_write_text(
             seq_path,
             json.dumps(
-                {"seq": seq, "events_bytes": path.stat().st_size},
+                {"seq": seq, "events_bytes": events_bytes},
                 separators=(",", ":"),
             ),
         )
@@ -4089,6 +4358,29 @@ def _scrub_guarded_value(value: Any, sensitive_values: tuple[str, ...]) -> Any:
     return value
 
 
+@dataclass
+class _LaunchAdmissionReservation:
+    team_id: str
+    owner_pid: int
+    active: bool = True
+    registered_run_ids: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.registered_run_ids is None:
+            self.registered_run_ids = []
+
+    def require_active(self) -> None:
+        if not self.active or self.owner_pid != os.getpid():
+            raise OrchestratorError("Team launch admission reservation is inactive.")
+
+    def register(self, run_id: str) -> None:
+        self.require_active()
+        assert self.registered_run_ids is not None
+        if run_id in self.registered_run_ids:
+            raise OrchestratorError("Team child registration was duplicated.")
+        self.registered_run_ids.append(run_id)
+
+
 @dataclass(frozen=True)
 class PreparedWorkerLaunch:
     mode: str
@@ -4099,6 +4391,7 @@ class PreparedWorkerLaunch:
     selected_model: str | None = None
     skip_cost_guard: bool = False
     sensitive_values: tuple[str, ...] = ()
+    admission_reservation: _LaunchAdmissionReservation | None = None
 
     def __post_init__(self) -> None:
         if self.mode not in {"one_shot", "streaming"}:
@@ -4131,6 +4424,8 @@ class PreparedWorkerLaunch:
             raise TypeError("selected_model must be a string or null")
         if not isinstance(self.skip_cost_guard, bool):
             raise TypeError("skip_cost_guard must be a boolean")
+        if self.admission_reservation is not None:
+            self.admission_reservation.require_active()
         object.__setattr__(
             self,
             "sensitive_values",
@@ -4178,6 +4473,7 @@ def prepare_worker_launch(
     selected_model: str | None = None,
     skip_cost_guard: bool = False,
     sensitive_values: tuple[str, ...] = (),
+    admission_reservation: _LaunchAdmissionReservation | None = None,
 ) -> PreparedWorkerLaunch:
     if mode not in {"one_shot", "streaming"}:
         raise OrchestratorError("Launch mode must be one_shot or streaming.")
@@ -4265,6 +4561,7 @@ def prepare_worker_launch(
         selected_model=selected_model,
         skip_cost_guard=skip_cost_guard,
         sensitive_values=exact_values,
+        admission_reservation=admission_reservation,
     )
 
 
@@ -4370,20 +4667,52 @@ def capture_git_snapshot(
     cwd: Path,
     label: str,
     sensitive_values: tuple[str, ...] = (),
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     """Capture git diff/status, untracked files, and key file hashes."""
     result = {"ok": False, "label": label, "is_git_repo": False}
     if not (cwd / ".git").exists():
         return result
     try:
-        diff_proc = run_git_command(cwd, ["diff", "--binary", "--", "."], timeout=60)
-        status_proc = run_git_command(cwd, ["status", "--short"], timeout=30)
-        porcelain_proc = run_git_command(cwd, ["status", "--porcelain=v1", "-z"], timeout=30)
-        untracked_proc = run_git_command(cwd, ["ls-files", "--others", "--exclude-standard", "-z"], timeout=30)
+        def command_timeout(limit: float) -> float:
+            if deadline is None:
+                return limit
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Git evidence capture exceeded the launch deadline.")
+            return max(0.001, min(limit, remaining))
+
+        diff_proc = run_git_command(
+            cwd, ["diff", "--binary", "--", "."], timeout=command_timeout(60)
+        )
+        status_proc = run_git_command(
+            cwd, ["status", "--short"], timeout=command_timeout(30)
+        )
+        porcelain_proc = run_git_command(
+            cwd,
+            ["status", "--porcelain=v1", "-z"],
+            timeout=command_timeout(30),
+        )
+        untracked_proc = run_git_command(
+            cwd,
+            ["ls-files", "--others", "--exclude-standard", "-z"],
+            timeout=command_timeout(30),
+        )
         status_items = parse_porcelain_status(porcelain_proc.stdout or "") if porcelain_proc.returncode == 0 else []
         changed_paths = status_paths(status_items)
         untracked_paths = [part.replace("\\", "/") for part in (untracked_proc.stdout or "").split("\0") if part] if untracked_proc.returncode == 0 else []
-        hashes = workspace_hashes(cwd, [*changed_paths, *untracked_paths])
+        hashes = workspace_hashes(
+            cwd,
+            [*changed_paths, *untracked_paths],
+            deadline=deadline,
+        )
+        evidence_errors = sorted(
+            rel
+            for rel, evidence in hashes.items()
+            if isinstance(evidence, Mapping)
+            and (evidence.get("error") or evidence.get("skipped"))
+        )
+        evidence_complete = not evidence_errors
         diff_path = run_dir / f"git_{label}.diff"
         status_path = run_dir / f"git_{label}_status.txt"
         porcelain_path = run_dir / f"git_{label}_porcelain.json"
@@ -4413,9 +4742,19 @@ def capture_git_snapshot(
             ),
         )
         for artifact_path, safe_payload in artifact_payloads:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "Git evidence artifact writes exceeded the launch deadline."
+                )
             _atomic_write_text(artifact_path, safe_payload)
         return {
-            "ok": diff_proc.returncode == 0 and status_proc.returncode == 0 and porcelain_proc.returncode == 0,
+            "ok": (
+                diff_proc.returncode == 0
+                and status_proc.returncode == 0
+                and porcelain_proc.returncode == 0
+                and untracked_proc.returncode == 0
+                and evidence_complete
+            ),
             "label": label,
             "is_git_repo": True,
             "diff_path": str(diff_path),
@@ -4430,10 +4769,16 @@ def capture_git_snapshot(
             "changed_count": len(changed_paths),
             "untracked_count": len(untracked_paths),
             "hash_count": len(hashes),
+            "evidence_complete": evidence_complete,
+            "evidence_errors": _scrub_guarded_value(
+                evidence_errors, sensitive_values
+            ),
             "_raw_diff_text": raw_diff,
             "_raw_changed_paths": changed_paths,
             "_raw_untracked_paths": untracked_paths,
             "_raw_hashes": hashes,
+            "_raw_evidence_complete": evidence_complete,
+            "_raw_evidence_errors": evidence_errors,
         }
     except Exception as exc:
         return {
@@ -4515,15 +4860,26 @@ def _record_blocked_launch(
         }
 
 
-def _terminate_owned_process(process: subprocess.Popen[Any]) -> None:
+def _remaining_deadline(deadline: float | None, ceiling: float) -> float:
+    if deadline is None:
+        return ceiling
+    return max(0.0, min(ceiling, deadline - time.monotonic()))
+
+
+def _terminate_owned_process(
+    process: subprocess.Popen[Any], *, deadline: float | None = None
+) -> None:
     if process.poll() is None:
         try:
             process.terminate()
-            process.wait(timeout=5)
+            remaining = _remaining_deadline(deadline, 5.0)
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, 0)
+            process.wait(timeout=remaining)
         except (OSError, subprocess.TimeoutExpired):
             if process.poll() is None:
                 process.kill()
-                process.wait(timeout=5)
+                process.wait(timeout=max(0.1, _remaining_deadline(deadline, 5.0)))
     for stream in (process.stdin, process.stdout, process.stderr):
         if stream is not None:
             try:
@@ -4556,6 +4912,8 @@ def _prefer_complete_output(partial: Any, drained: Any) -> bytes:
 
 def _terminate_and_drain_owned_process(
     process: subprocess.Popen[Any],
+    *,
+    deadline: float | None = None,
 ) -> tuple[bytes, bytes]:
     if process.poll() is None:
         try:
@@ -4563,11 +4921,14 @@ def _terminate_and_drain_owned_process(
         except OSError:
             pass
     try:
-        stdout, stderr = process.communicate(timeout=5)
+        remaining = _remaining_deadline(deadline, 5.0)
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(process.args, 0)
+        stdout, stderr = process.communicate(timeout=remaining)
     except subprocess.TimeoutExpired as timeout_error:
         if process.poll() is None:
             process.kill()
-        stdout, stderr = process.communicate()
+        stdout, stderr = process.communicate(timeout=5)
         stdout = _prefer_complete_output(timeout_error.output, stdout)
         stderr = _prefer_complete_output(timeout_error.stderr, stderr)
     return _output_bytes(stdout), _output_bytes(stderr)
@@ -4709,7 +5070,6 @@ def _start_one_shot_launch(
             error=_runtime_identity_changed(identity.canonical_path),
         )
     command = _runtime_command(identity, spec.arguments)
-    started = time.time()
     process: subprocess.Popen[bytes] | None = None
     if not identity.matches_current_file():
         return _record_blocked_launch(
@@ -4753,6 +5113,19 @@ def _start_one_shot_launch(
             ),
         )
     try:
+        pinned_scope = _pin_write_scope_policy(Path(spec.cwd))
+    except Exception:
+        return _record_blocked_launch(
+            run_dir,
+            metadata,
+            sensitive_values=prepared.sensitive_values,
+            status="blocked_runtime_launch",
+            error=_launch_failure_error(
+                "write_scope_invalid",
+                "The write-scope policy could not be pinned before runtime launch.",
+            ),
+        )
+    try:
         process = subprocess.Popen(
             command,
             cwd=spec.cwd,
@@ -4761,6 +5134,8 @@ def _start_one_shot_launch(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+        started_monotonic = time.monotonic()
+        launch_deadline = started_monotonic + spec.timeout_seconds
     except OSError:
         return _record_blocked_launch(
             run_dir,
@@ -4826,15 +5201,25 @@ def _start_one_shot_launch(
                 child_process_identity=child_identity.to_dict(),
             )
         try:
-            stdout_bytes, stderr_bytes = process.communicate(
-                input=prepared.prompt_bytes, timeout=spec.timeout_seconds
+            remaining = _remaining_deadline(
+                launch_deadline, float(spec.timeout_seconds)
             )
-            timed_out = False
-            exit_code = process.returncode
+            if remaining <= 0:
+                timed_out = True
+                stdout_bytes, stderr_bytes = _terminate_and_drain_owned_process(
+                    process, deadline=launch_deadline
+                )
+                exit_code = 124
+            else:
+                stdout_bytes, stderr_bytes = process.communicate(
+                    input=prepared.prompt_bytes, timeout=remaining
+                )
+                timed_out = False
+                exit_code = process.returncode
         except subprocess.TimeoutExpired as timeout_error:
             timed_out = True
             drained_stdout, drained_stderr = _terminate_and_drain_owned_process(
-                process
+                process, deadline=launch_deadline
             )
             stdout_bytes = _prefer_complete_output(
                 timeout_error.output, drained_stdout
@@ -4845,7 +5230,7 @@ def _start_one_shot_launch(
             exit_code = 124
     finally:
         if process.poll() is None:
-            _terminate_owned_process(process)
+            _terminate_owned_process(process, deadline=launch_deadline)
     stdout = stdout_bytes.decode("utf-8", errors="replace")
     stderr = stderr_bytes.decode("utf-8", errors="replace")
     safe_stdout = _scrub_output_text(stdout, prepared.sensitive_values)
@@ -4863,12 +5248,14 @@ def _start_one_shot_launch(
         Path(spec.cwd),
         "after",
         prepared.sensitive_values,
+        deadline=launch_deadline,
     )
     scope_check_raw = _check_write_scope_with_evidence(
         str(metadata["run_id"]),
         Path(spec.cwd),
         git_before_raw,
         git_after_raw,
+        pinned_scope,
     )
     git_after = _git_snapshot_projection(
         git_after_raw, prepared.sensitive_values
@@ -4876,10 +5263,13 @@ def _start_one_shot_launch(
     scope_check = _scrub_guarded_value(
         scope_check_raw, prepared.sensitive_values
     )
+    if time.monotonic() >= launch_deadline and not timed_out:
+        timed_out = True
+        exit_code = 124
     updates: dict[str, Any] = _scrub_guarded_value(
         {
             "finished_at": utc_now_iso(),
-            "duration_ms": int((time.time() - started) * 1000),
+            "duration_ms": int((time.monotonic() - started_monotonic) * 1000),
             "exit_code": exit_code,
             "timed_out": timed_out,
             "git_after": git_after,
@@ -5184,20 +5574,38 @@ def _start_streaming_controller(
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     else:
         popen_kwargs["start_new_session"] = True
-    try:
-        admission = launch_lock()
-        admission.__enter__()
-    except Exception:
-        return _record_blocked_launch(
-            run_dir,
-            metadata,
-            sensitive_values=prepared.sensitive_values,
-            status="blocked_runtime_launch",
-            error=_launch_failure_error(
-                "cost_guard_blocked", "Streaming launch admission could not be acquired."
-            ),
-        )
-    admission_active = True
+    reservation = prepared.admission_reservation
+    admission: Any | None = None
+    if reservation is not None:
+        try:
+            reservation.require_active()
+        except Exception:
+            return _record_blocked_launch(
+                run_dir,
+                metadata,
+                sensitive_values=prepared.sensitive_values,
+                status="blocked_runtime_launch",
+                error=_launch_failure_error(
+                    "cost_guard_blocked",
+                    "Team launch admission reservation is unavailable.",
+                ),
+            )
+        admission_active = False
+    else:
+        try:
+            admission = launch_lock()
+            admission.__enter__()
+        except Exception:
+            return _record_blocked_launch(
+                run_dir,
+                metadata,
+                sensitive_values=prepared.sensitive_values,
+                status="blocked_runtime_launch",
+                error=_launch_failure_error(
+                    "cost_guard_blocked", "Streaming launch admission could not be acquired."
+                ),
+            )
+        admission_active = True
     worker: subprocess.Popen[bytes] | None = None
     try:
         try:
@@ -5301,8 +5709,11 @@ def _start_streaming_controller(
             _append_unsafe_runtime_event(prepared, run_dir)
             _publish_latest_run(metadata)
             _retain_worker_handle(str(metadata["run_id"]), worker)
-            admission_active = False
-            admission.__exit__(None, None, None)
+            if admission is not None:
+                admission_active = False
+                admission.__exit__(None, None, None)
+            if reservation is not None:
+                reservation.register(str(metadata["run_id"]))
             metadata = _open_worker_start_gate(run_dir)
         except Exception:
             _terminate_owned_process(worker)
@@ -5332,6 +5743,7 @@ def _start_streaming_controller(
     finally:
         if admission_active:
             try:
+                assert admission is not None
                 admission.__exit__(None, None, None)
             except Exception:
                 pass
@@ -5358,6 +5770,7 @@ def run_streaming_agent(
     final_max_chars: int | None = None,
     skip_cost_guard: bool = False,
     allow_unsafe_runtime: bool = False,
+    _admission_reservation: _LaunchAdmissionReservation | None = None,
 ) -> dict[str, Any]:
     if not isinstance(task, str) or not task.strip():
         raise OrchestratorError("Task cannot be empty.")
@@ -5450,6 +5863,7 @@ def run_streaming_agent(
         selected_model=selected_model,
         skip_cost_guard=skip_cost_guard,
         sensitive_values=(task, context or ""),
+        admission_reservation=_admission_reservation,
     )
     return start_prepared_worker_launch(prepared)
 
@@ -5619,6 +6033,8 @@ def _consume_worker_nonce(run_dir: Path, nonce: str) -> dict[str, Any]:
     with artifact_lock(run_dir):
         metadata = read_metadata(run_dir)
         gate = _read_worker_start_gate(run_dir)
+        if str(metadata.get("status") or "") not in {"starting", "running"}:
+            raise _runtime_not_trusted("Controller closed the worker start gate.")
         public = metadata.get("runtime_launch")
         worker_launch = metadata.get("worker_launch")
         if (
@@ -5819,6 +6235,19 @@ def stream_worker(run_id: str) -> dict[str, Any]:
                 "Pre-launch Git evidence could not be persisted safely.",
             ),
         )
+    try:
+        pinned_scope = _pin_write_scope_policy(cwd)
+    except Exception:
+        return _record_blocked_launch(
+            run_dir,
+            metadata,
+            sensitive_values=sensitive_values,
+            status="blocked_runtime_launch",
+            error=_launch_failure_error(
+                "write_scope_invalid",
+                "The write-scope policy could not be pinned before runtime launch.",
+            ),
+        )
     creationflags = 0
     popen_kwargs: dict[str, Any] = {}
     if os.name == "nt":
@@ -5831,7 +6260,6 @@ def stream_worker(run_id: str) -> dict[str, Any]:
     budget_stop = threading.Event()
     actual_route_recorded = threading.Event()
     route_mismatch_recorded = threading.Event()
-    started = time.time()
     if not executable_identity.matches_current_file():
         return _worker_security_failure(
             run_dir, _runtime_identity_changed(executable_identity.canonical_path)
@@ -5847,6 +6275,8 @@ def stream_worker(run_id: str) -> dict[str, Any]:
             creationflags=creationflags,
             **popen_kwargs,
         )
+        started_monotonic = time.monotonic()
+        launch_deadline = started_monotonic + timeout
     except OSError:
         return _record_blocked_launch(
             run_dir,
@@ -5869,7 +6299,7 @@ def stream_worker(run_id: str) -> dict[str, Any]:
             if termination_requested.is_set():
                 return
             termination_requested.set()
-            _terminate_owned_process(proc)
+            _terminate_owned_process(proc, deadline=launch_deadline)
 
     def drain_output(
         stream: Any, destination: queue.Queue[bytes | None], source: str
@@ -6142,8 +6572,10 @@ def stream_worker(run_id: str) -> dict[str, Any]:
         source_queue: queue.Queue[bytes | None], out_path: Path, source: str
     ) -> None:
         try:
-            with out_path.open("a", encoding="utf-8", errors="replace") as out:
-                _set_private_file(out_path)
+            with _open_managed_file(
+                out_path, writable=True, verify_private=False
+            ) as (out, _details):
+                out.seek(0, os.SEEK_END)
                 while True:
                     raw_line = source_queue.get()
                     if raw_line is None:
@@ -6218,7 +6650,12 @@ def stream_worker(run_id: str) -> dict[str, Any]:
                     if not write_line:
                         trigger_budget("output_budget_exceeded", source)
                         continue
-                    out.write(safe_line)
+                    safe_payload = safe_line.encode("utf-8", errors="replace")
+                    if out.tell() + len(safe_payload) > MAX_MANAGED_ARTIFACT_BYTES:
+                        raise OrchestratorError(
+                            f"Managed artifact exceeds its size limit: {out_path.name}"
+                        )
+                    out.write(safe_payload)
                     out.flush()
                     with budget_lock:
                         budget["written_output_bytes"] = int(budget.get("written_output_bytes") or 0) + safe_line_bytes
@@ -6272,7 +6709,7 @@ def stream_worker(run_id: str) -> dict[str, Any]:
                 stopped = True
                 io_cancel.set()
                 terminate_child_once()
-            if not timed_out and time.time() - started > timeout:
+            if not timed_out and time.monotonic() >= launch_deadline:
                 timed_out = True
                 safe_append({"type": "timeout", "timeout_seconds": timeout})
                 with budget_lock:
@@ -6282,7 +6719,10 @@ def stream_worker(run_id: str) -> dict[str, Any]:
                 terminate_child_once()
             time.sleep(0.2)
         try:
-            exit_code = proc.wait(timeout=5)
+            remaining = _remaining_deadline(launch_deadline, 5.0)
+            if remaining <= 0 and proc.poll() is None:
+                raise subprocess.TimeoutExpired(proc.args, 0)
+            exit_code = proc.wait(timeout=max(remaining, 0.001))
         except subprocess.TimeoutExpired:
             io_cancel.set()
             terminate_child_once()
@@ -6327,7 +6767,7 @@ def stream_worker(run_id: str) -> dict[str, Any]:
             }
         )
 
-    duration_ms = int((time.time() - started) * 1000)
+    duration_ms = int((time.monotonic() - started_monotonic) * 1000)
     latest_metadata = read_metadata(run_dir)
     stopped = stopped or bool(latest_metadata.get("stop_requested_at"))
     if timed_out:
@@ -6348,10 +6788,15 @@ def stream_worker(run_id: str) -> dict[str, Any]:
             budget["stop_reason"] = "user_requested"
         persist_budget_unlocked(str(budget.get("stop_reason") or "") or None)
     git_after_raw = capture_git_snapshot(
-        run_dir, cwd, "after", sensitive_values
+        run_dir, cwd, "after", sensitive_values, deadline=launch_deadline
     )
+    if time.monotonic() >= launch_deadline and not stopped:
+        timed_out = True
+        status = "timed_out"
+        final_exit = 124
+    duration_ms = int((time.monotonic() - started_monotonic) * 1000)
     scope_check_raw = _check_write_scope_with_evidence(
-        run_id, cwd, git_before_raw, git_after_raw
+        run_id, cwd, git_before_raw, git_after_raw, pinned_scope
     )
     git_after = _git_snapshot_projection(
         git_after_raw, sensitive_values
@@ -6783,6 +7228,9 @@ def spawn_role_team(
                 "runs": [],
                 "rollback": manifest["rollback"],
             }
+        reservation = _LaunchAdmissionReservation(
+            team_id=team_id, owner_pid=os.getpid()
+        )
         try:
             for role in selected_roles:
                 run = run_streaming_agent(
@@ -6792,9 +7240,25 @@ def spawn_role_team(
                     context="\n".join(part for part in [f"Team id: {team_id}", context or ""] if part),
                     timeout_seconds=timeout_seconds,
                     skip_cost_guard=True,
+                    _admission_reservation=reservation,
                 )
-                update_metadata(safe_run_dir(str(run["run_id"])), team_id=team_id)
-                runs.append({"role": role, "run_id": run["run_id"], "status": run["status"], "profile": run.get("profile")})
+                run_id = str(run["run_id"])
+                runs.append(
+                    {
+                        "role": role,
+                        "run_id": run_id,
+                        "status": run["status"],
+                        "profile": run.get("profile"),
+                    }
+                )
+                if (
+                    run.get("status") != "starting"
+                    or run_id not in (reservation.registered_run_ids or [])
+                ):
+                    raise OrchestratorError(
+                        f"Team child registration failed for role {role}."
+                    )
+                update_metadata(safe_run_dir(run_id), team_id=team_id)
         except Exception as exc:
             stops = []
             for item in runs:
@@ -6840,6 +7304,8 @@ def spawn_role_team(
                 "runs": runs,
                 "rollback": rollback,
             }
+        finally:
+            reservation.active = False
     manifest = {
         "team_id": team_id,
         "created_at": utc_now_iso(),
@@ -6995,6 +7461,91 @@ def load_write_scope(cwd: Path) -> tuple[Path, dict[str, Any] | None]:
     return path, json.loads(path.read_text(encoding="utf-8"))
 
 
+def _validate_write_scope_policy(
+    root: Path, path: Path, scope: Any
+) -> dict[str, Any]:
+    if not isinstance(scope, Mapping):
+        raise OrchestratorError("Write-scope policy must be a JSON object.")
+    normalized = dict(scope)
+    for key in ("allowed_paths", "denied_paths"):
+        values = normalized.get(key, [])
+        if not isinstance(values, list) or not all(
+            isinstance(item, str) and item for item in values
+        ):
+            raise OrchestratorError(
+                f"Write-scope policy field {key} must be a string list."
+            )
+        for item in values:
+            candidate = Path(item)
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            if safe_relative(root, candidate.resolve()) is None:
+                raise OrchestratorError(
+                    f"Write-scope policy field {key} contains an outside path."
+                )
+    max_diff_lines = normalized.get("max_diff_lines", 0)
+    if (
+        not isinstance(max_diff_lines, int)
+        or isinstance(max_diff_lines, bool)
+        or max_diff_lines < 0
+    ):
+        raise OrchestratorError(
+            "Write-scope policy max_diff_lines must be a non-negative integer."
+        )
+    cwd_value = normalized.get("cwd")
+    if cwd_value is not None and not isinstance(cwd_value, str):
+        raise OrchestratorError("Write-scope policy cwd must be a string.")
+    return normalized
+
+
+def _pin_write_scope_policy(root: Path) -> dict[str, Any]:
+    root = root.resolve()
+    path = root / ".claude-code-orchestrator" / "write-scope.json"
+    try:
+        payload = path.read_bytes()
+    except FileNotFoundError:
+        return {
+            "path": str(path),
+            "exists": False,
+            "sha256": None,
+            "scope": None,
+        }
+    if len(payload) > 1024 * 1024:
+        raise OrchestratorError("Write-scope policy exceeds its size limit.")
+    try:
+        parsed = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise OrchestratorError("Write-scope policy is malformed.") from exc
+    scope = _validate_write_scope_policy(root, path, parsed)
+    return {
+        "path": str(path),
+        "exists": True,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "scope": scope,
+    }
+
+
+def _write_scope_policy_drift(pinned: Mapping[str, Any]) -> str | None:
+    path = Path(str(pinned["path"]))
+    try:
+        payload = path.read_bytes()
+    except FileNotFoundError:
+        return "deleted" if pinned.get("exists") else None
+    except OSError:
+        return "unreadable"
+    if not pinned.get("exists"):
+        return "created"
+    if len(payload) > 1024 * 1024:
+        return "oversized"
+    try:
+        json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return "malformed"
+    if hashlib.sha256(payload).hexdigest() != pinned.get("sha256"):
+        return "changed"
+    return None
+
+
 def path_under(candidate: Path, parent: Path) -> bool:
     try:
         candidate.resolve().relative_to(parent.resolve())
@@ -7018,10 +7569,42 @@ def _check_write_scope_with_evidence(
     root: Path,
     before: Mapping[str, Any],
     after: Mapping[str, Any],
+    pinned_scope: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     root = root.resolve()
-    scope_path, scope = load_write_scope(root)
+    if pinned_scope is None:
+        scope_path, scope = load_write_scope(root)
+        if scope is not None:
+            scope = _validate_write_scope_policy(root, scope_path, scope)
+        policy_drift = None
+    else:
+        scope_path = Path(str(pinned_scope["path"]))
+        scope_value = pinned_scope.get("scope")
+        scope = dict(scope_value) if isinstance(scope_value, Mapping) else None
+        policy_drift = _write_scope_policy_drift(pinned_scope)
     if not scope:
+        if policy_drift:
+            return {
+                "ok": False,
+                "status": "blocked",
+                "run_id": run_id,
+                "cwd": str(root),
+                "scope_path": str(scope_path),
+                "checked_paths": [],
+                "changed_paths": [],
+                "violation_count": 1,
+                "violations": [
+                    {
+                        "type": "scope_policy_drift",
+                        "reason": policy_drift,
+                        "message": "The pinned write-scope policy changed during launch.",
+                    }
+                ],
+                "diff_lines": 0,
+                "diff_source": "unavailable",
+                "max_diff_lines": 0,
+                "rollback_recommendation": "Review diff and restore the pinned write-scope policy.",
+            }
         return {
             "ok": True,
             "status": "no_scope",
@@ -7042,6 +7625,30 @@ def _check_write_scope_with_evidence(
     allowed = [Path(item).resolve() for item in scope.get("allowed_paths", []) or []]
     denied = [Path(item).resolve() for item in scope.get("denied_paths", []) or []]
     violations: list[dict[str, Any]] = []
+    if policy_drift:
+        violations.append(
+            {
+                "type": "scope_policy_drift",
+                "reason": policy_drift,
+                "message": "The pinned write-scope policy changed during launch.",
+            }
+        )
+    evidence_incomplete = any(
+        snapshot.get("is_git_repo")
+        and (
+            snapshot.get("ok") is False
+            or snapshot.get("_raw_evidence_complete") is False
+            or snapshot.get("evidence_complete") is False
+        )
+        for snapshot in (before, after)
+    )
+    if evidence_incomplete:
+        violations.append(
+            {
+                "type": "git_evidence_incomplete",
+                "message": "Complete Git evidence was unavailable; acceptance is blocked.",
+            }
+        )
     checked: list[str] = []
     for rel in changed_paths:
         normalized = rel.replace("\\", "/").strip("/")
@@ -7110,8 +7717,31 @@ def check_write_scope(
         run_dir = safe_run_dir(run_id)
         metadata = read_metadata(run_dir)
         root = Path(str(metadata.get("cwd") or cwd or Path.cwd())).resolve()
-        before = metadata.get("git_before") or {}
-        after = metadata.get("git_after") or {}
+        authoritative = metadata.get("write_scope_check")
+        if isinstance(authoritative, Mapping) and "ok" in authoritative:
+            return sanitize_for_json(dict(authoritative))
+        return {
+            "ok": False,
+            "status": "pending_authoritative_scope",
+            "run_id": run_id,
+            "cwd": str(root),
+            "scope_path": str(
+                root / ".claude-code-orchestrator" / "write-scope.json"
+            ),
+            "checked_paths": [],
+            "changed_paths": [],
+            "violation_count": 1,
+            "violations": [
+                {
+                    "type": "authoritative_scope_pending",
+                    "message": "Authoritative raw write-scope evidence is not available yet.",
+                }
+            ],
+            "diff_lines": 0,
+            "diff_source": "unavailable",
+            "max_diff_lines": 0,
+            "rollback_recommendation": None,
+        }
     else:
         root = (cwd or Path.cwd()).resolve()
     return _check_write_scope_with_evidence(run_id, root, before, after)

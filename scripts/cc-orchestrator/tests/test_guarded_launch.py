@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -1558,7 +1559,9 @@ class SecondReviewScrubAndScannerTests(GuardedLaunchFixture):
             _cwd: Path,
             label: str,
             _sensitive_values: tuple[str, ...] = (),
+            deadline: float | None = None,
         ) -> dict[str, object]:
+            del deadline
             if label == "after":
                 return {
                     "ok": False,
@@ -2197,7 +2200,11 @@ class ThirdReviewHandleBindingTests(GuardedLaunchFixture):
 
             def swap_then_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
                 nonlocal swapped
-                if Path(path) == victim and not swapped:
+                relative_victim = (
+                    kwargs.get("dir_fd") is not None
+                    and Path(path) == Path(victim.name)
+                )
+                if (Path(path) == victim or relative_victim) and not swapped:
                     victim.replace(backup)
                     os.symlink(outside, victim)
                     swapped = True
@@ -2211,6 +2218,674 @@ class ThirdReviewHandleBindingTests(GuardedLaunchFixture):
                 orchestrator._scrub_run_artifacts(run_dir, ("outside-secret",))
         self.assertTrue(swapped)
         self.assertEqual(outside.read_text(encoding="utf-8"), "outside-secret")
+
+
+class FourthReviewNonceTransactionTests(GuardedLaunchFixture):
+    def test_stop_between_gate_poll_and_lock_leaves_nonce_unconsumed(self) -> None:
+        prepared = self._prepare("streaming", prompt="")
+        run_dir, _metadata = orchestrator._initialize_prepared_run(prepared)
+        nonce = prepared.launch_spec.launch_nonce
+        identity = capture_process_identity(os.getpid(), launch_nonce=nonce)
+        metadata = orchestrator.update_metadata(
+            run_dir,
+            worker_pid=os.getpid(),
+            worker_process_identity=identity.to_dict(),
+            controller_pid=identity.parent_pid,
+        )
+        self._publish_worker_gate(run_dir, metadata)
+        real_read_gate = orchestrator._read_worker_start_gate
+        calls = 0
+
+        def stop_after_poll(path: Path) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            gate = real_read_gate(path)
+            if calls == 1:
+                orchestrator.update_metadata(
+                    run_dir,
+                    status="stopped",
+                    stop_requested_at="fixture-stop",
+                    terminal_state_count=1,
+                )
+            return gate
+
+        with patch.object(
+            orchestrator, "_read_worker_start_gate", side_effect=stop_after_poll
+        ):
+            with self.assertRaises(RuntimeSecurityError):
+                orchestrator._consume_worker_nonce(run_dir, nonce)
+        latest = orchestrator.read_metadata(run_dir)
+        self.assertEqual(latest["status"], "stopped")
+        self.assertFalse(latest["worker_launch"]["nonce_consumed"])
+        self.assertIsNone(latest.get("child_pid"))
+
+
+class FourthReviewScopeFixture(GuardedLaunchFixture):
+    denied_name = "sensitive-denied-fourth-cycle"
+
+    def _initialize_git_workspace(self) -> None:
+        completed = subprocess.run(
+            ["git", "init"],
+            cwd=self.workspace,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def _scope_path(self) -> Path:
+        return self.workspace / ".claude-code-orchestrator" / "write-scope.json"
+
+    def _write_scope(self, denied_name: str | None = None) -> Path:
+        path = self._scope_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "cwd": str(self.workspace),
+                    "allowed_paths": [str(self.workspace)],
+                    "denied_paths": [
+                        str(self.workspace / (denied_name or self.denied_name))
+                    ],
+                    "max_diff_lines": 100,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def _write_mutating_runtime(self, replacement: str = "changed") -> None:
+        self.fake_runtime.write_text(
+            "\n".join(
+                [
+                    "import pathlib, sys",
+                    "prompt = sys.stdin.buffer.read().decode('utf-8')",
+                    "task = prompt.rsplit('\\nTask:\\n', 1)[1].split('\\n\\nAdditional context:\\n', 1)[0].strip()",
+                    f"pathlib.Path(task).write_text({replacement!r}, encoding='utf-8')",
+                    "print('done', flush=True)",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def _run_sensitive_denied_path(self) -> tuple[dict[str, object], Path]:
+        self._initialize_git_workspace()
+        self._write_scope()
+        self._write_mutating_runtime()
+        metadata = orchestrator.run_agent(self.denied_name, cwd=self.workspace)
+        run_dir = self.runs_dir / str(metadata["run_id"])
+        self.assertEqual(metadata["acceptance_status"], "blocked_write_scope")
+        return metadata, run_dir
+
+
+class FourthReviewAuthoritativeScopeTests(FourthReviewScopeFixture):
+    def test_active_run_without_terminal_scope_never_reuses_projection(self) -> None:
+        prepared = self._prepare("streaming", prompt="")
+        run_dir, metadata = orchestrator._initialize_prepared_run(prepared)
+        self.assertNotIn("write_scope_check", metadata)
+        with patch.object(
+            orchestrator,
+            "_check_write_scope_with_evidence",
+            side_effect=AssertionError("scrubbed projection was re-evaluated"),
+        ):
+            scope = orchestrator.check_write_scope(run_id=run_dir.name)
+        self.assertFalse(scope["ok"], scope)
+        self.assertEqual(scope["status"], "pending_authoritative_scope")
+
+    def test_public_scope_api_uses_authoritative_terminal_result(self) -> None:
+        metadata, _run_dir = self._run_sensitive_denied_path()
+        scope = orchestrator.check_write_scope(run_id=str(metadata["run_id"]))
+        self.assertFalse(scope["ok"], scope)
+        self.assertIn(
+            "denied_path", {item["type"] for item in scope["violations"]}
+        )
+
+    def test_risk_scoring_and_cli_preserve_authoritative_scope_denial(self) -> None:
+        metadata, _run_dir = self._run_sensitive_denied_path()
+        run_id = str(metadata["run_id"])
+        with patch.object(
+            orchestrator,
+            "secret_scan_run",
+            return_value={
+                "ok": True,
+                "finding_count": 0,
+                "blocking_count": 0,
+            },
+        ):
+            risks = orchestrator.detect_failure_modes(run_id)
+            score = orchestrator.score_worker(run_id, solved=True, apply=False)
+        self.assertIn(
+            "write_scope_violation",
+            {item["code"] for item in risks["flags"]},
+        )
+        self.assertFalse(score["scope_ok"])
+
+        output = io.StringIO()
+        with patch.object(
+            sys,
+            "argv",
+            [str(orchestrator.__file__), "check-write-scope", "--run-id", run_id],
+        ), contextlib.redirect_stdout(output):
+            orchestrator.main()
+        cli_scope = json.loads(output.getvalue())
+        self.assertFalse(cli_scope["ok"], cli_scope)
+
+    def test_verify_run_gate_uses_authoritative_scope_denial(self) -> None:
+        metadata, _run_dir = self._run_sensitive_denied_path()
+        run_id = str(metadata["run_id"])
+        with patch.object(orchestrator, "REPORTS_DIR", self.workspace / "reports"), patch.object(
+            orchestrator,
+            "secret_scan_run",
+            return_value={"ok": True, "finding_count": 0, "blocking_count": 0},
+        ), patch.object(
+            orchestrator,
+            "score_worker",
+            return_value={"quality_score": 0},
+        ):
+            verification = orchestrator.verify_run(run_id, include_diff=False)
+        self.assertFalse(verification["gates"]["write_scope_ok"])
+        self.assertFalse(verification["write_scope"]["ok"])
+
+
+class FourthReviewWriterHandleTests(GuardedLaunchFixture):
+    def _private_run_dir(self) -> Path:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        for name in ("stdout.txt", "stderr.txt", "events.ndjson"):
+            orchestrator._atomic_write_text(run_dir / name, "")
+        return run_dir
+
+    def test_event_append_swap_cannot_modify_outside_file(self) -> None:
+        run_dir = self._private_run_dir()
+        events = run_dir / "events.ndjson"
+        outside = self.workspace / "outside-events.txt"
+        outside.write_text("outside", encoding="utf-8")
+        backup = run_dir / "events.original"
+        real_open = Path.open
+        real_private = orchestrator._set_private_file
+        attack_active = False
+
+        def swap_on_append(path: Path, mode: str = "r", *args: object, **kwargs: object) -> object:
+            nonlocal attack_active
+            if Path(path) == events and mode == "a" and not attack_active:
+                events.replace(backup)
+                os.symlink(outside, events)
+                attack_active = True
+            return real_open(path, mode, *args, **kwargs)
+
+        def hide_swap(path: Path) -> None:
+            if Path(path) == events and attack_active and events.is_symlink():
+                events.unlink()
+                backup.replace(events)
+            real_private(path)
+
+        with patch.object(Path, "open", swap_on_append), patch.object(
+            orchestrator, "_set_private_file", side_effect=hide_swap
+        ):
+            orchestrator.append_event(run_dir, {"type": "outside-race"})
+        self.assertEqual(outside.read_text(encoding="utf-8"), "outside")
+
+    def test_atomic_snapshot_swap_cannot_publish_or_modify_outside_file(self) -> None:
+        completed = subprocess.run(
+            ["git", "init"], cwd=self.workspace, capture_output=True, text=True
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        (self.workspace / "changed.txt").write_text("changed", encoding="utf-8")
+        run_dir = self._private_run_dir()
+        outside = self.workspace / "outside-snapshot.txt"
+        outside.write_text("outside", encoding="utf-8")
+        real_private = orchestrator._set_private_file
+
+        def replace_validated_temp(path: Path) -> None:
+            real_private(path)
+            candidate = Path(path)
+            if candidate.name.startswith(".git_after"):
+                candidate.unlink()
+                os.symlink(outside, candidate)
+
+        with patch.object(
+            orchestrator, "_set_private_file", side_effect=replace_validated_temp
+        ):
+            snapshot = orchestrator.capture_git_snapshot(
+                run_dir, self.workspace, "after"
+            )
+        self.assertTrue(snapshot["ok"], snapshot)
+        self.assertEqual(outside.read_text(encoding="utf-8"), "outside")
+        for path in run_dir.glob("git_after*"):
+            self.assertFalse(path.is_symlink(), path)
+
+    def test_stream_output_swap_cannot_modify_outside_file(self) -> None:
+        self.fake_runtime.write_text(
+            "import sys\nsys.stdin.buffer.read()\nprint('stream-output', flush=True)\n",
+            encoding="utf-8",
+        )
+        prepared = self._prepare("streaming", prompt="")
+        metadata = prepared.metadata()
+        run_dir = self._private_run_dir()
+        original_run_id = run_dir.name
+        metadata["run_id"] = original_run_id
+        nonce = prepared.launch_spec.launch_nonce
+        worker_identity = capture_process_identity(os.getpid(), launch_nonce=nonce)
+        metadata.update(
+            {
+                "status": "starting",
+                "runtime_launch": prepared.launch_spec.public_metadata(),
+                "worker_pid": os.getpid(),
+                "worker_process_identity": worker_identity.to_dict(),
+                "controller_pid": worker_identity.parent_pid,
+                "worker_launch": {
+                    "nonce_consumed": False,
+                    "nonce_expires_at": "2999-01-01T00:00:00+00:00",
+                    "start_gate": "closed",
+                },
+            }
+        )
+        orchestrator.write_metadata(run_dir, metadata)
+        self._publish_worker_gate(run_dir, metadata)
+        frame = prepared.launch_spec.private_frame()
+        protocol = len(frame).to_bytes(8, "big") + frame + (0).to_bytes(8, "big")
+        outside = self.workspace / "outside-output.txt"
+        outside.write_text("outside", encoding="utf-8")
+        stdout_path = run_dir / "stdout.txt"
+        backup = run_dir / "stdout.original"
+        real_open = Path.open
+        real_private = orchestrator._set_private_file
+        attack_active = False
+
+        def swap_on_append(path: Path, mode: str = "r", *args: object, **kwargs: object) -> object:
+            nonlocal attack_active
+            if Path(path) == stdout_path and mode == "a" and not attack_active:
+                stdout_path.replace(backup)
+                os.symlink(outside, stdout_path)
+                attack_active = True
+            return real_open(path, mode, *args, **kwargs)
+
+        def hide_swap(path: Path) -> None:
+            if Path(path) == stdout_path and attack_active and stdout_path.is_symlink():
+                stdout_path.unlink()
+                backup.replace(stdout_path)
+            real_private(path)
+
+        environment = dict(prepared.launch_spec.environment)
+        environment[orchestrator.INTERNAL_WORKER_NONCE_ENV] = nonce
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+            sys, "stdin", type("FixtureStdin", (), {"buffer": io.BytesIO(protocol)})()
+        ), patch.object(Path, "open", swap_on_append), patch.object(
+            orchestrator, "_set_private_file", side_effect=hide_swap
+        ):
+            result = orchestrator.stream_worker(original_run_id)
+        self.assertEqual(result["status"], "succeeded", result)
+        self.assertEqual(outside.read_text(encoding="utf-8"), "outside")
+
+
+class FourthReviewTeamAdmissionTests(GuardedLaunchFixture):
+    def test_real_team_launch_uses_one_nonreentrant_admission(self) -> None:
+        depth = 0
+
+        @contextlib.contextmanager
+        def nonreentrant_lock(*_args: object, **_kwargs: object) -> object:
+            nonlocal depth
+            if depth:
+                raise AssertionError("nested launch admission")
+            depth += 1
+            try:
+                yield
+            finally:
+                depth -= 1
+
+        with patch.object(orchestrator, "launch_lock", nonreentrant_lock), patch.object(
+            orchestrator, "TEAMS_DIR", self.artifact_root / "teams"
+        ), patch.object(orchestrator, "max_concurrent_limit", return_value=4), patch.object(
+            orchestrator, "run_status", return_value={"active_count": 0}
+        ):
+            team = orchestrator.spawn_role_team(
+                "real team compatibility",
+                roles=["testing", "review"],
+                cwd=self.workspace,
+                timeout_seconds=5,
+            )
+        self.assertTrue(team["ok"], team)
+        self.assertEqual(team["launched_count"], 2)
+        for item in team["runs"]:
+            metadata = self._wait_for_terminal_metadata(
+                self.runs_dir / str(item["run_id"])
+            )
+            self.assertNotEqual(metadata["status"], "blocked_runtime_launch")
+
+    def test_team_rolls_back_when_child_registration_fails(self) -> None:
+        real_gate = orchestrator._open_worker_start_gate
+        gate_count = 0
+
+        def fail_second_gate(run_dir: Path) -> dict[str, object]:
+            nonlocal gate_count
+            gate_count += 1
+            if gate_count == 2:
+                raise OSError("second child registration failed")
+            return real_gate(run_dir)
+
+        with patch.object(orchestrator, "launch_lock", side_effect=lambda: contextlib.nullcontext()), patch.object(
+            orchestrator, "TEAMS_DIR", self.artifact_root / "teams"
+        ), patch.object(orchestrator, "max_concurrent_limit", return_value=4), patch.object(
+            orchestrator, "run_status", return_value={"active_count": 0}
+        ), patch.object(
+            orchestrator, "_open_worker_start_gate", side_effect=fail_second_gate
+        ):
+            team = orchestrator.spawn_role_team(
+                "registration rollback",
+                roles=["testing", "review"],
+                cwd=self.workspace,
+                timeout_seconds=5,
+            )
+        self.assertFalse(team["ok"], team)
+        self.assertIn(
+            team["status"], {"rolled_back_partial_launch", "rollback_incomplete"}
+        )
+        self.assertTrue(team["rollback"]["attempted"])
+
+
+class FourthReviewPinnedScopeTests(FourthReviewScopeFixture):
+    def _write_scope_mutating_runtime(self, operation: str) -> None:
+        scope_path = self._scope_path()
+        operations = {
+            "delete": f"pathlib.Path({str(scope_path)!r}).unlink()",
+            "malformed": f"pathlib.Path({str(scope_path)!r}).write_text('{{', encoding='utf-8')",
+            "drift": (
+                f"pathlib.Path({str(scope_path)!r}).write_text("
+                "json.dumps({'cwd': '.', 'allowed_paths': [], 'denied_paths': [], 'max_diff_lines': 0}), encoding='utf-8')"
+            ),
+        }
+        self.fake_runtime.write_text(
+            "import json, pathlib, sys\n"
+            "sys.stdin.buffer.read()\n"
+            f"{operations[operation]}\n"
+            "print('done', flush=True)\n",
+            encoding="utf-8",
+        )
+
+    def test_scope_delete_malformed_and_drift_after_popen_fail_closed(self) -> None:
+        self._initialize_git_workspace()
+        for operation in ("delete", "malformed", "drift"):
+            with self.subTest(operation=operation):
+                self._write_scope()
+                self._write_scope_mutating_runtime(operation)
+                result = orchestrator.run_agent(
+                    f"scope {operation}", cwd=self.workspace
+                )
+                self.assertEqual(
+                    result["acceptance_status"], "blocked_write_scope", result
+                )
+                self.assertIn(
+                    "scope_policy_drift",
+                    {
+                        item["type"]
+                        for item in result["write_scope_check"]["violations"]
+                    },
+                )
+
+    def test_malformed_initial_scope_blocks_before_runtime_popen(self) -> None:
+        self._initialize_git_workspace()
+        scope_path = self._scope_path()
+        scope_path.parent.mkdir(parents=True)
+        scope_path.write_text("{", encoding="utf-8")
+        marker = self.workspace / "runtime-started.txt"
+        self.fake_runtime.write_text(
+            "import pathlib, sys\n"
+            "sys.stdin.buffer.read()\n"
+            f"pathlib.Path({str(marker)!r}).write_text('started', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        result = orchestrator.run_agent("malformed scope", cwd=self.workspace)
+        self.assertEqual(result["status"], "blocked_runtime_launch", result)
+        self.assertFalse(marker.exists())
+
+
+class FourthReviewGitCompletenessTests(FourthReviewScopeFixture):
+    def _write_same_size_mutator(self) -> None:
+        self.fake_runtime.write_text(
+            "import pathlib, sys\n"
+            "prompt = sys.stdin.buffer.read().decode('utf-8')\n"
+            "task = prompt.rsplit('\\nTask:\\n', 1)[1].split('\\n\\nAdditional context:\\n', 1)[0].strip()\n"
+            "path = pathlib.Path(task)\n"
+            "with path.open('r+b') as handle:\n"
+            "    first = handle.read(1)\n"
+            "    handle.seek(0)\n"
+            "    handle.write(b'Z' if first != b'Z' else b'Y')\n"
+            "print('done', flush=True)\n",
+            encoding="utf-8",
+        )
+
+    def test_large_predirty_denied_file_is_fully_hashed(self) -> None:
+        self._initialize_git_workspace()
+        denied = "large-denied.bin"
+        self._write_scope(denied)
+        with (self.workspace / denied).open("wb") as handle:
+            handle.truncate(20_000_001)
+        self._write_same_size_mutator()
+        result = orchestrator.run_agent(denied, cwd=self.workspace)
+        self.assertEqual(result["acceptance_status"], "blocked_write_scope", result)
+        self.assertIn(
+            "denied_path",
+            {item["type"] for item in result["write_scope_check"]["violations"]},
+        )
+
+    def test_denied_file_beyond_one_thousand_predirty_paths_is_hashed(self) -> None:
+        self._initialize_git_workspace()
+        denied = "zzzz-denied.bin"
+        self._write_scope(denied)
+        for index in range(1001):
+            (self.workspace / f"predirty-{index:04d}.txt").write_text(
+                "x", encoding="utf-8"
+            )
+        (self.workspace / denied).write_bytes(b"x")
+        self._write_same_size_mutator()
+        result = orchestrator.run_agent(denied, cwd=self.workspace)
+        self.assertEqual(result["acceptance_status"], "blocked_write_scope", result)
+        self.assertIn(
+            "denied_path",
+            {item["type"] for item in result["write_scope_check"]["violations"]},
+        )
+
+    def test_hash_read_failure_marks_git_evidence_incomplete(self) -> None:
+        self._initialize_git_workspace()
+        denied = "unreadable-denied.bin"
+        self._write_scope(denied)
+        target = self.workspace / denied
+        target.write_bytes(b"x")
+        self._write_same_size_mutator()
+        real_hash = orchestrator.file_sha256
+        target_reads = 0
+
+        def fail_target(path: Path, *args: object, **kwargs: object) -> dict[str, object]:
+            nonlocal target_reads
+            if Path(path).resolve() == target.resolve():
+                target_reads += 1
+                if target_reads > 2:
+                    raise OSError("fixture read failure")
+            return real_hash(path, *args, **kwargs)
+
+        with patch.object(orchestrator, "file_sha256", side_effect=fail_target):
+            result = orchestrator.run_agent(denied, cwd=self.workspace)
+        self.assertEqual(result["acceptance_status"], "blocked_write_scope", result)
+        self.assertIn(
+            "git_evidence_incomplete",
+            {item["type"] for item in result["write_scope_check"]["violations"]},
+        )
+
+
+class FourthReviewDeadlineTests(GuardedLaunchFixture):
+    def test_one_shot_validation_and_artifacts_consume_single_deadline(self) -> None:
+        self.fake_runtime.write_text(
+            "import sys, time\nsys.stdin.buffer.read()\ntime.sleep(5)\n",
+            encoding="utf-8",
+        )
+        real_capture = orchestrator.capture_process_identity
+        real_update = orchestrator.update_metadata
+        child_update_seen = False
+
+        def delayed_capture(pid: int, *, launch_nonce: str) -> ProcessIdentity:
+            time.sleep(0.65)
+            return real_capture(pid, launch_nonce=launch_nonce)
+
+        def delayed_update(run_dir: Path, **updates: object) -> dict[str, object]:
+            nonlocal child_update_seen
+            if "child_pid" in updates and not child_update_seen:
+                child_update_seen = True
+                time.sleep(0.65)
+            return real_update(run_dir, **updates)
+
+        started = time.monotonic()
+        with patch.object(
+            orchestrator, "capture_process_identity", side_effect=delayed_capture
+        ), patch.object(orchestrator, "update_metadata", side_effect=delayed_update):
+            result = orchestrator.run_agent(
+                "single deadline", cwd=self.workspace, timeout_seconds=1
+            )
+        elapsed = time.monotonic() - started
+        self.assertTrue(result["timed_out"], result)
+        self.assertLess(elapsed, 1.9)
+        self._wait_for_pid_exit(int(result["child_pid"]))
+
+    def test_streaming_timeout_uses_monotonic_deadline_after_wall_rollback(self) -> None:
+        self.fake_runtime.write_text(
+            "import sys, time\nsys.stdin.buffer.read()\ntime.sleep(2)\n",
+            encoding="utf-8",
+        )
+        prepared = orchestrator.prepare_worker_launch(
+            mode="streaming",
+            prompt="",
+            provider_env=self.provider.env,
+            model_override=None,
+            cwd=self.workspace,
+            workspace_root=self.workspace,
+            artifact_root=self.artifact_root,
+            permission_mode="plan",
+            timeout_seconds=1,
+            arguments=(
+                "-p",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--include-partial-messages",
+                "--permission-mode",
+                "plan",
+                "--no-session-persistence",
+            ),
+            safe_route_metadata={
+                "role": "testing",
+                "task_type": "code",
+                "profile": {"id": self.provider.id, "name": self.provider.name},
+                "output_format": "stream-json",
+                "include_partial_messages": True,
+                "allow_write": False,
+            },
+            expected_child_launches=1,
+            allow_unsafe_runtime=False,
+        )
+        metadata = prepared.metadata()
+        run_dir = self.runs_dir / str(metadata["run_id"])
+        orchestrator._set_private_directory(run_dir)
+        for name in ("stdout.txt", "stderr.txt", "events.ndjson"):
+            orchestrator._atomic_write_text(run_dir / name, "")
+        nonce = prepared.launch_spec.launch_nonce
+        worker_identity = capture_process_identity(os.getpid(), launch_nonce=nonce)
+        metadata.update(
+            {
+                "status": "starting",
+                "runtime_launch": prepared.launch_spec.public_metadata(),
+                "worker_pid": os.getpid(),
+                "worker_process_identity": worker_identity.to_dict(),
+                "controller_pid": worker_identity.parent_pid,
+                "worker_launch": {
+                    "nonce_consumed": False,
+                    "nonce_expires_at": "2999-01-01T00:00:00+00:00",
+                    "start_gate": "closed",
+                },
+            }
+        )
+        orchestrator.write_metadata(run_dir, metadata)
+        self._publish_worker_gate(run_dir, metadata)
+        frame = prepared.launch_spec.private_frame()
+        protocol = len(frame).to_bytes(8, "big") + frame + (0).to_bytes(8, "big")
+        environment = dict(prepared.launch_spec.environment)
+        environment[orchestrator.INTERNAL_WORKER_NONCE_ENV] = nonce
+        real_popen = subprocess.Popen
+        real_wall = time.time
+        child_started = threading.Event()
+
+        def mark_child(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+            child = real_popen(*args, **kwargs)
+            child_started.set()
+            return child
+
+        def rolled_back_wall() -> float:
+            now = real_wall()
+            return now - 3600 if child_started.is_set() else now
+
+        started = time.monotonic()
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+            sys, "stdin", type("FixtureStdin", (), {"buffer": io.BytesIO(protocol)})()
+        ), patch.object(orchestrator.subprocess, "Popen", side_effect=mark_child), patch.object(
+            orchestrator.time, "time", side_effect=rolled_back_wall
+        ):
+            result = orchestrator.stream_worker(str(metadata["run_id"]))
+        elapsed = time.monotonic() - started
+        self.assertEqual(result["status"], "timed_out", result)
+        self.assertLess(elapsed, 1.9)
+        self._wait_for_pid_exit(int(result["child_pid"]))
+
+
+class FourthReviewDirectoryHandleTests(GuardedLaunchFixture):
+    def test_directory_swap_during_permission_walk_is_rejected(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        nested = run_dir / "nested"
+        orchestrator._set_private_directory(nested)
+        orchestrator._atomic_write_text(nested / "inside.txt", "inside")
+        outside = self.workspace / "outside-directory"
+        outside.mkdir()
+        outside_file = outside / "outside.txt"
+        outside_file.write_text("outside", encoding="utf-8")
+        backup = run_dir / "nested.original"
+        swapped = False
+
+        if os.name == "nt":
+            real_open = orchestrator._open_windows_managed_directory
+
+            def swap_directory(path: Path, *args: object, **kwargs: object) -> object:
+                nonlocal swapped
+                if Path(path) == nested and not swapped:
+                    nested.replace(backup)
+                    os.symlink(outside, nested, target_is_directory=True)
+                    swapped = True
+                return real_open(path, *args, **kwargs)
+
+            opener_patch = patch.object(
+                orchestrator,
+                "_open_windows_managed_directory",
+                side_effect=swap_directory,
+            )
+        else:
+            real_open = os.open
+
+            def swap_directory(path: object, flags: int, *args: object, **kwargs: object) -> int:
+                nonlocal swapped
+                is_relative_nested = (
+                    kwargs.get("dir_fd") is not None
+                    and Path(path) == Path(nested.name)
+                    and bool(flags & getattr(os, "O_DIRECTORY", 0))
+                )
+                if is_relative_nested and not swapped:
+                    nested.replace(backup)
+                    os.symlink(outside, nested, target_is_directory=True)
+                    swapped = True
+                return real_open(path, flags, *args, **kwargs)
+
+            opener_patch = patch.object(orchestrator.os, "open", side_effect=swap_directory)
+        with opener_patch:
+            with self.assertRaises(orchestrator.OrchestratorError):
+                orchestrator._secure_run_artifacts(run_dir)
+        self.assertTrue(swapped)
+        self.assertEqual(outside_file.read_text(encoding="utf-8"), "outside")
 
 
 class ReviewFixWrapperChecks(GuardedLaunchFixture):
