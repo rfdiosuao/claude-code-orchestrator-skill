@@ -1902,7 +1902,9 @@ class ThirdReviewGateArtifactTests(GuardedLaunchFixture):
             orchestrator, "WORKER_START_GATE_FILENAME", "worker-start-gate.json"
         )
 
-        def interleave(temporary: Path, target: Path) -> None:
+        def interleave(
+            temporary: Path, target: Path, **kwargs: object
+        ) -> None:
             if Path(target).name == gate_name:
                 orchestrator.update_metadata(
                     run_dir,
@@ -1910,7 +1912,7 @@ class ThirdReviewGateArtifactTests(GuardedLaunchFixture):
                     stop_requested_at="fixture-stop",
                     terminal_state_count=1,
                 )
-            real_replace(temporary, target)
+            real_replace(temporary, target, **kwargs)
 
         with patch.object(
             orchestrator,
@@ -1933,14 +1935,16 @@ class ThirdReviewGateArtifactTests(GuardedLaunchFixture):
             orchestrator, "WORKER_START_GATE_FILENAME", "worker-start-gate.json"
         )
 
-        def interleave(temporary: Path, target: Path) -> None:
+        def interleave(
+            temporary: Path, target: Path, **kwargs: object
+        ) -> None:
             if Path(target).name == gate_name:
                 orchestrator.update_metadata(
                     run_dir,
                     arbitrary_controller_field={"preserve": [1, 2, 3]},
                     status="running",
                 )
-            real_replace(temporary, target)
+            real_replace(temporary, target, **kwargs)
 
         with patch.object(
             orchestrator,
@@ -3875,7 +3879,7 @@ class SixthReviewLifecycleTests(GuardedLaunchFixture):
                 )
             self.assertEqual(result["status"], "cleanup_pending", result)
             self.assertEqual(result["terminal_state_count"], 0)
-            self.assertEqual(result["persistence_state"], "degraded")
+            self.assertEqual(result["persistence_state"], "persisted")
             metadata = orchestrator.read_metadata(
                 self.runs_dir / str(result["run_id"])
             )
@@ -3894,6 +3898,12 @@ class SixthReviewLifecycleTests(GuardedLaunchFixture):
             )
         finally:
             release.set()
+            deadline = time.time() + 3
+            while time.time() < deadline and any(
+                thread.name.startswith("cc-cleanup-owner-")
+                for thread in threading.enumerate()
+            ):
+                time.sleep(0.02)
 
     def _direct_stream_fixture(self) -> tuple[object, Path, dict[str, object], bytes, dict[str, str]]:
         prepared = self._prepare("streaming", prompt="thread lifecycle")
@@ -5103,7 +5113,9 @@ class EighthReviewTeamTests(GuardedLaunchFixture):
         real_write = orchestrator.write_json_file
         attacked = False
 
-        def kill_after_validation(path: Path, data: object) -> Path:
+        def kill_after_validation(
+            path: Path, data: object, **kwargs: object
+        ) -> Path:
             nonlocal attacked
             if (
                 isinstance(data, dict)
@@ -5119,7 +5131,7 @@ class EighthReviewTeamTests(GuardedLaunchFixture):
                     worker, deadline=time.monotonic() + 3
                 )
                 attacked = True
-            return real_write(path, data)
+            return real_write(path, data, **kwargs)
 
         with patch.object(orchestrator, "TEAMS_DIR", team_dir), patch.object(
             orchestrator, "max_concurrent_limit", return_value=3
@@ -5555,6 +5567,593 @@ class SeventhReviewPosixCapabilityTests(GuardedLaunchFixture):
         os.symlink(outside, run_dir / "linked.txt")
         with self.assertRaises((OSError, orchestrator.OrchestratorError)):
             orchestrator._read_bounded_regular_file(run_dir / "linked.txt", 100)
+        self.assertEqual(outside.read_text(encoding="utf-8"), "outside")
+        self.assertEqual(orchestrator._PREPARED_ATOMIC_PARENTS, {})
+
+
+@unittest.skipUnless(os.name == "posix", "native POSIX ninth-cycle lock regression")
+class NinthReviewLegacyLockTests(GuardedLaunchFixture):
+    def test_multiprocess_legacy_reclaimers_cannot_retire_a_successor(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        lock_path = run_dir.parent / f".{run_dir.name}.artifact.lock"
+        lock_path.mkdir()
+        stale_pid = 999_999_999
+        (lock_path / "owner.pid").write_text(
+            json.dumps({"pid": stale_pid, "token": "ninth-stale"}),
+            encoding="ascii",
+        )
+        script = "\n".join(
+            [
+                "import os, pathlib, sys, time",
+                f"sys.path.insert(0, {str(ORCHESTRATOR_DIR)!r})",
+                "import cc_orchestrator as o",
+                "run_dir = pathlib.Path(sys.argv[1])",
+                "go = pathlib.Path(sys.argv[2])",
+                "markers = pathlib.Path(sys.argv[3])",
+                "timeline = pathlib.Path(sys.argv[4])",
+                "real_match = o._artifact_lock_directory_path_matches_generation",
+                "calls = 0",
+                "def synchronized_match(path, generation):",
+                "    global calls",
+                "    calls += 1",
+                "    matched = real_match(path, generation)",
+                "    if calls == 2 and matched:",
+                "        (markers / str(os.getpid())).write_text('ready')",
+                "        deadline = time.monotonic() + 1.0",
+                "        while len(list(markers.iterdir())) < 2 and time.monotonic() < deadline:",
+                "            time.sleep(0.005)",
+                "    return matched",
+                "o._artifact_lock_directory_path_matches_generation = synchronized_match",
+                "while not go.exists(): time.sleep(0.005)",
+                "with o.artifact_lock(run_dir, timeout_seconds=5):",
+                "    with timeline.open('a', encoding='ascii') as out:",
+                "        out.write(f'enter {os.getpid()} {time.monotonic()}\\n'); out.flush()",
+                "    time.sleep(0.25)",
+                "    with timeline.open('a', encoding='ascii') as out:",
+                "        out.write(f'exit {os.getpid()} {time.monotonic()}\\n'); out.flush()",
+            ]
+        )
+        go = self.workspace / "legacy-go"
+        markers = self.workspace / "legacy-markers"
+        markers.mkdir()
+        timeline = self.workspace / "legacy-timeline.txt"
+        processes = [
+            subprocess.Popen(
+                [sys.executable, "-c", script, str(run_dir), str(go), str(markers), str(timeline)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for _ in range(2)
+        ]
+        go.write_text("go", encoding="ascii")
+        completed = [process.communicate(timeout=10) for process in processes]
+        for process, (_stdout, stderr) in zip(processes, completed):
+            self.assertEqual(process.returncode, 0, stderr)
+        intervals: dict[str, dict[str, float]] = {}
+        for line in timeline.read_text(encoding="ascii").splitlines():
+            kind, pid, value = line.split()
+            intervals.setdefault(pid, {})[kind] = float(value)
+        self.assertEqual(len(intervals), 2, intervals)
+        ordered = sorted(intervals.values(), key=lambda item: item["enter"])
+        self.assertGreaterEqual(ordered[1]["enter"], ordered[0]["exit"])
+        self.assertFalse(lock_path.exists())
+
+
+class NinthReviewLaunchLockTests(GuardedLaunchFixture):
+    def test_live_long_holder_remains_exclusive_with_atomic_owner_evidence(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        active = 0
+        maximum = 0
+        guard = threading.Lock()
+        errors: list[BaseException] = []
+
+        def holder() -> None:
+            nonlocal active, maximum
+            try:
+                with orchestrator.launch_lock(timeout_seconds=2, stale_seconds=0.02):
+                    lock_path = self.runs_dir / ".launch.lock"
+                    owner_path = lock_path if lock_path.is_file() else lock_path / "owner.json"
+                    owner = json.loads(owner_path.read_text(encoding="utf-8"))
+                    self.assertEqual(owner["pid"], os.getpid())
+                    self.assertTrue(owner.get("token"), owner)
+                    self.assertTrue(owner.get("generation"), owner)
+                    with guard:
+                        active += 1
+                        maximum = max(maximum, active)
+                    entered.set()
+                    release.wait(1)
+                    with guard:
+                        active -= 1
+            except BaseException as exc:
+                errors.append(exc)
+
+        first = threading.Thread(target=holder)
+        second = threading.Thread(target=holder)
+        first.start()
+        self.assertTrue(entered.wait(2))
+        time.sleep(0.08)
+        second.start()
+        time.sleep(0.12)
+        release.set()
+        first.join(timeout=3)
+        second.join(timeout=3)
+        self.assertEqual(errors, [])
+        self.assertEqual(maximum, 1)
+
+    def test_old_launch_owner_cannot_delete_same_name_successor(self) -> None:
+        context = orchestrator.launch_lock(timeout_seconds=1, stale_seconds=0)
+        context.__enter__()
+        lock_path = self.runs_dir / ".launch.lock"
+        retired = self.runs_dir / ".launch.lock.old-generation"
+        lock_path.replace(retired)
+        successor = {
+            "pid": os.getpid(),
+            "token": "successor-token",
+            "generation": "successor-generation",
+            "created_at": orchestrator.utc_now_iso(),
+        }
+        if retired.is_dir():
+            lock_path.mkdir()
+            (lock_path / "owner.json").write_text(
+                json.dumps(successor), encoding="utf-8"
+            )
+        else:
+            lock_path.write_text(json.dumps(successor), encoding="utf-8")
+        context.__exit__(None, None, None)
+        self.assertTrue(lock_path.exists())
+        if lock_path.is_dir():
+            shutil.rmtree(lock_path)
+            shutil.rmtree(retired)
+        else:
+            lock_path.unlink()
+            retired.unlink()
+
+
+class NinthReviewCleanupOwnershipTests(GuardedLaunchFixture):
+    def test_direct_cleanup_pending_is_persisted_and_owned_by_nondaemon_thread(self) -> None:
+        release = threading.Event()
+
+        class Stream:
+            def close(self) -> None:
+                pass
+
+        class PendingProcess:
+            args = ("ninth-pending",)
+            pid = 424299
+            stdin = Stream()
+            stdout = Stream()
+            stderr = Stream()
+
+            def __init__(self) -> None:
+                self.returncode: int | None = None
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def terminate(self) -> None:
+                pass
+
+            def kill(self) -> None:
+                pass
+
+            def wait(self, timeout: float | None = None) -> int:
+                if timeout is not None:
+                    raise subprocess.TimeoutExpired(self.args, timeout)
+                release.wait(3)
+                self.returncode = -9
+                return self.returncode
+
+        process = PendingProcess()
+        pump = threading.Thread(
+            target=release.wait,
+            name="cc-runtime-ninth-live-pump",
+            daemon=True,
+        )
+        pump.start()
+        pending = orchestrator._OwnedCleanupPending(process, (pump,))
+        prepared = self._prepare("one_shot", prompt="durable cleanup owner")
+        try:
+            with patch.object(
+                orchestrator, "_start_one_shot_launch_inner", side_effect=pending
+            ):
+                result = orchestrator.start_prepared_worker_launch(prepared)
+            run_dir = self.runs_dir / str(result["run_id"])
+            persisted = orchestrator.read_metadata(run_dir)
+            self.assertEqual(result["status"], "cleanup_pending", result)
+            self.assertEqual(persisted["status"], "cleanup_pending", persisted)
+            self.assertTrue(persisted.get("persisted"), persisted)
+            self.assertIn(pump.name, persisted.get("live_cleanup_threads", []))
+            owners = [
+                thread
+                for thread in threading.enumerate()
+                if thread.name.startswith("cc-cleanup-owner-")
+            ]
+            self.assertTrue(owners)
+            self.assertTrue(all(not thread.daemon for thread in owners))
+        finally:
+            release.set()
+            pump.join(timeout=2)
+            deadline = time.time() + 3
+            while time.time() < deadline and any(
+                thread.name.startswith("cc-cleanup-owner-")
+                for thread in threading.enumerate()
+            ):
+                time.sleep(0.02)
+
+
+class NinthReviewLifecycleTests(EighthReviewLifecycleTests):
+    def test_second_pump_failure_waits_for_descendant_retained_pipe(self) -> None:
+        descendant_ready = self.workspace / "ninth-descendant-ready"
+        self.fake_runtime.write_text(
+            "\n".join(
+                [
+                    "import pathlib, subprocess, sys",
+                    "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(1.1)'], stdout=sys.stdout, stderr=sys.stderr, close_fds=False)",
+                    f"pathlib.Path({str(descendant_ready)!r}).write_text('ready')",
+                    "sys.stdin.buffer.read()",
+                    "print('parent-finished', flush=True)",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        _prepared, run_dir, metadata, protocol, environment = (
+            self._direct_stream_fixture()
+        )
+        real_thread = threading.Thread
+        real_popen = orchestrator.subprocess.Popen
+        pump_constructors = 0
+        retained_streams: list[object] = []
+
+        class RetainedPipe:
+            def __init__(self, stream: object) -> None:
+                self.stream = stream
+
+            def read(self, *args: object, **kwargs: object) -> object:
+                return self.stream.read(*args, **kwargs)
+
+            def read1(self, *args: object, **kwargs: object) -> object:
+                read1 = getattr(self.stream, "read1", self.stream.read)
+                return read1(*args, **kwargs)
+
+            def close(self) -> None:
+                pass
+
+        def retain_child_pipes(
+            *args: object, **kwargs: object
+        ) -> subprocess.Popen[bytes]:
+            child = real_popen(*args, **kwargs)
+            if kwargs.get("stdin") is subprocess.PIPE:
+                if child.stdout is not None:
+                    retained_streams.append(child.stdout)
+                    child.stdout = RetainedPipe(child.stdout)
+                if child.stderr is not None:
+                    retained_streams.append(child.stderr)
+                    child.stderr = RetainedPipe(child.stderr)
+            return child
+
+        def fail_second_pump(*args: object, **kwargs: object) -> threading.Thread:
+            nonlocal pump_constructors
+            thread_args = kwargs.get("args")
+            if (
+                isinstance(thread_args, tuple)
+                and thread_args
+                and getattr(thread_args[0], "__name__", "") == "pump"
+            ):
+                pump_constructors += 1
+                if pump_constructors == 2:
+                    deadline = time.monotonic() + 2
+                    while (
+                        not descendant_ready.exists()
+                        and time.monotonic() < deadline
+                    ):
+                        time.sleep(0.01)
+                    self.assertTrue(descendant_ready.exists())
+                    raise RuntimeError("ninth second pump failure")
+            return real_thread(*args, **kwargs)
+
+        started = time.monotonic()
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+            sys, "stdin", type("FixtureStdin", (), {"buffer": io.BytesIO(protocol)})()
+        ), patch.object(
+            orchestrator.subprocess, "Popen", side_effect=retain_child_pipes
+        ), patch.object(orchestrator.threading, "Thread", side_effect=fail_second_pump):
+            result = orchestrator.stream_worker(str(metadata["run_id"]))
+        for stream in retained_streams:
+            stream.close()
+        elapsed = time.monotonic() - started
+        self.assertEqual(pump_constructors, 2)
+        self.assertGreaterEqual(elapsed, 0.9, (elapsed, result))
+        self.assertFalse(
+            any(
+                thread.is_alive() and thread.name.startswith("cc-runtime-")
+                for thread in threading.enumerate()
+            )
+        )
+        persisted = orchestrator.read_metadata(run_dir)
+        self.assertIn(persisted.get("live_cleanup_threads"), (None, []))
+
+
+class NinthReviewTeamTests(EighthReviewTeamTests):
+    def test_authorization_publication_is_the_final_controller_commit(self) -> None:
+        team_dir = self.artifact_root / "teams"
+        real_manifest = orchestrator.write_team_manifest
+        authorized = False
+        writes_after_authorization: list[str] = []
+        killed = False
+
+        def kill_after_publication(team_id: str, data: dict[str, object]) -> Path:
+            nonlocal authorized, killed
+            if authorized:
+                writes_after_authorization.append(str(data.get("status")))
+            path = real_manifest(team_id, data)
+            if data.get("status") == "authorized" and not killed:
+                authorized = True
+                run_id = str(data["runs"][0]["run_id"])
+                with orchestrator._ACTIVE_WORKER_HANDLES_LOCK:
+                    worker = orchestrator._ACTIVE_WORKER_HANDLES.get(run_id)
+                self.assertIsNotNone(worker)
+                assert worker is not None
+                orchestrator._terminate_owned_process(
+                    worker, deadline=time.monotonic() + 3
+                )
+                killed = True
+            return path
+
+        with patch.object(orchestrator, "TEAMS_DIR", team_dir), patch.object(
+            orchestrator, "max_concurrent_limit", return_value=3
+        ), patch.object(
+            orchestrator, "run_status", return_value={"active_count": 0}
+        ), patch.object(
+            orchestrator, "write_team_manifest", side_effect=kill_after_publication
+        ):
+            team = orchestrator.spawn_role_team(
+                "post-publication member death",
+                roles=["testing", "review"],
+                cwd=self.workspace,
+                timeout_seconds=6,
+            )
+
+        self.assertTrue(killed)
+        self.assertTrue(team["ok"], team)
+        self.assertEqual(writes_after_authorization, [])
+        manifest = json.loads(
+            Path(str(team["manifest_path"])).read_text(encoding="utf-8")
+        )
+        self.assertEqual(manifest["status"], "authorized", manifest)
+        self._wait_for_team_workers(team)
+
+    def test_worker_performs_no_peer_validation_after_authorization_observation(self) -> None:
+        prepared, run_dir, metadata, protocol, environment = (
+            EighthReviewLifecycleTests._direct_stream_fixture(self)
+        )
+        metadata = orchestrator.update_metadata(
+            run_dir,
+            team_id="team-ninth-observation",
+            team_manifest_path=str(self.workspace / "team-ninth.json"),
+        )
+
+        def latest(*_args: object, **_kwargs: object) -> dict[str, object]:
+            return orchestrator.read_metadata(run_dir)
+
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+            sys, "stdin", type("FixtureStdin", (), {"buffer": io.BytesIO(protocol)})()
+        ), patch.object(
+            orchestrator, "_complete_team_worker_preflight", side_effect=latest
+        ), patch.object(
+            orchestrator, "_wait_for_team_authorization", side_effect=latest
+        ), patch.object(
+            orchestrator,
+            "_team_start_barrier_ready",
+            side_effect=AssertionError("peer validation after commit is forbidden"),
+        ) as peer_validation:
+            result = orchestrator.stream_worker(str(metadata["run_id"]))
+
+        self.assertFalse(peer_validation.called, result)
+        self.assertEqual(result.get("status"), "succeeded", result)
+        self.assertEqual(result.get("exit_code"), 0, result)
+
+
+@unittest.skipUnless(os.name == "nt", "Windows retained-temp cleanup regression")
+class NinthReviewWindowsCleanupTests(GuardedLaunchFixture):
+    def test_prepare_failure_deletes_only_the_retained_temp_source(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        target = run_dir / "metadata.json"
+        real_secure = orchestrator._secure_private_writable_handle
+        attacker: Path | None = None
+        retained: Path | None = None
+
+        def swap_then_fail(handle: object, path: Path) -> None:
+            nonlocal attacker, retained
+            real_secure(handle, path)
+            retained = path.with_name(path.name + ".retained")
+            path.replace(retained)
+            path.write_text("attacker-successor", encoding="utf-8")
+            attacker = path
+            raise OSError("ninth preparation failure")
+
+        try:
+            with patch.object(
+                orchestrator,
+                "_secure_private_writable_handle",
+                side_effect=swap_then_fail,
+            ):
+                with self.assertRaises(OSError):
+                    orchestrator._prepare_private_atomic_write(target, b"approved")
+            assert attacker is not None and retained is not None
+            self.assertTrue(attacker.exists())
+            self.assertEqual(attacker.read_text(encoding="utf-8"), "attacker-successor")
+            self.assertFalse(retained.exists())
+        finally:
+            if attacker is not None:
+                attacker.unlink(missing_ok=True)
+            if retained is not None:
+                retained.unlink(missing_ok=True)
+
+
+class NinthReviewDeadlineTests(GuardedLaunchFixture):
+    def test_direct_two_phase_launch_inherits_preparation_deadline_evidence(self) -> None:
+        prepared = self._prepare("one_shot", prompt="direct deadline evidence")
+        deadline = prepared.transaction_deadline_monotonic
+        observed: list[float | None] = []
+        real_popen = orchestrator.subprocess.Popen
+
+        def observe_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+            observed.append(orchestrator._effective_deadline())
+            return real_popen(*args, **kwargs)
+
+        with patch.object(orchestrator.subprocess, "Popen", side_effect=observe_popen):
+            result = orchestrator.start_prepared_worker_launch(prepared)
+        self.assertEqual(result.get("exit_code"), 0, result)
+        self.assertEqual(observed, [deadline])
+
+        invalid = self._prepare("one_shot", prompt="invalid deadline evidence")
+        object.__setattr__(invalid, "transaction_deadline_monotonic", float("nan"))
+        with self.assertRaises(orchestrator.OrchestratorError):
+            orchestrator.start_prepared_worker_launch(invalid)
+
+    def test_team_sequential_preparation_shares_one_total_wall_deadline(self) -> None:
+        team_dir = self.artifact_root / "teams"
+        observed: list[float | None] = []
+
+        def slow_member(*_args: object, **kwargs: object) -> dict[str, object]:
+            observed.append(orchestrator._effective_deadline())
+            time.sleep(0.38)
+            orchestrator._check_deadline()
+            reservation = kwargs["_admission_reservation"]
+            run_id = orchestrator.new_run_id()
+            reservation.register(run_id)
+            return {"run_id": run_id, "status": "starting", "profile": {}}
+
+        def write_fixture_manifest(team_id: str, data: dict[str, object]) -> Path:
+            team_dir.mkdir(parents=True, exist_ok=True)
+            path = team_dir / f"{team_id}.json"
+            path.write_text(json.dumps(data), encoding="utf-8")
+            return path
+
+        with patch.object(orchestrator, "TEAMS_DIR", team_dir), patch.object(
+            orchestrator, "max_concurrent_limit", return_value=4
+        ), patch.object(
+            orchestrator, "run_status", return_value={"active_count": 0}
+        ), patch.object(
+            orchestrator, "run_streaming_agent", side_effect=slow_member
+        ), patch.object(
+            orchestrator, "write_team_manifest", side_effect=write_fixture_manifest
+        ), patch.object(
+            orchestrator,
+            "_wait_for_team_members_ready",
+            side_effect=lambda _team, runs, deadline: runs,
+        ):
+            started = time.monotonic()
+            result = orchestrator.spawn_role_team(
+                "shared team deadline",
+                roles=["requirements", "testing", "review"],
+                cwd=self.workspace,
+                timeout_seconds=1,
+            )
+            elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 1.35, (elapsed, result))
+        self.assertTrue(observed)
+        self.assertTrue(all(value is not None for value in observed), observed)
+        self.assertEqual(len(set(observed)), 1, observed)
+        self.assertFalse(result.get("ok", False), result)
+
+
+class NinthReviewGitTests(SeventhReviewGitAndDeadlineTests):
+    def test_stage_movement_plus_real_edit_counts_only_the_logical_edit(self) -> None:
+        target = self._initialize_git_scope(max_diff_lines=1)
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        target.write_text("base\npredirty\n", encoding="utf-8")
+        before_stage = orchestrator.capture_git_snapshot(
+            run_dir, self.workspace, "ninth-before-stage"
+        )
+        self._git("add", target.name)
+        target.write_text("base\npredirty\nactual\n", encoding="utf-8")
+        after_stage = orchestrator.capture_git_snapshot(
+            run_dir, self.workspace, "ninth-after-stage"
+        )
+        pinned = orchestrator._pin_write_scope_policy(self.workspace)
+        stage_result = orchestrator._check_write_scope_with_evidence(
+            run_dir.name, self.workspace, before_stage, after_stage, pinned
+        )
+        self.assertEqual(stage_result["diff_lines"], 1, stage_result)
+        self.assertNotIn(
+            "max_diff_lines",
+            {item["type"] for item in stage_result["violations"]},
+        )
+
+        self._git("reset")
+        target.write_text("base\npredirty\nactual\nsecond\n", encoding="utf-8")
+        after_unstage = orchestrator.capture_git_snapshot(
+            run_dir, self.workspace, "ninth-after-unstage"
+        )
+        unstage_result = orchestrator._check_write_scope_with_evidence(
+            run_dir.name, self.workspace, after_stage, after_unstage, pinned
+        )
+        self.assertEqual(unstage_result["diff_lines"], 1, unstage_result)
+
+
+@unittest.skipUnless(os.name == "posix", "native POSIX ninth-cycle CI gate")
+class NinthReviewPosixGateTests(SeventhReviewGitAndDeadlineTests):
+    def test_native_posix_gate_preserves_backslashes_and_capabilities(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git is unavailable")
+        self._git("init")
+        self._git("config", "user.name", "Task Nine POSIX Fixture")
+        self._git("config", "user.email", "task-nine@example.invalid")
+        literal = "literal\\path-\u96ea.txt"
+        target = self.workspace / literal
+        target.write_text("base\n", encoding="utf-8")
+        self._git("add", literal)
+        self._git("commit", "-m", "base")
+        scope_dir = self.workspace / ".claude-code-orchestrator"
+        scope_dir.mkdir()
+        (scope_dir / "write-scope.json").write_text(
+            json.dumps(
+                {
+                    "cwd": str(self.workspace),
+                    "allowed_paths": [str(self.workspace)],
+                    "denied_paths": [],
+                    "max_diff_lines": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        before = orchestrator.capture_git_snapshot(
+            run_dir, self.workspace, "ninth-posix-before"
+        )
+        target.write_text("base\nedit\n", encoding="utf-8")
+        after = orchestrator.capture_git_snapshot(
+            run_dir, self.workspace, "ninth-posix-after"
+        )
+        result = orchestrator._check_write_scope_with_evidence(
+            run_dir.name,
+            self.workspace,
+            before,
+            after,
+            orchestrator._pin_write_scope_policy(self.workspace),
+        )
+        self.assertIn(literal, result["changed_paths"], result)
+        self.assertIn(literal, result["checked_paths"], result)
+        self.assertNotIn(literal.replace("\\", "/"), result["changed_paths"])
+        state = run_dir / "ninth-state.json"
+        orchestrator._atomic_write_text(state, '{"state":"one"}')
+        orchestrator._atomic_write_text(state, '{"state":"two"}')
+        self.assertEqual(stat.S_IMODE(run_dir.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(state.stat().st_mode), 0o600)
+        outside = self.workspace / "ninth-outside.txt"
+        outside.write_text("outside", encoding="utf-8")
+        os.symlink(outside, run_dir / "ninth-link.txt")
+        with self.assertRaises((OSError, orchestrator.OrchestratorError)):
+            orchestrator._read_bounded_regular_file(run_dir / "ninth-link.txt", 100)
         self.assertEqual(outside.read_text(encoding="utf-8"), "outside")
         self.assertEqual(orchestrator._PREPARED_ATOMIC_PARENTS, {})
 
