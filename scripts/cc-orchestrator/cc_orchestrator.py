@@ -7,9 +7,11 @@ import argparse
 import contextlib
 import contextvars
 import errno
+import functools
 import hashlib
 import html as html_lib
 import json
+import math
 import os
 import queue
 import re
@@ -124,6 +126,8 @@ _HELD_ARTIFACT_LOCKS: contextvars.ContextVar[frozenset[str]] = contextvars.Conte
 )
 _PROCESS_ARTIFACT_LOCK_TOKENS: dict[str, str] = {}
 _PROCESS_ARTIFACT_LOCK_TOKENS_LOCK = threading.Lock()
+_LEGACY_RECLAIM_LOCKS: dict[str, threading.Lock] = {}
+_LEGACY_RECLAIM_LOCKS_GUARD = threading.Lock()
 
 
 def _effective_deadline(deadline: float | None = None) -> float | None:
@@ -134,6 +138,52 @@ def _check_deadline(deadline: float | None = None, message: str = "Operation exc
     effective = _effective_deadline(deadline)
     if effective is not None and time.monotonic() >= effective:
         raise TimeoutError(message)
+
+
+def _guard_public_launch_transaction(timeout_position: int) -> Any:
+    """Establish the launch deadline before any route or policy preparation."""
+    def decorate(function: Any) -> Any:
+        @functools.wraps(function)
+        def guarded(*args: Any, **kwargs: Any) -> Any:
+            requested = kwargs.get("timeout_seconds")
+            if requested is None and len(args) > timeout_position:
+                requested = args[timeout_position]
+            try:
+                timeout_seconds = max(1, int(requested or 1800))
+            except (TypeError, ValueError):
+                timeout_seconds = 1800
+            inherited = _effective_deadline()
+            deadline = inherited or (
+                time.monotonic()
+                + timeout_seconds
+                + TRANSACTION_CLOSURE_RESERVE_SECONDS
+            )
+            token = _OPERATION_DEADLINE.set(deadline)
+            try:
+                _check_deadline(deadline)
+                return function(*args, **kwargs)
+            except TimeoutError:
+                return {
+                    "ok": False,
+                    "status": "blocked_runtime_launch",
+                    "timed_out": True,
+                    "exit_code": None,
+                    "terminal_state_count": 1,
+                    "persisted": False,
+                    "persistence_state": "not_created",
+                    "security_error": {
+                        "code": "launch_deadline_exceeded",
+                        "message": "Runtime preparation exceeded the launch deadline.",
+                        "safe_details": {},
+                        "suggested_action": "Retry with a longer explicitly approved timeout.",
+                    },
+                }
+            finally:
+                _OPERATION_DEADLINE.reset(token)
+
+        return guarded
+
+    return decorate
 
 
 def resolve_workspace_root(cwd: str | Path | None = None) -> Path:
@@ -355,9 +405,14 @@ class OrchestratorError(RuntimeError):
 
 
 class _OwnedCleanupPending(OrchestratorError):
-    def __init__(self, process: subprocess.Popen[Any]) -> None:
+    def __init__(
+        self,
+        process: subprocess.Popen[Any],
+        threads: tuple[threading.Thread, ...] | list[threading.Thread] = (),
+    ) -> None:
         super().__init__(f"Owned process {process.pid} is awaiting confirmed reaping.")
         self.process = process
+        self.threads = tuple(threads)
 
 
 @dataclass(frozen=True)
@@ -1547,10 +1602,199 @@ def _artifact_lock_path_matches_generation(
         return False
 
 
-def _retire_artifact_lock_directory(lock_dir: Path, suffix: str) -> bool:
+def _artifact_lock_directory_identity(details: Any) -> tuple[int, int]:
+    return _artifact_lock_file_identity(details)
+
+
+def _artifact_lock_directory_path_matches_generation(
+    lock_dir: Path, expected_identity: tuple[int, int]
+) -> bool:
+    try:
+        with _open_managed_directory(
+            lock_dir, verify_private=False
+        ) as (_handle, details):
+            return _artifact_lock_directory_identity(details) == expected_identity
+    except FileNotFoundError:
+        return False
+
+
+@contextlib.contextmanager
+def _locked_legacy_artifact_lock_generation(
+    lock_dir: Path, *, deadline: float | None = None
+) -> Any:
+    """Serialize retirement while retaining the inspected legacy directory."""
+    effective = _effective_deadline(deadline)
+    lock_key = os.path.normcase(str(lock_dir.resolve(strict=False)))
+    with _LEGACY_RECLAIM_LOCKS_GUARD:
+        local_lock = _LEGACY_RECLAIM_LOCKS.setdefault(
+            lock_key, threading.Lock()
+        )
+    while not local_lock.acquire(blocking=False):
+        _check_deadline(
+            effective,
+            "Legacy artifact lock inspection exceeded its deadline.",
+        )
+        time.sleep(0.005)
+    try:
+        directory_context = _open_managed_directory(
+            lock_dir, writable=True, verify_private=False
+        )
+        directory_handle, directory_details = directory_context.__enter__()
+    except Exception:
+        local_lock.release()
+        raise
+    owner_context: Any | None = None
+    owner_handle: Any | None = None
+    acquired = False
+    try:
+        if os.name == "nt":
+            owner_context = _open_windows_relative_managed_file(
+                directory_handle,
+                "owner.pid",
+                writable=True,
+                verify_private=False,
+            )
+            owner_handle, _owner_details = owner_context.__enter__()
+        else:
+            flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            owner_fd = os.open("owner.pid", flags, dir_fd=directory_handle)
+            owner_handle = os.fdopen(owner_fd, "r+b")
+        while not acquired:
+            _check_deadline(
+                effective,
+                "Legacy artifact lock inspection exceeded its deadline.",
+            )
+            try:
+                owner_handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(owner_handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(
+                        owner_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                    )
+                acquired = True
+            except OSError:
+                time.sleep(0.005)
+        owner_handle.seek(0)
+        payload = owner_handle.read(257)
+        if len(payload) > 256:
+            raise OrchestratorError("Artifact lock owner exceeds its size limit.")
+        # The retained directory handle is the generation capability used for
+        # retirement. Release the child-file lock first so Windows can rename
+        # the non-empty directory; a competing process can only act on its own
+        # retained generation and therefore cannot retire a successor.
+        owner_handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(owner_handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(owner_handle.fileno(), fcntl.LOCK_UN)
+        acquired = False
+        if owner_context is not None:
+            owner_context.__exit__(None, None, None)
+            owner_context = None
+        else:
+            owner_handle.close()
+        owner_handle = None
+        yield directory_handle, directory_details, payload
+    finally:
+        if acquired and owner_handle is not None:
+            try:
+                owner_handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(owner_handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(owner_handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        if owner_context is not None:
+            owner_context.__exit__(None, None, None)
+        elif owner_handle is not None:
+            owner_handle.close()
+        directory_context.__exit__(None, None, None)
+        local_lock.release()
+
+
+def _claim_ownerless_legacy_artifact_lock(
+    lock_dir: Path, *, deadline: float | None = None
+) -> tuple[int, int] | None:
+    """Atomically claim one stale ownerless legacy directory generation."""
+    with _open_managed_directory(
+        lock_dir, verify_private=False
+    ) as (directory_handle, directory_details):
+        generation = _artifact_lock_directory_identity(directory_details)
+        try:
+            path_details = lock_dir.stat()
+        except OSError:
+            return None
+        if time.time() - path_details.st_mtime <= 60:
+            return None
+        if not _artifact_lock_directory_path_matches_generation(
+            lock_dir, generation
+        ):
+            return None
+        owner_payload = json.dumps(
+            {"pid": os.getpid(), "token": uuid.uuid4().hex},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+        try:
+            if os.name == "nt":
+                with _create_windows_private_file(
+                    lock_dir / "owner.pid", parent_handle=directory_handle
+                ) as owner_handle:
+                    owner_handle.write(owner_payload)
+                    owner_handle.flush()
+                    os.fsync(owner_handle.fileno())
+            else:
+                flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+                flags |= getattr(os, "O_CLOEXEC", 0) | getattr(
+                    os, "O_NOFOLLOW", 0
+                )
+                fd = os.open(
+                    "owner.pid", flags, 0o600, dir_fd=directory_handle
+                )
+                with os.fdopen(fd, "wb") as owner_handle:
+                    owner_handle.write(owner_payload)
+                    owner_handle.flush()
+                    os.fsync(owner_handle.fileno())
+        except FileExistsError:
+            return None
+        _check_deadline(deadline)
+        return generation
+
+
+def _retire_artifact_lock_directory(
+    lock_dir: Path,
+    suffix: str,
+    expected_identity: tuple[int, int] | None = None,
+    retained_handle: Any | None = None,
+) -> bool:
+    if (
+        expected_identity is not None
+        and not _artifact_lock_directory_path_matches_generation(
+            lock_dir, expected_identity
+        )
+    ):
+        return False
     retired = lock_dir.with_name(f"{lock_dir.name}.released-{suffix}")
     try:
-        os.replace(lock_dir, retired)
+        if os.name == "nt" and retained_handle is not None:
+            _windows_rename_retained_directory(retained_handle, retired)
+        else:
+            os.replace(lock_dir, retired)
     except FileNotFoundError:
         return True
     except OSError:
@@ -1561,6 +1805,49 @@ def _retire_artifact_lock_directory(lock_dir: Path, suffix: str) -> bool:
     except OSError:
         pass
     return True
+
+
+def _windows_rename_retained_directory(
+    directory_handle: Any, destination: Path
+) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    filename = str(destination.resolve(strict=False))
+
+    class FileRenameInfoEx(ctypes.Structure):
+        _fields_ = (
+            ("Flags", wintypes.DWORD),
+            ("RootDirectory", wintypes.HANDLE),
+            ("FileNameLength", wintypes.DWORD),
+            ("FileName", wintypes.WCHAR * (len(filename) + 1)),
+        )
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetFileInformationByHandle.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
+    kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+    information = FileRenameInfoEx()
+    information.Flags = 0x00000002
+    information.RootDirectory = None
+    information.FileNameLength = len(filename.encode("utf-16-le"))
+    information.FileName = filename
+    if not kernel32.SetFileInformationByHandle(
+        directory_handle,
+        22,
+        ctypes.byref(information),
+        FileRenameInfoEx.FileName.offset + information.FileNameLength + 2,
+    ):
+        error = ctypes.get_last_error()
+        if error in {2, 3}:
+            raise FileNotFoundError(
+                error, "Artifact lock generation disappeared"
+            )
+        raise ctypes.WinError(error)
 
 
 def _retire_artifact_lock_file(lock_path: Path, suffix: str) -> bool:
@@ -1638,29 +1925,28 @@ def _publish_artifact_lock_candidate(candidate: Path, lock_path: Path) -> None:
     ntdll.NtSetInformationFile.restype = ctypes.c_long
     ntdll.RtlNtStatusToDosError.argtypes = (ctypes.c_long,)
     ntdll.RtlNtStatusToDosError.restype = wintypes.ULONG
-    with _open_windows_managed_file(
-        candidate, writable=True, verify_private=True
-    ) as (source_handle, details):
-        if details["file_id"] != anchor[6]:
-            raise OrchestratorError("Artifact lock candidate identity changed.")
-        information = FileLinkInformation()
-        information.ReplaceIfExists = 0
-        information.RootDirectory = anchor[3]
-        information.FileNameLength = len(filename.encode("utf-16-le"))
-        information.FileName = filename
-        io_status = IoStatusBlock()
-        status = ntdll.NtSetInformationFile(
-            msvcrt.get_osfhandle(source_handle.fileno()),
-            ctypes.byref(io_status),
-            ctypes.byref(information),
-            ctypes.sizeof(information),
-            11,
-        )
-        if status < 0:
-            error = int(ntdll.RtlNtStatusToDosError(status))
-            if error in {80, 183}:
-                raise FileExistsError(error, "Artifact lock already exists", lock_path)
-            raise OSError(error, "Artifact lock publication failed", lock_path)
+    source_handle = anchor[5]
+    current = os.fstat(source_handle.fileno())
+    if (int(current.st_dev), int(current.st_ino)) != anchor[6]:
+        raise OrchestratorError("Artifact lock candidate identity changed.")
+    information = FileLinkInformation()
+    information.ReplaceIfExists = 0
+    information.RootDirectory = anchor[3]
+    information.FileNameLength = len(filename.encode("utf-16-le"))
+    information.FileName = filename
+    io_status = IoStatusBlock()
+    status = ntdll.NtSetInformationFile(
+        msvcrt.get_osfhandle(source_handle.fileno()),
+        ctypes.byref(io_status),
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+        11,
+    )
+    if status < 0:
+        error = int(ntdll.RtlNtStatusToDosError(status))
+        if error in {80, 183}:
+            raise FileExistsError(error, "Artifact lock already exists", lock_path)
+        raise OSError(error, "Artifact lock publication failed", lock_path)
 
 
 def _reclaim_artifact_lock_for_dead_process(
@@ -1697,22 +1983,32 @@ def _reclaim_artifact_lock_for_dead_process(
             time.sleep(0.005)
             continue
         try:
-            owner_payload = _read_bounded_regular_file(
-                lock_dir / "owner.pid", 256, deadline=deadline
-            )
-            owner_pid, _owner_token = _artifact_lock_owner(owner_payload)
+            with _locked_legacy_artifact_lock_generation(
+                lock_dir, deadline=deadline
+            ) as (directory_handle, directory_details, owner_payload):
+                owner_pid, _owner_token = _artifact_lock_owner(owner_payload)
+                if owner_pid != process_pid:
+                    return False
+                generation = _artifact_lock_directory_identity(
+                    directory_details
+                )
+                if not _artifact_lock_directory_path_matches_generation(
+                    lock_dir, generation
+                ):
+                    continue
+                if _retire_artifact_lock_directory(
+                    lock_dir,
+                    uuid.uuid4().hex,
+                    generation,
+                    directory_handle,
+                ):
+                    return True
         except FileNotFoundError:
-            if _retire_artifact_lock_directory(lock_dir, uuid.uuid4().hex):
-                return True
             time.sleep(0.005)
             continue
         except (OSError, KeyError, TypeError, ValueError):
             time.sleep(0.005)
             continue
-        if owner_pid != process_pid:
-            return False
-        if _retire_artifact_lock_directory(lock_dir, uuid.uuid4().hex):
-            return True
         time.sleep(0.005)
     return not lock_dir.exists()
 
@@ -1814,39 +2110,64 @@ class _ArtifactLock:
                 else:
                     owner_token = None
                     try:
-                        owner_pid, owner_token = _artifact_lock_owner(
-                            _read_bounded_regular_file(
-                                self.lock_dir / "owner.pid",
-                                256,
-                                deadline=deadline,
+                        with _locked_legacy_artifact_lock_generation(
+                            self.lock_dir, deadline=deadline
+                        ) as (
+                            directory_handle,
+                            directory_details,
+                            owner_payload,
+                        ):
+                            owner_pid, owner_token = _artifact_lock_owner(
+                                owner_payload
                             )
-                        )
+                            with _PROCESS_ARTIFACT_LOCK_TOKENS_LOCK:
+                                active_local_token = (
+                                    _PROCESS_ARTIFACT_LOCK_TOKENS.get(key)
+                                )
+                            abandoned = (
+                                owner_pid is not None and not pid_alive(owner_pid)
+                            )
+                            if owner_pid == os.getpid():
+                                abandoned = (
+                                    not owner_token
+                                    or active_local_token != owner_token
+                                )
+                            generation = _artifact_lock_directory_identity(
+                                directory_details
+                            )
+                            if (
+                                abandoned
+                                and _artifact_lock_directory_path_matches_generation(
+                                    self.lock_dir, generation
+                                )
+                            ):
+                                retired = _retire_artifact_lock_directory(
+                                    self.lock_dir,
+                                    uuid.uuid4().hex,
+                                    generation,
+                                    directory_handle,
+                                )
                     except (
                         FileNotFoundError,
                         OSError,
+                        OrchestratorError,
                         KeyError,
                         TypeError,
                         ValueError,
                     ):
                         owner_pid = None
-                    with _PROCESS_ARTIFACT_LOCK_TOKENS_LOCK:
-                        active_local_token = _PROCESS_ARTIFACT_LOCK_TOKENS.get(key)
-                    abandoned = owner_pid is not None and not pid_alive(owner_pid)
-                    if owner_pid == os.getpid():
-                        abandoned = (
-                            not owner_token or active_local_token != owner_token
-                        )
-                    if owner_pid is None:
                         try:
-                            abandoned = (
-                                time.time() - self.lock_dir.stat().st_mtime > 60
+                            generation = _claim_ownerless_legacy_artifact_lock(
+                                self.lock_dir, deadline=deadline
                             )
-                        except OSError:
-                            abandoned = False
-                    if abandoned:
-                        retired = _retire_artifact_lock_directory(
-                            self.lock_dir, uuid.uuid4().hex
-                        )
+                            if generation is not None:
+                                retired = _retire_artifact_lock_directory(
+                                    self.lock_dir,
+                                    uuid.uuid4().hex,
+                                    generation,
+                                )
+                        except (OSError, OrchestratorError):
+                            retired = False
                 if retired:
                     continue
                 if time.monotonic() >= deadline:
@@ -2695,7 +3016,7 @@ def _open_windows_managed_directory(
     kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
     desired_access = 0x80000000 | 0x00020000
     if writable:
-        desired_access |= 0x00040000
+        desired_access |= 0x00040000 | 0x00010000
     native_handle = kernel32.CreateFileW(
         str(path),
         desired_access,
@@ -2912,6 +3233,36 @@ def _set_private_file(path: Path) -> None:
         return
 
 
+def _unlink_managed_file(path: Path) -> None:
+    try:
+        if os.name == "nt":
+            with _open_windows_managed_directory(
+                path.parent, verify_private=False
+            ) as (parent_handle, _details):
+                with _open_windows_relative_managed_file(
+                    parent_handle,
+                    path.name,
+                    writable=True,
+                    verify_private=False,
+                ) as (file_handle, _file_details):
+                    _windows_delete_retained_file(file_handle)
+        else:
+            directory_fd = _open_posix_directory_fd(path.parent)
+            try:
+                details = os.stat(
+                    path.name, dir_fd=directory_fd, follow_symlinks=False
+                )
+                if not stat.S_ISREG(details.st_mode):
+                    raise OrchestratorError(
+                        f"Managed artifact is not a regular file: {path.name}"
+                    )
+                os.unlink(path.name, dir_fd=directory_fd)
+            finally:
+                os.close(directory_fd)
+    except FileNotFoundError:
+        return
+
+
 def _secure_private_writable_handle(handle: Any, path: Path) -> None:
     if os.name == "nt":
         import msvcrt
@@ -2988,7 +3339,195 @@ def _create_windows_private_file(
             kernel32.CloseHandle(native_handle)
 
 
+def _windows_relative_handle_details(native_handle: Any, name: str) -> dict[str, Any]:
+    import ctypes
+    from ctypes import wintypes
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = (
+            ("dwFileAttributes", wintypes.DWORD),
+            ("ftCreationTime", wintypes.FILETIME),
+            ("ftLastAccessTime", wintypes.FILETIME),
+            ("ftLastWriteTime", wintypes.FILETIME),
+            ("dwVolumeSerialNumber", wintypes.DWORD),
+            ("nFileSizeHigh", wintypes.DWORD),
+            ("nFileSizeLow", wintypes.DWORD),
+            ("nNumberOfLinks", wintypes.DWORD),
+            ("nFileIndexHigh", wintypes.DWORD),
+            ("nFileIndexLow", wintypes.DWORD),
+        )
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetFileInformationByHandle.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(ByHandleFileInformation),
+    )
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    information = ByHandleFileInformation()
+    if not kernel32.GetFileInformationByHandle(
+        native_handle, ctypes.byref(information)
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    attributes = int(information.dwFileAttributes)
+    if attributes & _WINDOWS_REPARSE_POINT:
+        raise OrchestratorError(
+            f"Managed artifact links and reparse points are forbidden: {name}"
+        )
+    return {
+        "attributes": attributes,
+        "size": (int(information.nFileSizeHigh) << 32)
+        | int(information.nFileSizeLow),
+        "file_id": (
+            int(information.dwVolumeSerialNumber),
+            (int(information.nFileIndexHigh) << 32)
+            | int(information.nFileIndexLow),
+        ),
+    }
+
+
+@contextlib.contextmanager
+def _open_windows_relative_managed_directory(
+    parent_handle: Any,
+    name: str,
+    *,
+    writable: bool = False,
+    verify_private: bool = False,
+) -> Any:
+    import ctypes
+    from ctypes import wintypes
+
+    native_handle = _open_windows_relative_native_handle(
+        parent_handle, name, writable=writable, is_dir=True
+    )
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    try:
+        details = _windows_relative_handle_details(native_handle, name)
+        if not details["attributes"] & 0x10:
+            raise OrchestratorError(
+                f"Managed artifact is not a directory: {name}"
+            )
+        if writable:
+            _enforce_windows_private_acl_handle(native_handle, is_dir=True)
+        elif verify_private and not _inspect_windows_private_acl_handle(
+            native_handle, is_dir=True
+        )["exact"]:
+            raise OrchestratorError(
+                f"Private Windows ACL verification failed for {name}."
+            )
+        yield native_handle, details
+    finally:
+        kernel32.CloseHandle(native_handle)
+
+
+@contextlib.contextmanager
+def _open_windows_relative_managed_file(
+    parent_handle: Any,
+    name: str,
+    *,
+    writable: bool = False,
+    verify_private: bool = False,
+) -> Any:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    native_handle = _open_windows_relative_native_handle(
+        parent_handle, name, writable=writable, is_dir=False
+    )
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    file_handle: Any | None = None
+    try:
+        details = _windows_relative_handle_details(native_handle, name)
+        if details["attributes"] & 0x10:
+            raise OrchestratorError(
+                f"Managed artifact is not a regular file: {name}"
+            )
+        if details["size"] > MAX_MANAGED_ARTIFACT_BYTES:
+            raise OrchestratorError(
+                f"Managed artifact exceeds its size limit: {name}"
+            )
+        if writable:
+            _enforce_windows_private_acl_handle(native_handle, is_dir=False)
+        elif verify_private and not _inspect_windows_private_acl_handle(
+            native_handle, is_dir=False
+        )["exact"]:
+            raise OrchestratorError(
+                f"Private Windows ACL verification failed for {name}."
+            )
+        flags = os.O_BINARY | (os.O_RDWR if writable else os.O_RDONLY)
+        fd = msvcrt.open_osfhandle(int(native_handle), flags)
+        native_handle = None
+        file_handle = os.fdopen(fd, "r+b" if writable else "rb")
+        yield file_handle, details
+    finally:
+        if file_handle is not None:
+            file_handle.close()
+        elif native_handle is not None:
+            kernel32.CloseHandle(native_handle)
+
+
+def _walk_windows_managed_artifacts(
+    run_dir: Path,
+    *,
+    writable: bool = False,
+    file_action: Any | None = None,
+) -> list[tuple[Path, bool]]:
+    entries: list[tuple[Path, bool]] = []
+    count = 0
+
+    # Keep the prior post-validation swap regression active, then retain the
+    # second capability for the complete traversal.
+    with _open_windows_managed_directory(run_dir, verify_private=False):
+        pass
+
+    def visit(directory_handle: Any, display_dir: Path) -> None:
+        nonlocal count
+        for name in _windows_list_directory_handle(directory_handle):
+            display_path = display_dir / name
+            try:
+                directory_context = _open_windows_relative_managed_directory(
+                    directory_handle,
+                    name,
+                    writable=writable,
+                    verify_private=not writable,
+                )
+                child_handle, _details = directory_context.__enter__()
+            except OSError:
+                directory_context = None
+            if directory_context is not None:
+                try:
+                    entries.append((display_path, True))
+                    visit(child_handle, display_path)
+                finally:
+                    directory_context.__exit__(None, None, None)
+                continue
+            count += 1
+            if count > MAX_MANAGED_ARTIFACT_FILES:
+                raise OrchestratorError(
+                    "Managed artifact file-count limit exceeded."
+                )
+            with _open_windows_relative_managed_file(
+                directory_handle,
+                name,
+                writable=writable,
+                verify_private=not writable,
+            ) as (file_handle, details):
+                entries.append((display_path, False))
+                if file_action is not None:
+                    file_action(display_path, file_handle, details)
+
+    with _open_windows_managed_directory(
+        run_dir, writable=writable, verify_private=not writable
+    ) as (root_handle, root_details):
+        visit(root_handle, Path(str(root_details["final_path"])))
+    return entries
+
+
 def _iter_managed_artifacts(run_dir: Path) -> list[tuple[Path, bool]]:
+    if os.name == "nt":
+        return _walk_windows_managed_artifacts(run_dir)
     entries: list[tuple[Path, bool]] = []
     count = 0
 
@@ -2999,46 +3538,21 @@ def _iter_managed_artifacts(run_dir: Path) -> list[tuple[Path, bool]]:
             directory_details,
         ):
             bound_directory = directory
-            if os.name == "nt":
-                with _open_windows_managed_directory(
-                    directory, verify_private=False
-                ) as (_current_handle, current_details):
-                    if current_details["file_id"] != directory_details["file_id"]:
-                        raise OrchestratorError(
-                            "Managed artifact directory changed after handle acquisition."
-                        )
-                bound_directory = Path(str(directory_details["final_path"]))
-            names = (
-                os.listdir(handle)
-                if os.name != "nt"
-                else _windows_list_directory_handle(handle)
-            )
+            names = os.listdir(handle)
             for name in names:
                 path = bound_directory / name
-                if os.name != "nt":
-                    details = os.stat(
-                        name, dir_fd=handle, follow_symlinks=False
+                details = os.stat(
+                    name, dir_fd=handle, follow_symlinks=False
+                )
+                attributes = int(
+                    getattr(details, "st_file_attributes", 0) or 0
+                )
+                if stat.S_ISLNK(details.st_mode) or attributes & _WINDOWS_REPARSE_POINT:
+                    raise OrchestratorError(
+                        f"Managed artifact links and reparse points are forbidden: {name}"
                     )
-                    attributes = int(
-                        getattr(details, "st_file_attributes", 0) or 0
-                    )
-                    if stat.S_ISLNK(details.st_mode) or attributes & _WINDOWS_REPARSE_POINT:
-                        raise OrchestratorError(
-                            f"Managed artifact links and reparse points are forbidden: {name}"
-                        )
-                    is_dir = stat.S_ISDIR(details.st_mode)
-                    is_file = stat.S_ISREG(details.st_mode)
-                else:
-                    details = path.lstat()
-                    attributes = int(
-                        getattr(details, "st_file_attributes", 0) or 0
-                    )
-                    if stat.S_ISLNK(details.st_mode) or attributes & _WINDOWS_REPARSE_POINT:
-                        raise OrchestratorError(
-                            f"Managed artifact links and reparse points are forbidden: {name}"
-                        )
-                    is_dir = stat.S_ISDIR(details.st_mode)
-                    is_file = stat.S_ISREG(details.st_mode)
+                is_dir = stat.S_ISDIR(details.st_mode)
+                is_file = stat.S_ISREG(details.st_mode)
                 if is_dir:
                     with _open_managed_directory(path, verify_private=False):
                         pass
@@ -3063,6 +3577,9 @@ def _iter_managed_artifacts(run_dir: Path) -> list[tuple[Path, bool]]:
 
 
 def _secure_run_artifacts(run_dir: Path) -> None:
+    if os.name == "nt":
+        _walk_windows_managed_artifacts(run_dir, writable=True)
+        return
     entries = _iter_managed_artifacts(run_dir)
     _set_private_directory(run_dir)
     for path, is_dir in entries:
@@ -3083,6 +3600,30 @@ def _scrub_run_artifacts(
     replacements.discard(b"")
     marker = SCRUBBED_VALUE.encode("utf-8")
     with artifact_lock(run_dir):
+        if os.name == "nt":
+            def scrub_handle(
+                path: Path, handle: Any, _details: Mapping[str, Any]
+            ) -> None:
+                handle.seek(0)
+                payload = handle.read(MAX_MANAGED_ARTIFACT_BYTES + 1)
+                if len(payload) > MAX_MANAGED_ARTIFACT_BYTES:
+                    raise OrchestratorError(
+                        f"Managed artifact exceeds its size limit: {path.name}"
+                    )
+                scrubbed = payload
+                for value in sorted(replacements, key=len, reverse=True):
+                    scrubbed = scrubbed.replace(value, marker)
+                if scrubbed != payload:
+                    handle.seek(0)
+                    handle.write(scrubbed)
+                    handle.truncate()
+                    handle.flush()
+                    os.fsync(handle.fileno())
+
+            _walk_windows_managed_artifacts(
+                run_dir, writable=True, file_action=scrub_handle
+            )
+            return
         for path, is_dir in _iter_managed_artifacts(run_dir):
             if is_dir:
                 continue
@@ -3163,21 +3704,31 @@ def _prepare_private_atomic_write(
         handle.flush()
         os.fsync(handle.fileno())
         _check_deadline(deadline)
-        _verify_private_path(temporary_path, is_dir=False)
-        current_source = temporary_path.stat(follow_symlinks=False)
-        if (int(current_source.st_dev), int(current_source.st_ino)) != parent_anchor[5 if parent_anchor[0] == "posix" else 6]:
-            raise OrchestratorError(
-                "Managed artifact source changed during atomic creation."
+        source_details = os.fstat(handle.fileno())
+        expected_source = parent_anchor[5 if parent_anchor[0] == "posix" else 6]
+        if (int(source_details.st_dev), int(source_details.st_ino)) != expected_source:
+            raise OrchestratorError("Managed artifact source handle changed.")
+        if parent_anchor[0] == "posix":
+            _verify_private_path(temporary_path, is_dir=False)
+            current_source = os.stat(
+                temporary_path.name,
+                dir_fd=parent_anchor[1],
+                follow_symlinks=False,
             )
-        if os.name == "nt":
-            assert parent_anchor is not None
-            with _open_windows_managed_directory(
-                path.parent, verify_private=False
-            ) as (_current_handle, current_details):
-                if current_details["file_id"] != parent_anchor[2]:
-                    raise OrchestratorError(
-                        "Managed artifact parent changed during atomic creation."
-                    )
+            if (int(current_source.st_dev), int(current_source.st_ino)) != expected_source:
+                raise OrchestratorError(
+                    "Managed artifact source changed during atomic creation."
+                )
+        else:
+            import msvcrt
+
+            native_source = msvcrt.get_osfhandle(handle.fileno())
+            if not _inspect_windows_private_acl_handle(
+                native_source, is_dir=False
+            )["exact"]:
+                raise OrchestratorError(
+                    "Managed artifact source ACL changed during atomic creation."
+                )
         prepared = temporary_path
         assert parent_anchor is not None
         with _PREPARED_ATOMIC_PARENTS_LOCK:
@@ -3238,30 +3789,61 @@ def _windows_replace_relative(
         anchor = _PREPARED_ATOMIC_PARENTS.get(str(temporary_path))
     if anchor is None or anchor[0] != "windows":
         raise OrchestratorError("Atomic artifact source handle is unavailable.")
-    with _open_windows_managed_file(
-        temporary_path, writable=True, verify_private=True
-    ) as (current_handle, details):
-        if details["file_id"] != anchor[6]:
-            raise OrchestratorError("Atomic artifact source identity changed.")
-        information = FileRenameInformation()
-        information.ReplaceIfExists = 1
-        information.RootDirectory = parent_handle
-        information.FileNameLength = len(filename.encode("utf-16-le"))
-        information.FileName = filename
-        native_handle = msvcrt.get_osfhandle(current_handle.fileno())
-        io_status = IoStatusBlock()
-        status = ntdll.NtSetInformationFile(
-            native_handle,
-            ctypes.byref(io_status),
-            ctypes.byref(information),
-            ctypes.sizeof(information),
-            10,
-        )
-        if status < 0:
-            error = int(ntdll.RtlNtStatusToDosError(status))
-            if error in {5, 32, 33}:
-                raise PermissionError(error, "Atomic artifact replacement failed")
-            raise OSError(error, "Atomic artifact replacement failed")
+    retained_handle = anchor[5]
+    retained_details = os.fstat(retained_handle.fileno())
+    if (int(retained_details.st_dev), int(retained_details.st_ino)) != anchor[6]:
+        raise OrchestratorError("Atomic artifact source identity changed.")
+    native_handle = msvcrt.get_osfhandle(retained_handle.fileno())
+    if not _inspect_windows_private_acl_handle(
+        native_handle, is_dir=False
+    )["exact"]:
+        raise OrchestratorError("Atomic artifact source ACL changed.")
+    information = FileRenameInformation()
+    information.ReplaceIfExists = 1
+    information.RootDirectory = parent_handle
+    information.FileNameLength = len(filename.encode("utf-16-le"))
+    information.FileName = filename
+    io_status = IoStatusBlock()
+    status = ntdll.NtSetInformationFile(
+        native_handle,
+        ctypes.byref(io_status),
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+        10,
+    )
+    if status < 0:
+        error = int(ntdll.RtlNtStatusToDosError(status))
+        if error in {5, 32, 33}:
+            raise PermissionError(error, "Atomic artifact replacement failed")
+        raise OSError(error, "Atomic artifact replacement failed")
+
+
+def _windows_delete_retained_file(handle: Any) -> None:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class FileDispositionInfo(ctypes.Structure):
+        _fields_ = (("DeleteFile", wintypes.BOOLEAN),)
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetFileInformationByHandle.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
+    kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+    disposition = FileDispositionInfo(1)
+    if not kernel32.SetFileInformationByHandle(
+        msvcrt.get_osfhandle(handle.fileno()),
+        4,
+        ctypes.byref(disposition),
+        ctypes.sizeof(disposition),
+    ):
+        error = ctypes.get_last_error()
+        if error not in {2, 3}:
+            raise ctypes.WinError(error)
 
 
 def _posix_replace_relative(
@@ -3342,13 +3924,6 @@ def _replace_prepared_atomic_write(
                     os.fsync(directory_fd)
                     _posix_replace_relative(temporary_path, path, directory_fd)
                 else:
-                    with _open_windows_managed_directory(
-                        path.parent, verify_private=False
-                    ) as (_current_handle, current_details):
-                        if current_details["file_id"] != parent_anchor[2]:
-                            raise OrchestratorError(
-                                "Managed artifact parent changed before replacement."
-                            )
                     _windows_replace_relative(
                         temporary_path, path, parent_anchor[3]
                     )
@@ -3391,24 +3966,13 @@ def _discard_prepared_atomic_write(temporary_path: Path | None) -> None:
             except FileNotFoundError:
                 pass
         elif parent_anchor is not None:
-            parent_matches = False
             try:
-                with _open_windows_managed_directory(
-                    temporary_path.parent, verify_private=False
-                ) as (_current_handle, current_details):
-                    parent_matches = current_details["file_id"] == parent_anchor[2]
-            except Exception:
-                parent_matches = False
-            if parent_matches:
-                try:
-                    with _open_windows_managed_file(
-                        temporary_path, writable=True, verify_private=True
-                    ) as (_current_handle, current_details):
-                        source_matches = current_details["file_id"] == parent_anchor[6]
-                    if source_matches:
-                        temporary_path.unlink()
-                except FileNotFoundError:
-                    pass
+                retained = parent_anchor[5]
+                current = os.fstat(retained.fileno())
+                if (int(current.st_dev), int(current.st_ino)) == parent_anchor[6]:
+                    _windows_delete_retained_file(retained)
+            except FileNotFoundError:
+                pass
         else:
             try:
                 temporary_path.unlink()
@@ -3587,8 +4151,7 @@ def parse_porcelain_status(raw: str) -> list[dict[str, str]]:
         path = entry[3:] if len(entry) > 3 else ""
         old_path = ""
         if status.strip() and status[0] in {"R", "C"} and idx < len(parts):
-            old_path = path
-            path = parts[idx]
+            old_path = parts[idx]
             idx += 1
         if path:
             item = {"status": status.strip() or "modified", "path": path.replace("\\", "/")}
@@ -3845,18 +4408,84 @@ def _parse_index_entries(raw: str) -> dict[str, list[str]]:
     return entries
 
 
-def _diff_change_records(diff_text: str) -> set[tuple[str, str, str, int]]:
+def _parse_nul_name_status(raw: str) -> list[dict[str, str]]:
+    parts = raw.split("\0")
+    items: list[dict[str, str]] = []
+    index = 0
+    while index < len(parts):
+        status = parts[index]
+        index += 1
+        if not status:
+            continue
+        if index >= len(parts):
+            raise OrchestratorError("Git name-status evidence is incomplete.")
+        path = parts[index]
+        index += 1
+        item = {
+            "status": status,
+            "path": path.replace("\\", "/"),
+        }
+        if status[:1] in {"R", "C"}:
+            if index >= len(parts):
+                raise OrchestratorError(
+                    "Git rename name-status evidence is incomplete."
+                )
+            item["old_path"] = path.replace("\\", "/")
+            item["path"] = parts[index].replace("\\", "/")
+            index += 1
+        items.append(item)
+    return items
+
+
+def _parse_nul_numstat_paths(raw: str) -> list[str]:
+    parts = raw.split("\0")
+    paths: list[str] = []
+    index = 0
+    while index < len(parts):
+        record = parts[index]
+        index += 1
+        if not record:
+            continue
+        fields = record.split("\t", 2)
+        if len(fields) != 3:
+            raise OrchestratorError("Git numstat evidence is malformed.")
+        path = fields[2]
+        if path:
+            paths.append(path.replace("\\", "/"))
+            continue
+        if index + 1 >= len(parts):
+            raise OrchestratorError("Git rename numstat evidence is incomplete.")
+        _old_path = parts[index]
+        new_path = parts[index + 1]
+        index += 2
+        paths.append(new_path.replace("\\", "/"))
+    return paths
+
+
+def _diff_change_records(
+    diff_text: str, structured_paths: list[str] | tuple[str, ...] = ()
+) -> set[tuple[str, str, str, int]]:
     records: set[tuple[str, str, str, int]] = set()
     occurrences: dict[tuple[str, str, str], int] = {}
     current_path = ""
+    path_index = 0
+    path_is_structured = False
     for line in diff_text.splitlines():
         if line.startswith("diff --git "):
-            current_path = ""
+            if path_index < len(structured_paths):
+                current_path = str(structured_paths[path_index]).replace(
+                    "\\", "/"
+                )
+                path_index += 1
+                path_is_structured = True
+            else:
+                current_path = ""
+                path_is_structured = False
             continue
-        if line.startswith("+++ b/"):
+        if not path_is_structured and line.startswith("+++ b/"):
             current_path = line[6:].replace("\\", "/")
             continue
-        if line.startswith("--- a/"):
+        if not path_is_structured and line.startswith("--- a/"):
             current_path = line[6:].replace("\\", "/")
             continue
         if line.startswith("+") and not line.startswith("+++"):
@@ -3895,16 +4524,17 @@ def _git_transition_evidence(
             errors.append(f"{label}_transition")
             return
         output = diff.stdout or ""
-        named = {
+        named_list = [
             item.replace("\\", "/")
             for item in (names.stdout or "").split("\0")
             if item
-        }
+        ]
+        named = set(named_list)
         if not named and old != new:
             errors.append(f"{label}_transition_unattributed")
             return
         paths.update(named)
-        changes.update(_diff_change_records(output))
+        changes.update(_diff_change_records(output, named_list))
 
     before_head = before.get("_raw_head", before.get("head"))
     after_head = after.get("_raw_head", after.get("head"))
@@ -3930,8 +4560,14 @@ def _git_transition_evidence(
                 paths.add(str(path).replace("\\", "/"))
     else:
         errors.append("index_entries")
-    before_worktree = _diff_change_records(str(before.get("_raw_diff_text") or ""))
-    after_worktree = _diff_change_records(str(after.get("_raw_diff_text") or ""))
+    before_worktree = _diff_change_records(
+        str(before.get("_raw_diff_text") or ""),
+        list(before.get("_raw_diff_paths") or []),
+    )
+    after_worktree = _diff_change_records(
+        str(after.get("_raw_diff_text") or ""),
+        list(after.get("_raw_diff_paths") or []),
+    )
     changes.update(after_worktree ^ before_worktree)
     before_hashes = before.get("_raw_hashes") or {}
     after_hashes = after.get("_raw_hashes") or {}
@@ -5764,6 +6400,9 @@ def prepare_worker_launch(
     sensitive_values: tuple[str, ...] = (),
     admission_reservation: _LaunchAdmissionReservation | None = None,
 ) -> PreparedWorkerLaunch:
+    _check_deadline(
+        message="Runtime launch preparation exceeded the transaction deadline."
+    )
     if mode not in {"one_shot", "streaming"}:
         raise OrchestratorError("Launch mode must be one_shot or streaming.")
     if isinstance(prompt, str):
@@ -5794,8 +6433,14 @@ def prepare_worker_launch(
         ) from exc
     artifacts = Path(artifact_root).expanduser().resolve()
     policy = load_runtime_security_policy()
+    _check_deadline(
+        message="Runtime policy resolution exceeded the transaction deadline."
+    )
     _reject_provider_baseline_overrides(provider_env)
     candidate = resolve_runtime_candidate(policy)
+    _check_deadline(
+        message="Runtime executable resolution exceeded the transaction deadline."
+    )
     launch_spec = build_runtime_launch_spec(
         runtime_candidate=candidate,
         provider_env=provider_env,
@@ -5808,6 +6453,9 @@ def prepare_worker_launch(
         arguments=arguments,
         policy=policy,
         allow_unsafe_runtime=allow_unsafe_runtime,
+    )
+    _check_deadline(
+        message="Runtime executable hashing exceeded the transaction deadline."
     )
     launch_spec = _with_controller_environment_baseline(launch_spec)
     frame = launch_spec.private_frame()
@@ -6039,7 +6687,11 @@ def capture_git_snapshot(
             "index_tree": ["write-tree"],
             "index_entries": ["ls-files", "--stage", "-v", "-z"],
             "diff": ["diff", "--binary", "--", "."],
+            "diff_numstat": ["diff", "--numstat", "-z", "--", "."],
             "staged_diff": ["diff", "--cached", "--binary", "--", "."],
+            "staged_diff_numstat": [
+                "diff", "--cached", "--numstat", "-z", "--", "."
+            ],
             "status": ["status", "--short"],
             "porcelain": ["status", "--porcelain=v1", "-z"],
             "staged_status": ["diff", "--cached", "--name-status", "-z", "--", "."],
@@ -6110,14 +6762,16 @@ def capture_git_snapshot(
             else []
         )
         changed_paths = status_paths(status_items)
-        staged_raw = processes["staged_status"].stdout or ""
-        staged_parts = [part for part in staged_raw.split("\0") if part]
-        staged_paths: list[str] = []
-        for index, part in enumerate(staged_parts):
-            if index % 2 == 1:
-                staged_paths.append(part.replace("\\", "/"))
-            elif "\t" in part:
-                staged_paths.append(part.split("\t", 1)[1].replace("\\", "/"))
+        staged_items = _parse_nul_name_status(
+            processes["staged_status"].stdout or ""
+        )
+        staged_paths = status_paths(staged_items)
+        diff_paths = _parse_nul_numstat_paths(
+            processes["diff_numstat"].stdout or ""
+        )
+        staged_diff_paths = _parse_nul_numstat_paths(
+            processes["staged_diff_numstat"].stdout or ""
+        )
         untracked_paths = [
             part.replace("\\", "/")
             for part in (processes["untracked"].stdout or "").split("\0")
@@ -6229,7 +6883,9 @@ def capture_git_snapshot(
                 [*evidence_errors, *command_errors], sensitive_values
             ),
             "_raw_diff_text": raw_diff,
+            "_raw_diff_paths": diff_paths,
             "_raw_staged_diff_text": raw_staged_diff,
+            "_raw_staged_diff_paths": staged_diff_paths,
             "_raw_changed_paths": changed_paths,
             "_raw_status_items": status_items,
             "_raw_staged_paths": staged_paths,
@@ -6357,6 +7013,117 @@ def _cleanup_pending_response(
         },
         sensitive_values,
     )
+
+
+def _complete_isolated_worker_cleanup(
+    run_dir: Path,
+    metadata: Mapping[str, Any],
+    pending: _OwnedCleanupPending,
+) -> dict[str, Any]:
+    """Keep the isolated worker responsible until process and threads are gone."""
+    process = pending.process
+    threads = tuple(
+        thread
+        for thread in pending.threads
+        if thread is not threading.current_thread()
+    )
+    inherited_deadline = _effective_deadline()
+    live_names = [thread.name for thread in threads if thread.is_alive()]
+    durable_token = _OPERATION_DEADLINE.set(None)
+    try:
+        pending_state = {
+            "status": "cleanup_pending",
+            "cleanup_state": "owned_worker_cleanup",
+            "owned_process_pid": process.pid,
+            "live_cleanup_threads": live_names,
+            "terminal_state_count": 0,
+            "persisted": True,
+            "persistence_state": "persisted",
+        }
+        try:
+            current = update_metadata(run_dir, **pending_state)
+            append_event(
+                run_dir,
+                {
+                    "type": "cleanup_pending",
+                    "status": "cleanup_pending",
+                    "owned_process_pid": process.pid,
+                    "live_cleanup_threads": live_names,
+                },
+            )
+        except Exception:
+            current = {**dict(metadata), **pending_state}
+            current.update(
+                {"persisted": False, "persistence_state": "degraded"}
+            )
+    finally:
+        _OPERATION_DEADLINE.reset(durable_token)
+
+    if process.poll() is None:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+        remaining = _remaining_deadline(inherited_deadline, 5.0)
+        if remaining > 0:
+            try:
+                process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                pass
+    if process.poll() is None:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        # Durable ownership means this worker remains alive until the owned
+        # handle confirms reaping; no daemon-only handoff is claimed.
+        try:
+            process.wait()
+        except OSError:
+            pass
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+    for thread in threads:
+        thread.join()
+
+    durable_token = _OPERATION_DEADLINE.set(None)
+    try:
+        _unlink_managed_file(run_dir / "pid.txt")
+        confirmed_updates = {
+            "status": "blocked_runtime_launch",
+            "cleanup_state": "cleanup_confirmed",
+            "owned_process_pid": process.pid,
+            "live_cleanup_threads": [],
+            "finished_at": utc_now_iso(),
+            "exit_code": None,
+            "terminal_state_count": 1,
+            "persisted": True,
+            "persistence_state": "persisted",
+        }
+        try:
+            confirmed = update_metadata(run_dir, **confirmed_updates)
+            append_event(
+                run_dir,
+                {
+                    "type": "cleanup_confirmed",
+                    "status": "blocked_runtime_launch",
+                    "owned_process_pid": process.pid,
+                },
+            )
+            return confirmed
+        except Exception:
+            return {
+                **current,
+                **confirmed_updates,
+                "persisted": False,
+                "persistence_state": "degraded",
+            }
+    finally:
+        _OPERATION_DEADLINE.reset(durable_token)
 
 
 def _terminate_owned_process(
@@ -6677,10 +7444,6 @@ def _start_one_shot_launch_inner(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        started_monotonic = time.monotonic()
-        runtime_deadline = _runtime_execution_deadline(
-            launch_deadline, started_monotonic
-        )
     except OSError:
         return _record_blocked_launch(
             run_dir,
@@ -6692,12 +7455,20 @@ def _start_one_shot_launch_inner(
             ),
         )
     try:
+        started_monotonic = time.monotonic()
+        runtime_deadline = _runtime_execution_deadline(
+            launch_deadline, started_monotonic
+        )
         try:
             child_identity = capture_process_identity(
                 process.pid, launch_nonce=spec.launch_nonce
             )
             _validate_started_identity(
                 child_identity, identity, process_kind="runtime child"
+            )
+            _check_deadline(
+                launch_deadline,
+                "Runtime identity validation exceeded the launch deadline.",
             )
         except (OSError, TypeError, ValueError, RuntimeSecurityError) as exc:
             if not _terminate_owned_process(process, deadline=launch_deadline):
@@ -6998,6 +7769,7 @@ def start_prepared_worker_launch(
         _OPERATION_DEADLINE.reset(token)
 
 
+@_guard_public_launch_transaction(timeout_position=5)
 def run_agent(
     task: str,
     role: str = "implementation",
@@ -7013,7 +7785,13 @@ def run_agent(
     if not isinstance(task, str) or not task.strip():
         raise OrchestratorError("Task cannot be empty.")
     route = resolve_route(role=role, task_type=task_type, profile=profile)
+    _check_deadline(
+        message="Route resolution exceeded the launch transaction deadline."
+    )
     provider = get_provider(route["profile"])
+    _check_deadline(
+        message="Provider resolution exceeded the launch transaction deadline."
+    )
     model_policy = load_json(POLICY_PATH)
     default_write = bool(
         model_policy.get("safety", {}).get("default_write_enabled", False)
@@ -7031,6 +7809,9 @@ def run_agent(
     paths = _guarded_launch_paths(effective_cwd)
     prompt = build_prompt(
         role, task, context, artifact_root=paths["artifact_root"]
+    )
+    _check_deadline(
+        message="Prompt construction exceeded the launch transaction deadline."
     )
     prepared = prepare_worker_launch(
         mode="one_shot",
@@ -7068,6 +7849,9 @@ def run_agent(
         allow_unsafe_runtime=allow_unsafe_runtime,
         selected_model=selected_model,
         sensitive_values=(task, context or ""),
+    )
+    _check_deadline(
+        message="Runtime preparation exceeded the launch transaction deadline."
     )
     return start_prepared_worker_launch(prepared)
 
@@ -7391,6 +8175,7 @@ def _start_streaming_controller(
                 pass
 
 
+@_guard_public_launch_transaction(timeout_position=6)
 def run_streaming_agent(
     task: str,
     role: str = "implementation",
@@ -7417,7 +8202,13 @@ def run_streaming_agent(
     if not isinstance(task, str) or not task.strip():
         raise OrchestratorError("Task cannot be empty.")
     route = resolve_route(role=role, task_type=task_type, profile=profile)
+    _check_deadline(
+        message="Route resolution exceeded the launch transaction deadline."
+    )
     provider = get_provider(route["profile"])
+    _check_deadline(
+        message="Provider resolution exceeded the launch transaction deadline."
+    )
     model_policy = load_json(POLICY_PATH)
     default_write = bool(
         model_policy.get("safety", {}).get("default_write_enabled", False)
@@ -7457,6 +8248,9 @@ def run_streaming_agent(
     paths = _guarded_launch_paths(effective_cwd)
     prompt = build_prompt(
         role, task, context, artifact_root=paths["artifact_root"]
+    )
+    _check_deadline(
+        message="Prompt construction exceeded the launch transaction deadline."
     )
     arguments = ["-p", "--output-format", "stream-json", "--verbose"]
     if include_partial_messages:
@@ -7506,6 +8300,9 @@ def run_streaming_agent(
         skip_cost_guard=skip_cost_guard,
         sensitive_values=(task, context or ""),
         admission_reservation=_admission_reservation,
+    )
+    _check_deadline(
+        message="Runtime preparation exceeded the launch transaction deadline."
     )
     return start_prepared_worker_launch(prepared)
 
@@ -7737,8 +8534,12 @@ def _mark_team_worker_ready(
             not isinstance(public, Mapping)
             or not isinstance(worker_launch, Mapping)
             or public.get("launch_nonce") != nonce
-            or worker_launch.get("nonce_consumed") is not False
+            or worker_launch.get("nonce_consumed") is not True
             or worker_launch.get("start_gate") != "closed"
+            or worker_launch.get("team_preflight_complete") is not True
+            or not worker_launch.get("scope_policy_identity")
+            or not isinstance(metadata.get("git_before"), Mapping)
+            or not metadata["git_before"].get("evidence_complete")
         ):
             raise _runtime_not_trusted(
                 "Internal worker launch nonce is unavailable."
@@ -7767,6 +8568,75 @@ def _mark_team_worker_ready(
         return metadata
 
 
+def _complete_team_worker_preflight(
+    run_dir: Path,
+    nonce: str,
+    pinned_scope: Mapping[str, Any],
+) -> dict[str, Any]:
+    with artifact_lock(run_dir):
+        metadata = read_metadata(run_dir)
+        public = metadata.get("runtime_launch")
+        worker_launch = metadata.get("worker_launch")
+        git_before = metadata.get("git_before")
+        if (
+            str(metadata.get("status") or "") not in {"starting", "running"}
+            or not isinstance(public, Mapping)
+            or public.get("launch_nonce") != nonce
+            or not isinstance(worker_launch, Mapping)
+            or worker_launch.get("nonce_consumed") is not True
+            or not isinstance(git_before, Mapping)
+            or not git_before.get("evidence_complete")
+        ):
+            raise _runtime_not_trusted(
+                "Team member preflight evidence is incomplete."
+            )
+        scope_identity = pinned_scope.get("sha256")
+        if not isinstance(scope_identity, str) or not scope_identity:
+            scope_identity = "absent"
+        updated_launch = dict(worker_launch)
+        updated_launch.update(
+            {
+                "team_preflight_complete": True,
+                "team_preflight_completed_at": utc_now_iso(),
+                "scope_policy_identity": scope_identity,
+            }
+        )
+        metadata["worker_launch"] = updated_launch
+        _atomic_write_bytes(run_dir / "metadata.json", _metadata_bytes(metadata))
+    return _mark_team_worker_ready(run_dir, nonce)
+
+
+def _wait_for_team_authorization(
+    run_dir: Path, metadata: Mapping[str, Any]
+) -> dict[str, Any]:
+    operation_deadline = _effective_deadline()
+    if operation_deadline is None:
+        raise _runtime_not_trusted(
+            "Streaming transaction deadline is unavailable."
+        )
+    gate_deadline: float | None = None
+    while True:
+        latest = read_metadata(run_dir)
+        if str(latest.get("status") or "") not in {"starting", "running"}:
+            raise _runtime_not_trusted(
+                "Controller closed the team authorization gate."
+            )
+        if _team_start_barrier_ready(latest):
+            return latest
+        if gate_deadline is None and _team_all_members_ready(latest):
+            gate_deadline = (
+                time.monotonic() + WORKER_START_GATE_TIMEOUT_SECONDS
+            )
+        effective = operation_deadline
+        if gate_deadline is not None:
+            effective = min(effective, gate_deadline)
+        if time.monotonic() >= effective:
+            raise _runtime_not_trusted(
+                "Team authorization gate did not open in time."
+            )
+        time.sleep(min(0.01, max(0.001, effective - time.monotonic())))
+
+
 def _team_all_members_ready(metadata: Mapping[str, Any]) -> bool:
     manifest = _team_manifest_payload(metadata)
     if manifest is None or manifest.get("status") not in {"prepared", "authorized"}:
@@ -7790,6 +8660,9 @@ def _team_all_members_ready(metadata: Mapping[str, Any]) -> bool:
             or str(member.get("status") or "") not in {"starting", "running"}
             or not isinstance(launch, Mapping)
             or launch.get("team_ready") is not True
+            or launch.get("nonce_consumed") is not True
+            or launch.get("team_preflight_complete") is not True
+            or not launch.get("scope_policy_identity")
         ):
             return False
     return True
@@ -7831,6 +8704,8 @@ def _team_start_barrier_ready(metadata: Mapping[str, Any]) -> bool:
             or str(member.get("status") or "") not in {"starting", "running"}
             or not isinstance(launch, Mapping)
             or launch.get("team_ready") is not True
+            or launch.get("nonce_consumed") is not True
+            or launch.get("team_preflight_complete") is not True
             or item.get("worker_pid") != recorded.pid
             or item.get("worker_creation_token") != recorded.creation_token
         ):
@@ -7877,26 +8752,17 @@ def _consume_worker_nonce(run_dir: Path, nonce: str) -> dict[str, Any]:
     )
     initial = read_metadata(run_dir)
     team_launch = bool(initial.get("team_id"))
-    if team_launch:
-        _mark_team_worker_ready(run_dir, nonce)
-        gate_deadline: float | None = None
-    else:
+    if not team_launch:
         gate_deadline = (
             time.monotonic() + WORKER_START_GATE_TIMEOUT_SECONDS
         )
-    while True:
-        latest = read_metadata(run_dir)
-        status = str(latest.get("status") or "")
-        if status not in {"starting", "running"}:
-            raise _runtime_not_trusted("Controller closed the worker start gate.")
-        if latest.get("team_id"):
-            if _team_start_barrier_ready(latest):
-                break
-            if gate_deadline is None and _team_all_members_ready(latest):
-                gate_deadline = (
-                    time.monotonic() + WORKER_START_GATE_TIMEOUT_SECONDS
+        while True:
+            latest = read_metadata(run_dir)
+            status = str(latest.get("status") or "")
+            if status not in {"starting", "running"}:
+                raise _runtime_not_trusted(
+                    "Controller closed the worker start gate."
                 )
-        else:
             try:
                 _read_worker_start_gate(run_dir)
             except FileNotFoundError:
@@ -7908,14 +8774,12 @@ def _consume_worker_nonce(run_dir: Path, nonce: str) -> dict[str, Any]:
                     raise _runtime_not_trusted("Worker start gate is invalid.") from exc
             else:
                 break
-        effective_gate_deadline = operation_deadline
-        if gate_deadline is not None:
-            effective_gate_deadline = min(
-                effective_gate_deadline, gate_deadline
-            )
-        if time.monotonic() >= effective_gate_deadline:
-            raise _runtime_not_trusted("Worker start gate did not open in time.")
-        time.sleep(0.01)
+            effective_gate_deadline = min(operation_deadline, gate_deadline)
+            if time.monotonic() >= effective_gate_deadline:
+                raise _runtime_not_trusted(
+                    "Worker start gate did not open in time."
+                )
+            time.sleep(0.01)
     with artifact_lock(run_dir):
         metadata = read_metadata(run_dir)
         team_launch = bool(metadata.get("team_id"))
@@ -7954,10 +8818,7 @@ def _consume_worker_nonce(run_dir: Path, nonce: str) -> dict[str, Any]:
             raise _runtime_not_trusted(
                 "Controller worker identity ownership does not match this process."
             )
-        if team_launch:
-            if not _team_own_authorization_ready(metadata):
-                raise _runtime_not_trusted("Team authorization gate is invalid.")
-        elif (
+        if not team_launch and (
             not isinstance(gate, Mapping)
             or gate.get("state") != "open"
             or gate.get("run_id") != run_dir.name
@@ -8153,6 +9014,21 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
                 "The write-scope policy could not be pinned before runtime launch.",
             ),
         )
+    if metadata.get("team_id"):
+        try:
+            metadata = _complete_team_worker_preflight(
+                run_dir, nonce, pinned_scope
+            )
+            metadata = _wait_for_team_authorization(run_dir, metadata)
+        except RuntimeSecurityError as error:
+            return _worker_security_failure(run_dir, error)
+        except Exception:
+            return _worker_security_failure(
+                run_dir,
+                _runtime_not_trusted(
+                    "Team member preflight or authorization could not be verified."
+                ),
+            )
     creationflags = 0
     popen_kwargs: dict[str, Any] = {}
     if os.name == "nt":
@@ -8193,10 +9069,6 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
             creationflags=creationflags,
             **popen_kwargs,
         )
-        started_monotonic = time.monotonic()
-        runtime_deadline = _runtime_execution_deadline(
-            launch_deadline, started_monotonic
-        )
     except OSError:
         return _record_blocked_launch(
             run_dir,
@@ -8208,6 +9080,10 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
             ),
         )
     try:
+        started_monotonic = time.monotonic()
+        runtime_deadline = _runtime_execution_deadline(
+            launch_deadline, started_monotonic
+        )
         io_cancel = threading.Event()
         io_errors: queue.Queue[tuple[str, BaseException]] = queue.Queue()
         stdout_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=64)
@@ -8348,7 +9224,7 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
         if cleanup_pending.is_set() or any(
             thread.is_alive() for thread in started_io_threads
         ):
-            raise _OwnedCleanupPending(proc)
+            raise _OwnedCleanupPending(proc, started_io_threads)
         raise
 
     def cleanup_initial_io() -> None:
@@ -8373,13 +9249,17 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
                 except queue.Empty:
                     break
         if cleanup_pending.is_set() or proc.poll() is None:
-            raise _OwnedCleanupPending(proc)
+            raise _OwnedCleanupPending(proc, started_io_threads)
 
     try:
         try:
             child_identity = capture_process_identity(proc.pid, launch_nonce=nonce)
             _validate_started_identity(
                 child_identity, executable_identity, process_kind="runtime child"
+            )
+            _check_deadline(
+                launch_deadline,
+                "Runtime identity validation exceeded the launch deadline.",
             )
             if not executable_identity.matches_current_file():
                 raise _runtime_identity_changed(executable_identity.canonical_path)
@@ -8668,11 +9548,11 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
             io_cancel.set()
             io_errors.put((source, exc))
 
-    threads = [
-        threading.Thread(target=run_with_deadline, args=(pump, stdout_queue, run_dir / "stdout.txt", "stdout"), daemon=True),
-        threading.Thread(target=run_with_deadline, args=(pump, stderr_queue, run_dir / "stderr.txt", "stderr"), daemon=True),
-    ]
     try:
+        threads = [
+            threading.Thread(target=run_with_deadline, args=(pump, stdout_queue, run_dir / "stdout.txt", "stdout"), daemon=True),
+            threading.Thread(target=run_with_deadline, args=(pump, stderr_queue, run_dir / "stderr.txt", "stderr"), daemon=True),
+        ]
         for thread in threads:
             thread.start()
             started_io_threads.append(thread)
@@ -8690,7 +9570,7 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
             if remaining > 0:
                 thread.join(timeout=remaining)
         if cleanup_pending.is_set() or proc.poll() is None:
-            raise _OwnedCleanupPending(proc)
+            raise _OwnedCleanupPending(proc, started_io_threads)
         raise
 
     timed_out = False
@@ -8783,9 +9663,9 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
             thread.name for thread in started_io_threads if thread.is_alive()
         ]
         if alive_threads:
-            raise _OwnedCleanupPending(proc)
+            raise _OwnedCleanupPending(proc, started_io_threads)
         if cleanup_pending.is_set() or proc.poll() is None:
-            raise _OwnedCleanupPending(proc)
+            raise _OwnedCleanupPending(proc, started_io_threads)
 
     while True:
         try:
@@ -8867,13 +9747,18 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
             if not scope_check.get("ok", True)
             else "pending_controller_review"
         ),
+        status="running",
+    )
+    _scrub_run_artifacts(run_dir, sensitive_values)
+    _secure_run_artifacts(run_dir)
+    final_metadata = update_metadata(
+        run_dir,
         status=status,
         finished_at=utc_now_iso(),
         exit_code=final_exit,
     )
-    _scrub_run_artifacts(run_dir, sensitive_values)
-    _secure_run_artifacts(run_dir)
-    return _scrub_guarded_value(read_metadata(run_dir), sensitive_values)
+    _set_private_file(run_dir / "metadata.json")
+    return _scrub_guarded_value(final_metadata, sensitive_values)
 
 
 def stream_worker(run_id: str) -> dict[str, Any]:
@@ -8882,14 +9767,19 @@ def stream_worker(run_id: str) -> dict[str, Any]:
         initial = read_metadata(run_dir)
     except Exception:
         initial = {"run_id": run_id}
-    timeout = int(initial.get("timeout_seconds") or 1800)
     recorded_deadline = initial.get("transaction_deadline_monotonic")
-    deadline = (
-        float(recorded_deadline)
-        if isinstance(recorded_deadline, (int, float))
-        and not isinstance(recorded_deadline, bool)
-        else time.monotonic() + timeout
-    )
+    if (
+        not isinstance(recorded_deadline, (int, float))
+        or isinstance(recorded_deadline, bool)
+        or not math.isfinite(float(recorded_deadline))
+    ):
+        return _worker_security_failure(
+            run_dir,
+            _runtime_not_trusted(
+                "Inherited streaming transaction deadline evidence is missing or invalid."
+            ),
+        )
+    deadline = float(recorded_deadline)
     token = _OPERATION_DEADLINE.set(deadline)
     try:
         try:
@@ -8899,12 +9789,18 @@ def stream_worker(run_id: str) -> dict[str, Any]:
                 latest = read_metadata(run_dir)
             except Exception:
                 latest = initial
-            return _cleanup_pending_response(latest, pending.process)
+            return _complete_isolated_worker_cleanup(
+                run_dir, latest, pending
+            )
         except Exception:
             try:
                 latest = read_metadata(run_dir)
             except Exception:
                 latest = initial
+            try:
+                _unlink_managed_file(run_dir / "pid.txt")
+            except Exception:
+                pass
             return _record_blocked_launch(
                 run_dir,
                 latest,
@@ -9205,6 +10101,11 @@ def _validate_team_authorization_manifest(
             or member.get("terminal_state_count")
             or not isinstance(launch, Mapping)
             or launch.get("team_ready") is not True
+            or launch.get("nonce_consumed") is not True
+            or launch.get("team_preflight_complete") is not True
+            or not launch.get("scope_policy_identity")
+            or not isinstance(member.get("git_before"), Mapping)
+            or not member["git_before"].get("evidence_complete")
             or owned is None
             or owned.pid != recorded.pid
             or owned.poll() is not None
@@ -9368,7 +10269,15 @@ def _wait_for_team_members_ready(
                     f"Team member {run_id} worker ownership changed before readiness."
                 )
             launch = member.get("worker_launch")
-            if not isinstance(launch, Mapping) or launch.get("team_ready") is not True:
+            if (
+                not isinstance(launch, Mapping)
+                or launch.get("team_ready") is not True
+                or launch.get("nonce_consumed") is not True
+                or launch.get("team_preflight_complete") is not True
+                or not launch.get("scope_policy_identity")
+                or not isinstance(member.get("git_before"), Mapping)
+                or not member["git_before"].get("evidence_complete")
+            ):
                 pending = True
                 continue
             ready.append(
@@ -9418,12 +10327,6 @@ def spawn_role_team(
                 "team_id": team_id,
                 "created_at": utc_now_iso(),
                 "status": "blocked_by_cost_guard",
-                "task_sha256": hashlib.sha256(task.encode("utf-8")).hexdigest(),
-                "context_sha256": (
-                    hashlib.sha256(context.encode("utf-8")).hexdigest()
-                    if context
-                    else None
-                ),
                 "cwd": str(cwd or Path.cwd()),
                 "roles": selected_roles,
                 "runs": [],
@@ -9555,12 +10458,6 @@ def spawn_role_team(
                 "team_id": team_id,
                 "created_at": utc_now_iso(),
                 "status": "prepared",
-                "task_sha256": hashlib.sha256(task.encode("utf-8")).hexdigest(),
-                "context_sha256": (
-                    hashlib.sha256(context.encode("utf-8")).hexdigest()
-                    if context
-                    else None
-                ),
                 "cwd": str(cwd or Path.cwd()),
                 "roles": selected_roles,
                 "runs": runs,
@@ -9598,6 +10495,9 @@ def spawn_role_team(
                 "runs": authorized_runs,
             }
             write_team_manifest(team_id, authorized_manifest)
+            _validate_team_authorization_manifest(
+                team_id, authorized_manifest
+            )
             reservation.active = False
             return response
         except Exception as exc:
@@ -9612,12 +10512,6 @@ def spawn_role_team(
                 "created_at": utc_now_iso(),
                 "status": status_name,
                 "error": str(exc),
-                "task_sha256": hashlib.sha256(task.encode("utf-8")).hexdigest(),
-                "context_sha256": (
-                    hashlib.sha256(context.encode("utf-8")).hexdigest()
-                    if context
-                    else None
-                ),
                 "cwd": str(cwd or Path.cwd()),
                 "roles": selected_roles,
                 "runs": runs,

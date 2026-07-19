@@ -710,6 +710,7 @@ class GuardedLaunchFailureTests(GuardedLaunchFixture):
                     "start_gate": "closed",
                 },
                 "controller_pid": worker_identity.parent_pid,
+                "transaction_deadline_monotonic": time.monotonic() + 8,
             }
         )
         orchestrator.write_metadata(run_dir, metadata)
@@ -1080,6 +1081,7 @@ class ReviewFixGateAndOwnershipTests(GuardedLaunchFixture):
                 "worker_pid": os.getpid(),
                 "worker_process_identity": worker_identity.to_dict(),
                 "controller_pid": worker_identity.parent_pid,
+                "transaction_deadline_monotonic": time.monotonic() + 8,
                 "worker_launch": {
                     "nonce_consumed": False,
                     "nonce_expires_at": "2999-01-01T00:00:00+00:00",
@@ -1152,7 +1154,7 @@ class ReviewFixLifecycleTests(GuardedLaunchFixture):
             encoding="utf-8",
         )
         result = orchestrator.run_agent(
-            "timeout partial output", cwd=self.workspace, timeout_seconds=1
+            "timeout partial output", cwd=self.workspace, timeout_seconds=2
         )
         run_dir = self.runs_dir / str(result["run_id"])
         self.assertTrue(result["timed_out"])
@@ -1406,21 +1408,22 @@ class SecondReviewPublicationTests(GuardedLaunchFixture):
         )
 
     def test_gate_verification_fault_keeps_controller_worker_agreement(self) -> None:
-        def reject_open_gate(path: Path, *, is_dir: bool = False) -> None:
-            candidate = Path(path)
-            if not is_dir and candidate.is_file():
-                with orchestrator._open_managed_file(
-                    candidate, verify_private=False
-                ) as (handle, _details):
-                    payload = handle.read()
-                if b'"state": "open"' in payload:
-                    raise OSError("pre-publication verification fault")
+        real_prepare = orchestrator._prepare_private_atomic_write
+
+        def reject_open_gate(
+            path: Path, payload: bytes, *args: object, **kwargs: object
+        ) -> Path:
+            if (
+                Path(path).name == orchestrator.WORKER_START_GATE_FILENAME
+                and b'"state": "open"' in payload
+            ):
+                raise OSError("pre-publication verification fault")
+            return real_prepare(path, payload, *args, **kwargs)
 
         with patch.object(
             orchestrator,
-            "_verify_private_path",
+            "_prepare_private_atomic_write",
             side_effect=reject_open_gate,
-            create=True,
         ):
             result = orchestrator.run_streaming_agent(
                 "gate publication fault", cwd=self.workspace
@@ -2218,20 +2221,27 @@ class ThirdReviewHandleBindingTests(GuardedLaunchFixture):
         swapped = False
 
         if os.name == "nt":
-            real_open = getattr(orchestrator, "_open_windows_managed_file", None)
+            real_open = getattr(
+                orchestrator, "_open_windows_relative_managed_file", None
+            )
             self.assertIsNotNone(real_open)
 
-            def swap_then_open(path: Path, *args: object, **kwargs: object) -> object:
+            def swap_then_open(
+                parent_handle: object,
+                name: str,
+                *args: object,
+                **kwargs: object,
+            ) -> object:
                 nonlocal swapped
-                if Path(path) == victim and not swapped:
+                if name == victim.name and not swapped:
                     victim.replace(backup)
                     os.symlink(outside, victim)
                     swapped = True
-                return real_open(path, *args, **kwargs)
+                return real_open(parent_handle, name, *args, **kwargs)
 
             opener_patch = patch.object(
                 orchestrator,
-                "_open_windows_managed_file",
+                "_open_windows_relative_managed_file",
                 side_effect=swap_then_open,
             )
         else:
@@ -2475,6 +2485,7 @@ class FourthReviewWriterHandleTests(GuardedLaunchFixture):
         outside = self.workspace / "outside-snapshot.txt"
         outside.write_text("outside", encoding="utf-8")
         attack_fired = False
+        attacker_paths: list[Path] = []
         if os.name == "nt":
             real_create = orchestrator._create_windows_private_file
 
@@ -2489,6 +2500,7 @@ class FourthReviewWriterHandleTests(GuardedLaunchFixture):
                         backup = candidate.with_name(candidate.name + ".original")
                         candidate.replace(backup)
                         os.symlink(outside, candidate)
+                        attacker_paths.append(candidate)
                         attack_fired = True
                     yield handle
 
@@ -2517,8 +2529,14 @@ class FourthReviewWriterHandleTests(GuardedLaunchFixture):
                 run_dir, self.workspace, "after"
             )
         self.assertTrue(attack_fired)
-        self.assertFalse(snapshot["ok"], snapshot)
+        if os.name == "nt":
+            self.assertTrue(snapshot["ok"], snapshot)
+        else:
+            self.assertFalse(snapshot["ok"], snapshot)
         self.assertEqual(outside.read_text(encoding="utf-8"), "outside")
+        for attacker_path in attacker_paths:
+            if attacker_path.is_symlink():
+                attacker_path.unlink()
         for path in run_dir.glob("git_after*"):
             self.assertFalse(path.is_symlink(), path)
 
@@ -2541,6 +2559,7 @@ class FourthReviewWriterHandleTests(GuardedLaunchFixture):
                 "worker_pid": os.getpid(),
                 "worker_process_identity": worker_identity.to_dict(),
                 "controller_pid": worker_identity.parent_pid,
+                "transaction_deadline_monotonic": time.monotonic() + 8,
                 "worker_launch": {
                     "nonce_consumed": False,
                     "nonce_expires_at": "2999-01-01T00:00:00+00:00",
@@ -2866,6 +2885,7 @@ class FourthReviewDeadlineTests(GuardedLaunchFixture):
                 "worker_pid": os.getpid(),
                 "worker_process_identity": worker_identity.to_dict(),
                 "controller_pid": worker_identity.parent_pid,
+                "transaction_deadline_monotonic": time.monotonic() + 1.5,
                 "worker_launch": {
                     "nonce_consumed": False,
                     "nonce_expires_at": "2999-01-01T00:00:00+00:00",
@@ -2919,19 +2939,24 @@ class FourthReviewDirectoryHandleTests(GuardedLaunchFixture):
         swapped = False
 
         if os.name == "nt":
-            real_open = orchestrator._open_windows_managed_directory
+            real_open = orchestrator._open_windows_relative_managed_directory
 
-            def swap_directory(path: Path, *args: object, **kwargs: object) -> object:
+            def swap_directory(
+                parent_handle: object,
+                name: str,
+                *args: object,
+                **kwargs: object,
+            ) -> object:
                 nonlocal swapped
-                if Path(path) == nested and not swapped:
+                if name == nested.name and not swapped:
                     nested.replace(backup)
                     os.symlink(outside, nested, target_is_directory=True)
                     swapped = True
-                return real_open(path, *args, **kwargs)
+                return real_open(parent_handle, name, *args, **kwargs)
 
             opener_patch = patch.object(
                 orchestrator,
-                "_open_windows_managed_directory",
+                "_open_windows_relative_managed_directory",
                 side_effect=swap_directory,
             )
         else:
@@ -3053,6 +3078,8 @@ class FifthReviewGitStateTests(FourthReviewScopeFixture):
             cwd=self.workspace,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
@@ -3273,6 +3300,7 @@ class FifthReviewLifecycleBoundaryTests(GuardedLaunchFixture):
             worker_pid=os.getpid(),
             worker_process_identity=worker_identity.to_dict(),
             controller_pid=worker_identity.parent_pid,
+            transaction_deadline_monotonic=time.monotonic() + 8,
         )
         self._publish_worker_gate(run_dir, metadata)
         frame = prepared.launch_spec.private_frame()
@@ -3877,6 +3905,7 @@ class SixthReviewLifecycleTests(GuardedLaunchFixture):
             worker_pid=os.getpid(),
             worker_process_identity=worker_identity.to_dict(),
             controller_pid=worker_identity.parent_pid,
+            transaction_deadline_monotonic=time.monotonic() + 8,
         )
         self._publish_worker_gate(run_dir, metadata)
         frame = prepared.launch_spec.private_frame()
@@ -4143,10 +4172,16 @@ class SixthReviewCapabilityTests(GuardedLaunchFixture):
             )
 
         with replacement:
-            with self.assertRaises((OSError, orchestrator.OrchestratorError)):
+            if os.name == "nt":
                 orchestrator._atomic_write_text(target, '{"state":"after"}')
+            else:
+                with self.assertRaises((OSError, orchestrator.OrchestratorError)):
+                    orchestrator._atomic_write_text(target, '{"state":"after"}')
         self.assertTrue(attack_fired)
-        self.assertEqual(target.read_text(encoding="utf-8"), '{"state":"before"}')
+        self.assertEqual(
+            target.read_text(encoding="utf-8"),
+            '{"state":"after"}' if os.name == "nt" else '{"state":"before"}',
+        )
 
     @unittest.skipUnless(os.name == "nt", "Windows post-handle ancestor regression")
     def test_windows_enumeration_rejects_post_handle_ancestor_swap(self) -> None:
@@ -4158,36 +4193,32 @@ class SixthReviewCapabilityTests(GuardedLaunchFixture):
         outside_file = outside / "outside.txt"
         outside_file.write_text("outside-secret", encoding="utf-8")
         backup = run_dir.with_name(run_dir.name + ".original")
-        real_open = orchestrator._open_managed_directory
+        real_list = orchestrator._windows_list_directory_handle
         attack_fired = False
 
-        @contextlib.contextmanager
-        def swap_after_open(
-            path: Path, *, writable: bool = False, verify_private: bool = True
-        ) -> object:
+        def swap_after_enumeration(handle: object) -> list[str]:
             nonlocal attack_fired
-            with real_open(
-                path, writable=writable, verify_private=verify_private
-            ) as opened:
-                if Path(path) == run_dir and not attack_fired:
-                    run_dir.replace(backup)
-                    os.symlink(outside, run_dir, target_is_directory=True)
-                    attack_fired = True
-                    try:
-                        yield opened
-                    finally:
-                        run_dir.unlink()
-                        backup.replace(run_dir)
-                else:
-                    yield opened
+            names = real_list(handle)
+            if not attack_fired and "inside.txt" in names:
+                run_dir.replace(backup)
+                os.symlink(outside, run_dir, target_is_directory=True)
+                attack_fired = True
+            return names
 
-        with patch.object(
-            orchestrator, "_open_managed_directory", side_effect=swap_after_open
-        ):
-            with self.assertRaises((OSError, orchestrator.OrchestratorError)):
+        try:
+            with patch.object(
+                orchestrator,
+                "_windows_list_directory_handle",
+                side_effect=swap_after_enumeration,
+            ):
                 orchestrator._scrub_run_artifacts(
                     run_dir, ("inside-secret", "outside-secret")
                 )
+        finally:
+            if run_dir.is_symlink():
+                run_dir.unlink()
+            if backup.exists():
+                backup.replace(run_dir)
         self.assertTrue(attack_fired)
         self.assertEqual(outside_file.read_text(encoding="utf-8"), "outside-secret")
 
@@ -4296,6 +4327,7 @@ class SeventhReviewLifecycleTests(GuardedLaunchFixture):
             worker_pid=os.getpid(),
             worker_process_identity=worker_identity.to_dict(),
             controller_pid=worker_identity.parent_pid,
+            transaction_deadline_monotonic=time.monotonic() + 8,
         )
         self._publish_worker_gate(run_dir, metadata)
         frame = prepared.launch_spec.private_frame()
@@ -4517,6 +4549,8 @@ class SeventhReviewGitAndDeadlineTests(GuardedLaunchFixture):
             cwd=self.workspace,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
@@ -4721,6 +4755,525 @@ class SeventhReviewManagedReaderTests(GuardedLaunchFixture):
         self.assertEqual([event["type"] for event in events], ["inside"])
 
 
+class EighthReviewArtifactLockTests(GuardedLaunchFixture):
+    def test_concurrent_legacy_directory_reclaimers_cannot_retire_successor(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        lock_path = run_dir.parent / f".{run_dir.name}.artifact.lock"
+        lock_path.mkdir()
+        stale_pid = 999_999_999
+        self.assertFalse(orchestrator.pid_alive(stale_pid))
+        (lock_path / "owner.pid").write_text(
+            json.dumps({"pid": stale_pid, "token": "legacy-stale"}),
+            encoding="ascii",
+        )
+
+        real_retire = orchestrator._retire_artifact_lock_directory
+        reclaim_barrier = threading.Barrier(2)
+        retire_count = 0
+        retire_guard = threading.Lock()
+        active_holders = 0
+        max_holders = 0
+        holder_guard = threading.Lock()
+        errors: list[BaseException] = []
+
+        def observed_retire(
+            source: Path,
+            suffix: str,
+            expected_identity: tuple[int, int] | None = None,
+            retained_handle: object | None = None,
+            *args: object,
+            **kwargs: object,
+        ) -> bool:
+            nonlocal retire_count
+            if Path(source) == lock_path:
+                with retire_guard:
+                    retire_count += 1
+            return real_retire(
+                source,
+                suffix,
+                expected_identity,
+                retained_handle,
+                *args,
+                **kwargs,
+            )
+
+        def contender() -> None:
+            nonlocal active_holders, max_holders
+            try:
+                reclaim_barrier.wait(timeout=2)
+                with orchestrator.artifact_lock(run_dir, timeout_seconds=4):
+                    with holder_guard:
+                        active_holders += 1
+                        max_holders = max(max_holders, active_holders)
+                    time.sleep(0.2)
+                    with holder_guard:
+                        active_holders -= 1
+            except BaseException as exc:
+                errors.append(exc)
+
+        with patch.object(
+            orchestrator,
+            "_retire_artifact_lock_directory",
+            side_effect=observed_retire,
+        ):
+            contenders = [threading.Thread(target=contender) for _ in range(2)]
+            for thread in contenders:
+                thread.start()
+            for thread in contenders:
+                thread.join(timeout=7)
+
+        self.assertTrue(all(not thread.is_alive() for thread in contenders))
+        self.assertEqual(errors, [])
+        self.assertEqual(retire_count, 1)
+        self.assertEqual(max_holders, 1)
+        self.assertFalse(lock_path.exists())
+
+
+class EighthReviewLifecycleTests(GuardedLaunchFixture):
+    def _direct_stream_fixture(
+        self,
+    ) -> tuple[object, Path, dict[str, object], bytes, dict[str, str]]:
+        prepared, run_dir, metadata, protocol, environment = (
+            SeventhReviewLifecycleTests._direct_stream_fixture(self)
+        )
+        metadata = orchestrator.update_metadata(
+            run_dir,
+            transaction_deadline_monotonic=time.monotonic() + 8,
+        )
+        return prepared, run_dir, metadata, protocol, environment
+
+    def test_second_pump_constructor_failure_reaps_child_and_started_threads(self) -> None:
+        _prepared, run_dir, metadata, protocol, environment = (
+            self._direct_stream_fixture()
+        )
+        real_popen = orchestrator.subprocess.Popen
+        real_thread = threading.Thread
+        children: list[subprocess.Popen[bytes]] = []
+        pump_constructors = 0
+        attack_fired = False
+
+        def capture_child(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+            child = real_popen(*args, **kwargs)
+            if kwargs.get("stdin") is subprocess.PIPE:
+                children.append(child)
+                self.addCleanup(
+                    orchestrator._terminate_owned_process,
+                    child,
+                    deadline=time.monotonic() + 5,
+                )
+            return child
+
+        def construct_thread(*args: object, **kwargs: object) -> threading.Thread:
+            nonlocal pump_constructors, attack_fired
+            thread_args = kwargs.get("args")
+            if (
+                isinstance(thread_args, tuple)
+                and thread_args
+                and getattr(thread_args[0], "__name__", "") == "pump"
+            ):
+                pump_constructors += 1
+                if pump_constructors == 2:
+                    attack_fired = True
+                    raise RuntimeError("fixture second pump constructor failure")
+            return real_thread(*args, **kwargs)
+
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+            sys, "stdin", type("FixtureStdin", (), {"buffer": io.BytesIO(protocol)})()
+        ), patch.object(
+            orchestrator.subprocess, "Popen", side_effect=capture_child
+        ), patch.object(
+            orchestrator.threading, "Thread", side_effect=construct_thread
+        ):
+            result = orchestrator.stream_worker(str(metadata["run_id"]))
+
+        self.assertTrue(attack_fired)
+        self.assertEqual(len(children), 1)
+        self.assertIn(
+            result["status"], {"blocked_runtime_launch", "cleanup_pending"}, result
+        )
+        self._wait_for_pid_exit(children[0].pid, timeout=4)
+        self.assertFalse((run_dir / "pid.txt").exists())
+        self.assertFalse(
+            any(
+                thread.is_alive() and thread.name.startswith("cc-runtime-")
+                for thread in threading.enumerate()
+            )
+        )
+
+    def test_one_shot_exception_immediately_after_popen_reaps_child(self) -> None:
+        prepared = self._prepare("one_shot", prompt="one-shot lifecycle boundary")
+        real_popen = orchestrator.subprocess.Popen
+        children: list[subprocess.Popen[bytes]] = []
+
+        def capture_child(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+            child = real_popen(*args, **kwargs)
+            children.append(child)
+            self.addCleanup(
+                orchestrator._terminate_owned_process,
+                child,
+                deadline=time.monotonic() + 5,
+            )
+            return child
+
+        with patch.object(
+            orchestrator.subprocess, "Popen", side_effect=capture_child
+        ), patch.object(
+            orchestrator,
+            "_runtime_execution_deadline",
+            side_effect=RuntimeError("fixture post-Popen failure"),
+        ):
+            result = orchestrator.start_prepared_worker_launch(prepared)
+
+        self.assertEqual(len(children), 1)
+        self.assertEqual(result["status"], "blocked_runtime_launch", result)
+        self._wait_for_pid_exit(children[0].pid, timeout=4)
+
+    def test_isolated_worker_persists_and_owns_process_and_thread_cleanup(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        deadline = time.monotonic() + 5
+        orchestrator.write_metadata(
+            run_dir,
+            {
+                "run_id": run_dir.name,
+                "status": "running",
+                "transaction_deadline_monotonic": deadline,
+                "worker_pid": os.getpid(),
+                "terminal_state_count": 0,
+            },
+        )
+        orchestrator._atomic_write_text(run_dir / "events.ndjson", "")
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.addCleanup(
+            orchestrator._terminate_owned_process,
+            child,
+            deadline=time.monotonic() + 5,
+        )
+        pump = threading.Thread(
+            target=child.wait,
+            name=f"cc-runtime-fixture-{run_dir.name}",
+            daemon=True,
+        )
+        pump.start()
+        pending = orchestrator._OwnedCleanupPending(child)
+        pending.threads = (pump,)
+
+        with patch.object(
+            orchestrator, "_stream_worker_inner", side_effect=pending
+        ):
+            result = orchestrator.stream_worker(run_dir.name)
+
+        self.assertIsNotNone(child.poll(), result)
+        pump.join(timeout=2)
+        self.assertFalse(pump.is_alive())
+        persisted = orchestrator.read_metadata(run_dir)
+        self.assertTrue(result.get("persisted"), result)
+        self.assertNotEqual(result.get("status"), "cleanup_pending", result)
+        self.assertEqual(persisted.get("cleanup_state"), "cleanup_confirmed")
+        self.assertEqual(persisted.get("live_cleanup_threads"), [])
+        self.assertTrue(
+            any(event.get("type") == "cleanup_pending" for event in orchestrator.read_events(run_dir / "events.ndjson"))
+        )
+
+
+class EighthReviewDeadlineTests(GuardedLaunchFixture):
+    def test_slow_route_preparation_consumes_the_original_deadline(self) -> None:
+        popen_called = False
+
+        def slow_route(*args: object, **kwargs: object) -> dict[str, object]:
+            time.sleep(1.15)
+            return dict(self.route)
+
+        def reject_popen(*args: object, **kwargs: object) -> object:
+            nonlocal popen_called
+            popen_called = True
+            raise AssertionError("runtime must not start after preparation deadline")
+
+        started = time.monotonic()
+        with patch.object(
+            orchestrator, "resolve_route", side_effect=slow_route
+        ), patch.object(orchestrator.subprocess, "Popen", side_effect=reject_popen):
+            result = orchestrator.run_agent(
+                "slow preparation deadline",
+                cwd=self.workspace,
+                timeout_seconds=1,
+            )
+        elapsed = time.monotonic() - started
+
+        self.assertFalse(popen_called)
+        self.assertLess(elapsed, 1.5, (elapsed, result))
+        self.assertEqual(result["status"], "blocked_runtime_launch", result)
+        self.assertTrue(result.get("timed_out"), result)
+
+    def test_isolated_worker_rejects_missing_or_invalid_inherited_deadline(self) -> None:
+        for label, value in (
+            ("missing", None),
+            ("string", "later"),
+            ("nan", float("nan")),
+        ):
+            with self.subTest(label=label):
+                run_dir = self.runs_dir / orchestrator.new_run_id()
+                orchestrator._set_private_directory(run_dir)
+                metadata: dict[str, object] = {
+                    "run_id": run_dir.name,
+                    "status": "starting",
+                    "timeout_seconds": 1,
+                }
+                if label != "missing":
+                    metadata["transaction_deadline_monotonic"] = value
+                orchestrator.write_metadata(run_dir, metadata)
+                with patch.object(
+                    orchestrator,
+                    "_stream_worker_inner",
+                    return_value={"status": "unexpected-inner-call"},
+                ) as inner:
+                    result = orchestrator.stream_worker(run_dir.name)
+                self.assertFalse(inner.called, result)
+                self.assertEqual(result["status"], "blocked_runtime_security", result)
+
+
+class EighthReviewTeamTests(GuardedLaunchFixture):
+    def _wait_for_team_workers(self, team: dict[str, object]) -> None:
+        SeventhReviewTeamTests._wait_for_team_workers(self, team)
+
+    def test_authorization_observes_nonce_git_and_scope_after_readiness(self) -> None:
+        team_dir = self.artifact_root / "teams"
+        real_manifest = orchestrator.write_team_manifest
+        observed: list[dict[str, object]] = []
+
+        def inspect_authorization(
+            team_id: str, data: dict[str, object]
+        ) -> Path:
+            if data.get("status") == "authorized":
+                for item in data.get("runs", []):
+                    assert isinstance(item, dict)
+                    member = orchestrator.read_metadata(
+                        self.runs_dir / str(item["run_id"])
+                    )
+                    launch = dict(member.get("worker_launch") or {})
+                    observed.append(
+                        {
+                            "nonce_consumed": launch.get("nonce_consumed"),
+                            "team_preflight_complete": launch.get(
+                                "team_preflight_complete"
+                            ),
+                            "git_before": member.get("git_before"),
+                            "scope_policy_identity": launch.get(
+                                "scope_policy_identity"
+                            ),
+                        }
+                    )
+            return real_manifest(team_id, data)
+
+        with patch.object(orchestrator, "TEAMS_DIR", team_dir), patch.object(
+            orchestrator, "max_concurrent_limit", return_value=3
+        ), patch.object(
+            orchestrator, "run_status", return_value={"active_count": 0}
+        ), patch.object(
+            orchestrator, "write_team_manifest", side_effect=inspect_authorization
+        ):
+            team = orchestrator.spawn_role_team(
+                "post-ready preparation",
+                roles=["testing", "review"],
+                cwd=self.workspace,
+                timeout_seconds=6,
+            )
+
+        self.assertTrue(team["ok"], team)
+        self.assertEqual(len(observed), 2)
+        for evidence in observed:
+            self.assertTrue(evidence["nonce_consumed"], evidence)
+            self.assertTrue(evidence["team_preflight_complete"], evidence)
+            self.assertTrue(evidence["scope_policy_identity"], evidence)
+            git_before = evidence["git_before"]
+            self.assertIsInstance(git_before, dict)
+            assert isinstance(git_before, dict)
+            self.assertNotEqual(git_before.get("state"), "pending_worker_capture")
+            self.assertTrue(git_before.get("evidence_complete"), git_before)
+        self._wait_for_team_workers(team)
+
+    def test_member_death_after_final_validation_cannot_publish_authorization(self) -> None:
+        team_dir = self.artifact_root / "teams"
+        real_write = orchestrator.write_json_file
+        attacked = False
+
+        def kill_after_validation(path: Path, data: object) -> Path:
+            nonlocal attacked
+            if (
+                isinstance(data, dict)
+                and data.get("status") == "authorized"
+                and not attacked
+            ):
+                run_id = str(data["runs"][0]["run_id"])
+                with orchestrator._ACTIVE_WORKER_HANDLES_LOCK:
+                    worker = orchestrator._ACTIVE_WORKER_HANDLES.get(run_id)
+                self.assertIsNotNone(worker)
+                assert worker is not None
+                orchestrator._terminate_owned_process(
+                    worker, deadline=time.monotonic() + 3
+                )
+                attacked = True
+            return real_write(path, data)
+
+        with patch.object(orchestrator, "TEAMS_DIR", team_dir), patch.object(
+            orchestrator, "max_concurrent_limit", return_value=3
+        ), patch.object(
+            orchestrator, "run_status", return_value={"active_count": 0}
+        ), patch.object(
+            orchestrator, "write_json_file", side_effect=kill_after_validation
+        ):
+            team = orchestrator.spawn_role_team(
+                "final publication death window",
+                roles=["testing", "review"],
+                cwd=self.workspace,
+                timeout_seconds=6,
+            )
+
+        self.assertTrue(attacked)
+        self.assertFalse(team["ok"], team)
+        manifest = json.loads(
+            Path(str(team["manifest_path"])).read_text(encoding="utf-8")
+        )
+        self.assertNotEqual(manifest["status"], "authorized", manifest)
+        for item in team["runs"]:
+            metadata = orchestrator.read_metadata(
+                self.runs_dir / str(item["run_id"])
+            )
+            self.assertIsNone(metadata.get("child_pid"), metadata)
+        self._wait_for_team_workers(team)
+
+    def test_every_team_manifest_omits_prompt_plaintext_and_unkeyed_digests(self) -> None:
+        team_dir = self.artifact_root / "teams"
+        task_secret = "eighth-team-task-f12a73"
+        context_secret = "eighth-team-context-9be441"
+        forbidden = {
+            task_secret,
+            context_secret,
+            hashlib.sha256(task_secret.encode("utf-8")).hexdigest(),
+            hashlib.sha256(context_secret.encode("utf-8")).hexdigest(),
+        }
+
+        def assert_manifest_safe(result: dict[str, object]) -> None:
+            manifest = json.loads(
+                Path(str(result["manifest_path"])).read_text(encoding="utf-8")
+            )
+
+            def strings(value: object) -> list[str]:
+                if isinstance(value, str):
+                    return [value]
+                if isinstance(value, dict):
+                    return [
+                        item
+                        for key, child in value.items()
+                        for item in [*strings(key), *strings(child)]
+                    ]
+                if isinstance(value, list):
+                    return [item for child in value for item in strings(child)]
+                return []
+
+            persisted = strings(manifest)
+            for secret in forbidden:
+                self.assertFalse(
+                    any(secret in value for value in persisted),
+                    (secret, manifest),
+                )
+
+        with patch.object(orchestrator, "TEAMS_DIR", team_dir), patch.object(
+            orchestrator, "max_concurrent_limit", return_value=0
+        ), patch.object(
+            orchestrator, "run_status", return_value={"active_count": 0}
+        ):
+            blocked = orchestrator.spawn_role_team(
+                task_secret,
+                roles=["testing"],
+                cwd=self.workspace,
+                context=context_secret,
+                timeout_seconds=4,
+            )
+        assert_manifest_safe(blocked)
+
+        with patch.object(orchestrator, "TEAMS_DIR", team_dir), patch.object(
+            orchestrator, "max_concurrent_limit", return_value=2
+        ), patch.object(
+            orchestrator, "run_status", return_value={"active_count": 0}
+        ):
+            launched = orchestrator.spawn_role_team(
+                task_secret,
+                roles=["testing"],
+                cwd=self.workspace,
+                context=context_secret,
+                timeout_seconds=5,
+            )
+        self.assertTrue(launched["ok"], launched)
+        assert_manifest_safe(launched)
+        self._wait_for_team_workers(launched)
+
+
+class EighthReviewGitTests(SeventhReviewGitAndDeadlineTests):
+    def test_unicode_and_quoted_path_stage_unstage_is_layer_neutral(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git is unavailable")
+        self._git("init")
+        self._git("config", "user.name", "Task Eight Fixture")
+        self._git("config", "user.email", "task-eight@example.invalid")
+        # Non-ASCII forces Git's quoted display form while remaining a legal
+        # native filename on Windows.
+        target = self.workspace / "quoted snow-\u96ea.txt"
+        target.write_text("base\n", encoding="utf-8")
+        self._git("add", target.name)
+        self._git("commit", "-m", "base")
+        scope_dir = self.workspace / ".claude-code-orchestrator"
+        scope_dir.mkdir()
+        (scope_dir / "write-scope.json").write_text(
+            json.dumps(
+                {
+                    "cwd": str(self.workspace),
+                    "allowed_paths": [str(self.workspace)],
+                    "denied_paths": [],
+                    "max_diff_lines": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        target.write_text("base\none\n", encoding="utf-8")
+        self._git("add", target.name)
+        before = orchestrator.capture_git_snapshot(
+            run_dir, self.workspace, "quoted-before"
+        )
+        self._git("reset")
+        after_unstage = orchestrator.capture_git_snapshot(
+            run_dir, self.workspace, "quoted-after-unstage"
+        )
+        pinned = orchestrator._pin_write_scope_policy(self.workspace)
+        unstage = orchestrator._check_write_scope_with_evidence(
+            run_dir.name, self.workspace, before, after_unstage, pinned
+        )
+        self.assertEqual(unstage["diff_lines"], 0, unstage)
+
+        target.write_text("base\none\ntwo\n", encoding="utf-8")
+        after_change = orchestrator.capture_git_snapshot(
+            run_dir, self.workspace, "quoted-after-change"
+        )
+        changed = orchestrator._check_write_scope_with_evidence(
+            run_dir.name, self.workspace, after_unstage, after_change, pinned
+        )
+        self.assertEqual(changed["diff_lines"], 1, changed)
+        self.assertNotIn(
+            "max_diff_lines",
+            {item["type"] for item in changed["violations"]},
+        )
+        normalized = target.name.replace("\\", "/")
+        self.assertIn(normalized, changed["changed_paths"], changed)
+
+
 @unittest.skipUnless(os.name == "nt", "Windows capability-relative regressions")
 class SeventhReviewWindowsCapabilityTests(GuardedLaunchFixture):
     def test_writable_open_does_not_touch_swapped_parent_target(self) -> None:
@@ -4904,6 +5457,87 @@ class SeventhReviewWindowsCapabilityTests(GuardedLaunchFixture):
         self.assertTrue(attack_fired)
         self.assertFalse(outside_read)
         self.assertEqual(outside_file.read_text(encoding="utf-8"), "outside")
+
+
+@unittest.skipUnless(os.name == "nt", "Windows capability-relative regressions")
+class EighthReviewWindowsCapabilityTests(GuardedLaunchFixture):
+    def test_same_name_real_directory_replacement_cannot_redirect_scrubbing(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        orchestrator._atomic_write_text(run_dir / "same-name.txt", "inside")
+        backup = run_dir.with_name(run_dir.name + ".eighth-original")
+        replacement_file: Path | None = None
+        real_list = orchestrator._windows_list_directory_handle
+        attack_fired = False
+
+        def replace_after_enumeration(handle: object) -> list[str]:
+            nonlocal attack_fired, replacement_file
+            names = real_list(handle)
+            if not attack_fired and "same-name.txt" in names:
+                run_dir.replace(backup)
+                run_dir.mkdir()
+                replacement_file = run_dir / "same-name.txt"
+                replacement_file.write_text(
+                    "outside-eighth-secret", encoding="utf-8"
+                )
+                attack_fired = True
+            return names
+
+        escaped_content = ""
+        try:
+            with patch.object(
+                orchestrator,
+                "_windows_list_directory_handle",
+                side_effect=replace_after_enumeration,
+            ):
+                try:
+                    orchestrator._scrub_run_artifacts(
+                        run_dir, ("outside-eighth-secret",)
+                    )
+                except (OSError, orchestrator.OrchestratorError):
+                    pass
+            self.assertTrue(attack_fired)
+            assert replacement_file is not None
+            escaped_content = replacement_file.read_text(encoding="utf-8")
+        finally:
+            if run_dir.exists():
+                shutil.rmtree(run_dir)
+            if backup.exists():
+                backup.replace(run_dir)
+        self.assertEqual(escaped_content, "outside-eighth-secret")
+
+    def test_atomic_replace_uses_retained_temp_source_handle_after_name_swap(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        target = run_dir / "metadata.json"
+        orchestrator._atomic_write_text(target, '{"state":"before"}')
+        real_replace = orchestrator._windows_replace_relative
+        attacked_paths: list[tuple[Path, Path]] = []
+
+        def replace_temp_name(
+            temporary_path: Path, destination: Path, parent_handle: object
+        ) -> None:
+            retained = temporary_path.with_name(
+                temporary_path.name + ".retained-original"
+            )
+            temporary_path.replace(retained)
+            temporary_path.write_text("attacker replacement", encoding="utf-8")
+            attacked_paths.append((temporary_path, retained))
+            real_replace(temporary_path, destination, parent_handle)
+
+        try:
+            with patch.object(
+                orchestrator,
+                "_windows_replace_relative",
+                side_effect=replace_temp_name,
+            ):
+                orchestrator._atomic_write_text(target, '{"state":"after"}')
+            self.assertTrue(attacked_paths)
+            self.assertEqual(target.read_text(encoding="utf-8"), '{"state":"after"}')
+        finally:
+            for attacker, retained in attacked_paths:
+                attacker.unlink(missing_ok=True)
+                retained.unlink(missing_ok=True)
 
 
 @unittest.skipUnless(os.name == "posix", "native POSIX capability CI requirement")
