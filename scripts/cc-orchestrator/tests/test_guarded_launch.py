@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import contextlib
 import ctypes
 import hashlib
@@ -4700,7 +4701,9 @@ class SeventhReviewGitAndDeadlineTests(GuardedLaunchFixture):
 
         self.assertLess(elapsed, 1.3, (elapsed, result))
         self.assertIn(
-            result["status"], {"blocked_runtime_launch", "cleanup_pending"}, result
+            result["status"],
+            {"blocked_runtime_launch", "cleanup_pending", "cleanup_incomplete"},
+            result,
         )
         worker_pid = result.get("worker_pid") or result.get("owned_process_pid")
         if isinstance(worker_pid, int):
@@ -6818,6 +6821,264 @@ class TenthReviewCleanupOwnershipTests(TenthReviewFixture):
                     process, deadline=time.monotonic() + 2
                 )
             launch_thread.join(timeout=2)
+
+
+class EleventhReviewCleanupOwnershipTests(TenthReviewFixture):
+    def test_retain_worker_handle_obeys_owned_deadline_and_exits_boundedly(
+        self,
+    ) -> None:
+        class DeadlineProcess(self.FakeProcess):
+            def __init__(self) -> None:
+                super().__init__(510401, ignore_terminate=True)
+                self.wait_entered = threading.Event()
+                self.allow_exit = threading.Event()
+                self.wait_observations: list[tuple[float, float | None]] = []
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.wait_observations.append((time.monotonic(), timeout))
+                self.wait_timeouts.append(timeout)
+                self.wait_entered.set()
+                if self.returncode is not None:
+                    return self.returncode
+                if timeout is None:
+                    raise subprocess.TimeoutExpired(self.args, 0)
+                if self.allow_exit.wait(timeout):
+                    self.returncode = -9
+                    return self.returncode
+                raise subprocess.TimeoutExpired(self.args, timeout)
+
+            def terminate(self) -> None:
+                self.terminate_calls += 1
+
+            def kill(self) -> None:
+                self.kill_calls += 1
+                self.returncode = -9
+                self.allow_exit.set()
+
+            def force_exit(self) -> None:
+                self.returncode = -9
+                self.allow_exit.set()
+
+        process = DeadlineProcess()
+        run_id = "eleventh-bounded-reaper"
+        deadline = time.monotonic() + 0.15
+        record = orchestrator._ensure_owned_process_record(
+            process, deadline=deadline
+        )
+        owner_threads: list[threading.Thread] = []
+        observation: dict[str, object] = {}
+        real_thread = threading.Thread
+
+        def capture_owner_thread(
+            *args: object, **kwargs: object
+        ) -> threading.Thread:
+            thread = real_thread(*args, **kwargs)
+            if run_id in thread.name and thread.name.startswith(
+                ("cc-worker-reaper-", "cc-cleanup-owner-")
+            ):
+                owner_threads.append(thread)
+            return thread
+
+        try:
+            with patch.object(
+                orchestrator.threading,
+                "Thread",
+                side_effect=capture_owner_thread,
+            ):
+                orchestrator._retain_worker_handle(run_id, process)
+            wait_started = process.wait_entered.wait(1)
+            if owner_threads:
+                owner_threads[0].join(
+                    timeout=max(0.0, deadline - time.monotonic()) + 0.5
+                )
+            with orchestrator._ACTIVE_WORKER_HANDLES_LOCK:
+                retained = (
+                    orchestrator._ACTIVE_WORKER_HANDLES.get(run_id) is process
+                )
+            with orchestrator._ACTIVE_CLEANUP_OWNERS_LOCK:
+                active_owner_names = {
+                    name
+                    for name in orchestrator._ACTIVE_CLEANUP_OWNERS
+                    if run_id in name
+                }
+            observation = {
+                "wait_started": wait_started,
+                "owner_count": len(owner_threads),
+                "owner_alive": any(
+                    thread.is_alive() for thread in owner_threads
+                ),
+                "retained": retained,
+                "active_owner_names": active_owner_names,
+                "wait_observations": list(process.wait_observations),
+                "cleanup_result": record.cleanup_result,
+                "record_state": record.state,
+                "process_exited": process.poll() is not None,
+            }
+        finally:
+            process.force_exit()
+            for thread in owner_threads:
+                thread.join(timeout=1)
+            with orchestrator._ACTIVE_WORKER_HANDLES_LOCK:
+                if orchestrator._ACTIVE_WORKER_HANDLES.get(run_id) is process:
+                    orchestrator._ACTIVE_WORKER_HANDLES.pop(run_id, None)
+            with orchestrator._ACTIVE_CLEANUP_OWNERS_LOCK:
+                for name in tuple(orchestrator._ACTIVE_CLEANUP_OWNERS):
+                    if run_id in name:
+                        orchestrator._ACTIVE_CLEANUP_OWNERS.pop(name, None)
+            if orchestrator._owned_process_record(process) is record:
+                orchestrator._remove_owned_process_record(record)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                stream.close()
+
+        wait_observations = observation["wait_observations"]
+        assert isinstance(wait_observations, list)
+        self.assertTrue(observation["wait_started"], observation)
+        self.assertEqual(observation["owner_count"], 1, observation)
+        self.assertFalse(observation["owner_alive"], observation)
+        self.assertFalse(observation["retained"], observation)
+        self.assertEqual(observation["active_owner_names"], set(), observation)
+        self.assertTrue(wait_observations, observation)
+        self.assertTrue(
+            all(
+                timeout is not None
+                and timeout >= 0
+                and called_at + timeout <= deadline + 0.05
+                for called_at, timeout in wait_observations
+            ),
+            observation,
+        )
+        self.assertIn(
+            observation["cleanup_result"],
+            {"cleanup_confirmed", "cleanup_incomplete"},
+            observation,
+        )
+        expected_result = (
+            "cleanup_confirmed"
+            if observation["process_exited"]
+            else "cleanup_incomplete"
+        )
+        self.assertEqual(
+            observation["cleanup_result"], expected_result, observation
+        )
+        self.assertEqual(
+            observation["record_state"],
+            (
+                "completed"
+                if expected_result == "cleanup_confirmed"
+                else "cleanup_incomplete"
+            ),
+            observation,
+        )
+        self.assertFalse(
+            any(
+                thread.is_alive()
+                and run_id in thread.name
+                and thread.name.startswith(
+                    ("cc-worker-reaper-", "cc-cleanup-owner-")
+                )
+                for thread in threading.enumerate()
+            ),
+            observation,
+        )
+
+    def test_cleanup_entrypoints_reuse_deadlines_and_common_owner_machine(
+        self,
+    ) -> None:
+        source_path = Path(orchestrator.__file__).resolve()
+        module = ast.parse(source_path.read_text(encoding="utf-8"))
+        functions = {
+            node.name: node
+            for node in module.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        targets = {
+            "_retain_worker_handle",
+            "_complete_isolated_worker_cleanup",
+            "_terminate_owned_process",
+        }
+        self.assertEqual(targets - functions.keys(), set())
+
+        def call_name(call: ast.Call) -> str | None:
+            function = call.func
+            if isinstance(function, ast.Name):
+                return function.id
+            if isinstance(function, ast.Attribute):
+                return function.attr
+            return None
+
+        def is_monotonic_call(node: ast.AST) -> bool:
+            return (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "monotonic"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "time"
+            )
+
+        calls = {
+            name: {
+                called
+                for node in ast.walk(function)
+                if isinstance(node, ast.Call)
+                and (called := call_name(node)) is not None
+            }
+            for name, function in functions.items()
+        }
+
+        def routes_to_common_owner(
+            name: str, visited: set[str] | None = None
+        ) -> bool:
+            visited = set() if visited is None else visited
+            if name in visited:
+                return False
+            visited.add(name)
+            if "_start_owned_process_owner" in calls.get(name, set()):
+                return True
+            return any(
+                called in functions
+                and routes_to_common_owner(called, visited.copy())
+                for called in calls.get(name, set())
+            )
+
+        relative_deadlines = {
+            name: [
+                node.lineno
+                for node in ast.walk(functions[name])
+                if isinstance(node, ast.BinOp)
+                and isinstance(node.op, ast.Add)
+                and any(is_monotonic_call(item) for item in ast.walk(node))
+            ]
+            for name in targets
+        }
+        direct_thread_owners = {
+            name: [
+                node.lineno
+                for node in ast.walk(functions[name])
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "Thread"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "threading"
+            ]
+            for name in targets
+        }
+        violations: list[str] = []
+        if any(relative_deadlines.values()):
+            violations.append(
+                f"fresh relative cleanup deadlines: {relative_deadlines}"
+            )
+        if any(direct_thread_owners.values()):
+            violations.append(
+                f"cleanup owners bypass common helper: {direct_thread_owners}"
+            )
+        unrouted = sorted(
+            name for name in targets if not routes_to_common_owner(name)
+        )
+        if unrouted:
+            violations.append(
+                f"entrypoints do not route through _start_owned_process_owner: {unrouted}"
+            )
+        self.assertEqual(violations, [], "\n".join(violations))
 
 
 @unittest.skipUnless(os.name == "nt", "Windows tenth-cycle publication regression")
