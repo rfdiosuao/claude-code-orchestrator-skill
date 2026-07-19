@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import hashlib
 import io
 import json
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -38,6 +40,23 @@ from runtime_security import (  # noqa: E402
 
 FAKE_PROVIDER_SECRET = "fixture-provider-secret-7d1f"
 REAL_ENFORCE_COST_GUARD = orchestrator.enforce_cost_guard
+
+
+def _native_unprivileged_ubuntu_or_macos() -> bool:
+    if os.name != "posix" or not hasattr(os, "geteuid") or os.geteuid() == 0:
+        return False
+    if sys.platform == "darwin":
+        return True
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        os_release = Path("/etc/os-release").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return any(
+        line.strip().casefold() == "id=ubuntu"
+        for line in os_release.splitlines()
+    )
 
 
 def _pinned_identity(identity: ExecutableIdentity) -> PinnedExecutableIdentity:
@@ -6156,6 +6175,1407 @@ class NinthReviewPosixGateTests(SeventhReviewGitAndDeadlineTests):
             orchestrator._read_bounded_regular_file(run_dir / "ninth-link.txt", 100)
         self.assertEqual(outside.read_text(encoding="utf-8"), "outside")
         self.assertEqual(orchestrator._PREPARED_ATOMIC_PARENTS, {})
+
+
+class TenthReviewFixture(GuardedLaunchFixture):
+    class FakeStream:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeProcess:
+        def __init__(self, pid: int, *, ignore_terminate: bool = False) -> None:
+            self.args = ("tenth-owned-process", str(pid))
+            self.pid = pid
+            self.stdin = TenthReviewFixture.FakeStream()
+            self.stdout = TenthReviewFixture.FakeStream()
+            self.stderr = TenthReviewFixture.FakeStream()
+            self.returncode: int | None = None
+            self.ignore_terminate = ignore_terminate
+            self.wait_timeouts: list[float | None] = []
+            self.terminate_calls = 0
+            self.kill_calls = 0
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.terminate_calls += 1
+            if not self.ignore_terminate:
+                self.returncode = -15
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+            self.returncode = -9
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_timeouts.append(timeout)
+            if self.returncode is None:
+                if timeout is not None:
+                    raise subprocess.TimeoutExpired(self.args, timeout)
+                self.returncode = -9
+            return self.returncode
+
+        def force_exit(self) -> None:
+            self.returncode = -9
+
+    class StartFailingThread:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self.name = str(kwargs.get("name") or "tenth-start-failure")
+            self.daemon = bool(kwargs.get("daemon", False))
+            self.target = kwargs.get("target")
+
+        def start(self) -> None:
+            raise RuntimeError("tenth thread start failure")
+
+        def is_alive(self) -> bool:
+            return False
+
+        def join(self, timeout: float | None = None) -> None:
+            return None
+
+    def _prepare_with_timeout(
+        self, mode: str, prompt: str, timeout_seconds: int = 1
+    ) -> object:
+        output_format = "json" if mode == "one_shot" else "stream-json"
+        arguments = ["-p", "--output-format", output_format]
+        if mode == "streaming":
+            arguments.extend(["--verbose", "--include-partial-messages"])
+        arguments.extend(
+            ["--permission-mode", "plan", "--no-session-persistence"]
+        )
+        return orchestrator.prepare_worker_launch(
+            mode=mode,
+            prompt=prompt,
+            provider_env=self.provider.env,
+            model_override=None,
+            cwd=self.workspace,
+            workspace_root=self.workspace,
+            artifact_root=self.artifact_root,
+            permission_mode="plan",
+            timeout_seconds=timeout_seconds,
+            arguments=tuple(arguments),
+            safe_route_metadata={
+                "role": "testing",
+                "task_type": "code",
+                "profile": {"id": self.provider.id, "name": self.provider.name},
+                "output_format": output_format,
+                "include_partial_messages": mode == "streaming",
+                "allow_write": False,
+            },
+            expected_child_launches=1,
+            allow_unsafe_runtime=False,
+        )
+
+    def _non_git_snapshot(self, label: str = "tenth") -> dict[str, object]:
+        return {
+            "ok": True,
+            "label": label,
+            "is_git_repo": False,
+            "evidence_complete": True,
+            "evidence_errors": [],
+            "_raw_evidence_complete": True,
+            "_raw_evidence_errors": [],
+        }
+
+    def _absent_scope_pin(self) -> dict[str, object]:
+        return {
+            "path": str(
+                self.workspace
+                / ".claude-code-orchestrator"
+                / "write-scope.json"
+            ),
+            "exists": False,
+            "scope": None,
+            "sha256": None,
+        }
+
+    def _force_cleanup_fake(self, process: FakeProcess) -> None:
+        if process.poll() is None:
+            process.terminate()
+        if process.poll() is None:
+            process.kill()
+        try:
+            process.wait(timeout=0.1)
+        except subprocess.TimeoutExpired:
+            process.force_exit()
+        for stream in (process.stdin, process.stdout, process.stderr):
+            stream.close()
+
+    def _launch_lock_key(self, path: Path) -> str:
+        return os.path.normcase(str(path.resolve(strict=False)))
+
+    def _launch_lock_owner(self, path: Path) -> dict[str, object]:
+        owner_path = path / "owner.json" if path.is_dir() else path
+        return json.loads(owner_path.read_text(encoding="utf-8"))
+
+    def _cleanup_exact_launch_context(self, context: object) -> None:
+        path = Path(str(context.path))
+        key = self._launch_lock_key(path)
+        with orchestrator._PROCESS_LAUNCH_LOCK_TOKENS_LOCK:
+            if (
+                orchestrator._PROCESS_LAUNCH_LOCK_TOKENS.get(key)
+                == context.token
+            ):
+                orchestrator._PROCESS_LAUNCH_LOCK_TOKENS.pop(key, None)
+        try:
+            owner = self._launch_lock_owner(path)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return
+        if (
+            owner.get("token") == context.token
+            and owner.get("generation") == context.generation
+        ):
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink(missing_ok=True)
+
+    def _install_fake_workers(
+        self, run_ids: list[str], first_pid: int
+    ) -> dict[str, FakeProcess]:
+        workers = {
+            run_id: self.FakeProcess(first_pid + index)
+            for index, run_id in enumerate(run_ids)
+        }
+        with orchestrator._ACTIVE_WORKER_HANDLES_LOCK:
+            orchestrator._ACTIVE_WORKER_HANDLES.update(workers)
+        return workers
+
+    def _remove_fake_workers(self, workers: dict[str, FakeProcess]) -> None:
+        with orchestrator._ACTIVE_WORKER_HANDLES_LOCK:
+            for run_id, worker in workers.items():
+                if orchestrator._ACTIVE_WORKER_HANDLES.get(run_id) is worker:
+                    orchestrator._ACTIVE_WORKER_HANDLES.pop(run_id, None)
+        for worker in workers.values():
+            self._force_cleanup_fake(worker)
+
+
+class TenthReviewLaunchLockTests(TenthReviewFixture):
+    def test_publication_failure_rolls_back_generation_token_and_reacquires(self) -> None:
+        context = orchestrator.launch_lock(timeout_seconds=0.5, stale_seconds=0)
+        lock_path = context.path
+        key = self._launch_lock_key(lock_path)
+        real_publish = orchestrator._publish_artifact_lock_candidate
+        published = threading.Event()
+
+        def publish_then_fail(candidate: Path, target: Path) -> None:
+            real_publish(candidate, target)
+            published.set()
+            raise OSError("tenth failure after publication")
+
+        reacquired = False
+        try:
+            with patch.object(
+                orchestrator,
+                "_publish_artifact_lock_candidate",
+                side_effect=publish_then_fail,
+            ):
+                with self.assertRaises(orchestrator.OrchestratorError):
+                    context.__enter__()
+            self.assertTrue(published.is_set())
+            generation_removed = not lock_path.exists()
+            with orchestrator._PROCESS_LAUNCH_LOCK_TOKENS_LOCK:
+                token_removed = key not in orchestrator._PROCESS_LAUNCH_LOCK_TOKENS
+            with orchestrator.launch_lock(
+                timeout_seconds=0.5, stale_seconds=0
+            ):
+                reacquired = True
+            self.assertTrue(generation_removed)
+            self.assertTrue(token_removed)
+            self.assertTrue(reacquired)
+        finally:
+            self._cleanup_exact_launch_context(context)
+
+    def test_publication_failure_preserves_same_name_successor_and_token(self) -> None:
+        context = orchestrator.launch_lock(timeout_seconds=0.5, stale_seconds=0)
+        lock_path = context.path
+        key = self._launch_lock_key(lock_path)
+        retired = lock_path.with_name(lock_path.name + ".tenth-original")
+        successor_token = "tenth-successor-token"
+        successor_generation = "tenth-successor-generation"
+        real_publish = orchestrator._publish_artifact_lock_candidate
+        successor_installed = threading.Event()
+
+        def publish_swap_and_fail(candidate: Path, target: Path) -> None:
+            real_publish(candidate, target)
+            target.replace(retired)
+            target.write_text(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "token": successor_token,
+                        "generation": successor_generation,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            orchestrator._PROCESS_LAUNCH_LOCK_TOKENS[key] = successor_token
+            successor_installed.set()
+            raise OSError("tenth successor installed after publication")
+
+        try:
+            with patch.object(
+                orchestrator,
+                "_publish_artifact_lock_candidate",
+                side_effect=publish_swap_and_fail,
+            ):
+                with self.assertRaises(orchestrator.OrchestratorError):
+                    context.__enter__()
+            self.assertTrue(successor_installed.is_set())
+            self.assertEqual(
+                self._launch_lock_owner(lock_path).get("token"), successor_token
+            )
+            self.assertEqual(
+                self._launch_lock_owner(lock_path).get("generation"),
+                successor_generation,
+            )
+            with orchestrator._PROCESS_LAUNCH_LOCK_TOKENS_LOCK:
+                self.assertEqual(
+                    orchestrator._PROCESS_LAUNCH_LOCK_TOKENS.get(key),
+                    successor_token,
+                )
+        finally:
+            self._cleanup_exact_launch_context(context)
+            with orchestrator._PROCESS_LAUNCH_LOCK_TOKENS_LOCK:
+                if (
+                    orchestrator._PROCESS_LAUNCH_LOCK_TOKENS.get(key)
+                    == successor_token
+                ):
+                    orchestrator._PROCESS_LAUNCH_LOCK_TOKENS.pop(key, None)
+            lock_path.unlink(missing_ok=True)
+            retired.unlink(missing_ok=True)
+
+    def test_release_contention_keeps_the_original_deadline(self) -> None:
+        context = orchestrator.launch_lock(timeout_seconds=1, stale_seconds=0)
+        release_entered = threading.Event()
+        unblock_fault = threading.Event()
+        acquired = threading.Event()
+        observed_deadlines: list[float | None] = []
+        errors: list[BaseException] = []
+        original_deadline: list[float] = []
+
+        @contextlib.contextmanager
+        def contended_generation(
+            _path: Path, *, deadline: float | None = None
+        ) -> object:
+            observed_deadlines.append(deadline)
+            release_entered.set()
+            remaining = (
+                None
+                if deadline is None
+                else max(0.0, deadline - time.monotonic())
+            )
+            if not unblock_fault.wait(remaining):
+                raise OSError("tenth release lock deadline")
+            raise OSError("tenth release lock unblocked")
+            yield None
+
+        def owner() -> None:
+            deadline = time.monotonic() + 0.25
+            original_deadline.append(deadline)
+            token = orchestrator._OPERATION_DEADLINE.set(deadline)
+            try:
+                context.__enter__()
+                acquired.set()
+                with patch.object(
+                    orchestrator,
+                    "_locked_artifact_lock_generation",
+                    side_effect=contended_generation,
+                ):
+                    context.__exit__(None, None, None)
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                orchestrator._OPERATION_DEADLINE.reset(token)
+
+        thread = threading.Thread(target=owner, name="tenth-release-contention")
+        try:
+            thread.start()
+            self.assertTrue(acquired.wait(2))
+            self.assertTrue(release_entered.wait(2))
+            thread.join(timeout=1)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(len(observed_deadlines), 1)
+            self.assertIsNotNone(observed_deadlines[0])
+            assert observed_deadlines[0] is not None
+            self.assertAlmostEqual(
+                observed_deadlines[0], original_deadline[0], delta=0.02
+            )
+        finally:
+            unblock_fault.set()
+            thread.join(timeout=2)
+            self._cleanup_exact_launch_context(context)
+
+
+class TenthReviewCleanupOwnershipTests(TenthReviewFixture):
+    def test_cleanup_pending_constructor_failure_runs_bounded_caller_cleanup(self) -> None:
+        process = self.FakeProcess(510301)
+        with orchestrator._ACTIVE_CLEANUP_OWNERS_LOCK:
+            owners_before = set(orchestrator._ACTIVE_CLEANUP_OWNERS)
+        failure: BaseException | None = None
+        try:
+            with patch.object(
+                orchestrator.threading,
+                "Thread",
+                side_effect=RuntimeError("tenth cleanup constructor failure"),
+            ):
+                try:
+                    orchestrator._cleanup_pending_response({}, process)
+                except BaseException as exc:
+                    failure = exc
+            self.assertIsNone(failure)
+            self.assertIsNotNone(process.poll())
+            self.assertTrue(process.wait_timeouts)
+            self.assertTrue(
+                all(timeout is not None for timeout in process.wait_timeouts),
+                process.wait_timeouts,
+            )
+            self.assertTrue(
+                all(
+                    stream.closed
+                    for stream in (process.stdin, process.stdout, process.stderr)
+                )
+            )
+            with orchestrator._ACTIVE_CLEANUP_OWNERS_LOCK:
+                self.assertEqual(
+                    set(orchestrator._ACTIVE_CLEANUP_OWNERS), owners_before
+                )
+        finally:
+            self._force_cleanup_fake(process)
+
+    def test_cleanup_pending_start_failure_runs_bounded_caller_cleanup(self) -> None:
+        process = self.FakeProcess(510302)
+        with orchestrator._ACTIVE_CLEANUP_OWNERS_LOCK:
+            owners_before = set(orchestrator._ACTIVE_CLEANUP_OWNERS)
+        try:
+            with patch.object(
+                orchestrator.threading,
+                "Thread",
+                side_effect=self.StartFailingThread,
+            ):
+                orchestrator._cleanup_pending_response({}, process)
+            self.assertIsNotNone(process.poll())
+            self.assertTrue(process.wait_timeouts)
+            self.assertTrue(
+                all(timeout is not None for timeout in process.wait_timeouts),
+                process.wait_timeouts,
+            )
+            self.assertTrue(
+                all(
+                    stream.closed
+                    for stream in (process.stdin, process.stdout, process.stderr)
+                )
+            )
+            with orchestrator._ACTIVE_CLEANUP_OWNERS_LOCK:
+                self.assertEqual(
+                    set(orchestrator._ACTIVE_CLEANUP_OWNERS), owners_before
+                )
+        finally:
+            self._force_cleanup_fake(process)
+
+    def test_reaper_constructor_failure_runs_bounded_caller_cleanup(self) -> None:
+        process = self.FakeProcess(510303)
+        run_id = "tenth-reaper-constructor"
+        failure: BaseException | None = None
+        try:
+            with patch.object(
+                orchestrator.threading,
+                "Thread",
+                side_effect=RuntimeError("tenth reaper constructor failure"),
+            ):
+                try:
+                    orchestrator._retain_worker_handle(run_id, process)
+                except BaseException as exc:
+                    failure = exc
+            self.assertIsNone(failure)
+            self.assertIsNotNone(process.poll())
+            self.assertTrue(process.wait_timeouts)
+            self.assertTrue(
+                all(timeout is not None for timeout in process.wait_timeouts),
+                process.wait_timeouts,
+            )
+            with orchestrator._ACTIVE_WORKER_HANDLES_LOCK:
+                self.assertIsNot(
+                    orchestrator._ACTIVE_WORKER_HANDLES.get(run_id), process
+                )
+        finally:
+            with orchestrator._ACTIVE_WORKER_HANDLES_LOCK:
+                if orchestrator._ACTIVE_WORKER_HANDLES.get(run_id) is process:
+                    orchestrator._ACTIVE_WORKER_HANDLES.pop(run_id, None)
+            self._force_cleanup_fake(process)
+
+    def test_reaper_start_failure_runs_bounded_caller_cleanup(self) -> None:
+        process = self.FakeProcess(510304)
+        run_id = "tenth-reaper-start"
+        failure: BaseException | None = None
+        try:
+            with patch.object(
+                orchestrator.threading,
+                "Thread",
+                side_effect=self.StartFailingThread,
+            ):
+                try:
+                    orchestrator._retain_worker_handle(run_id, process)
+                except BaseException as exc:
+                    failure = exc
+            self.assertIsNone(failure)
+            self.assertIsNotNone(process.poll())
+            self.assertTrue(process.wait_timeouts)
+            self.assertTrue(
+                all(timeout is not None for timeout in process.wait_timeouts),
+                process.wait_timeouts,
+            )
+            with orchestrator._ACTIVE_WORKER_HANDLES_LOCK:
+                self.assertIsNot(
+                    orchestrator._ACTIVE_WORKER_HANDLES.get(run_id), process
+                )
+        finally:
+            with orchestrator._ACTIVE_WORKER_HANDLES_LOCK:
+                if orchestrator._ACTIVE_WORKER_HANDLES.get(run_id) is process:
+                    orchestrator._ACTIVE_WORKER_HANDLES.pop(run_id, None)
+            self._force_cleanup_fake(process)
+
+    def test_nonexiting_descendant_is_contained_and_releases_inherited_pipes(self) -> None:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.settimeout(3)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = int(listener.getsockname()[1])
+        child_code = "\n".join(
+            [
+                "import os, socket",
+                f"sock = socket.create_connection(('127.0.0.1', {port}))",
+                "sock.sendall((str(os.getpid()) + '\\n').encode('ascii'))",
+                "sock.recv(1)",
+            ]
+        )
+        self.fake_runtime.write_text(
+            "\n".join(
+                [
+                    "import subprocess, sys, threading",
+                    f"child_code = {child_code!r}",
+                    "subprocess.Popen([sys.executable, '-c', child_code], stdout=sys.stdout, stderr=sys.stderr, close_fds=False)",
+                    "sys.stdin.buffer.read()",
+                    "threading.Event().wait()",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        prepared = self._prepare_with_timeout(
+            "one_shot", "tenth descendant containment", timeout_seconds=1
+        )
+        real_popen = orchestrator.subprocess.Popen
+        processes: list[subprocess.Popen[bytes]] = []
+        streams: list[tuple[object | None, object | None]] = []
+        connection: socket.socket | None = None
+        descendant_pid: int | None = None
+
+        def capture_process(
+            *args: object, **kwargs: object
+        ) -> subprocess.Popen[bytes]:
+            process = real_popen(*args, **kwargs)
+            processes.append(process)
+            streams.append((process.stdout, process.stderr))
+            return process
+
+        try:
+            started = time.monotonic()
+            with patch.object(
+                orchestrator,
+                "capture_git_snapshot",
+                side_effect=lambda *_args, **_kwargs: self._non_git_snapshot(),
+            ), patch.object(
+                orchestrator,
+                "_pin_write_scope_policy",
+                return_value=self._absent_scope_pin(),
+            ), patch.object(
+                orchestrator.subprocess, "Popen", side_effect=capture_process
+            ):
+                result = orchestrator.start_prepared_worker_launch(prepared)
+            elapsed = time.monotonic() - started
+            connection, _address = listener.accept()
+            connection.settimeout(2)
+            payload = b""
+            while b"\n" not in payload:
+                payload += connection.recv(64)
+            descendant_pid = int(payload.splitlines()[0])
+            self.assertEqual(len(processes), 1)
+            self.assertLess(elapsed, 1.75, (elapsed, result))
+            self.assertIsNotNone(processes[0].poll())
+            self.assertFalse(
+                orchestrator.pid_alive(descendant_pid),
+                f"descendant {descendant_pid} escaped owned containment",
+            )
+            self.assertTrue(
+                all(
+                    stream is None or getattr(stream, "closed", False)
+                    for pair in streams
+                    for stream in pair
+                ),
+                streams,
+            )
+            self.assertFalse(
+                any(
+                    thread.is_alive()
+                    and thread.name.startswith(
+                        ("cc-cleanup-owner-", "cc-worker-reaper-")
+                    )
+                    for thread in threading.enumerate()
+                )
+            )
+            self.assertTrue(result.get("timed_out"), result)
+        finally:
+            if connection is not None:
+                try:
+                    connection.sendall(b"x")
+                    connection.shutdown(socket.SHUT_WR)
+                    while connection.recv(256):
+                        pass
+                except OSError:
+                    pass
+                connection.close()
+            listener.close()
+            for process in reversed(processes):
+                orchestrator._terminate_owned_process(
+                    process, deadline=time.monotonic() + 2
+                )
+
+
+@unittest.skipUnless(os.name == "nt", "Windows tenth-cycle publication regression")
+class TenthReviewWindowsPublicationTests(TenthReviewFixture):
+    def test_initial_source_fstat_failure_deletes_retained_source_not_successor(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        target = run_dir / "tenth-state.json"
+        real_create = orchestrator._create_windows_private_file
+        real_fstat = orchestrator.os.fstat
+        contexts: list[object] = []
+        temporary: list[Path] = []
+        retained: list[Path] = []
+        attacked = threading.Event()
+
+        class TrackingContext:
+            def __init__(self, context: object, path: Path) -> None:
+                self.context = context
+                self.path = Path(path)
+                self.handle: object | None = None
+                self.exited = False
+
+            def __enter__(self) -> object:
+                self.handle = self.context.__enter__()
+                temporary.append(self.path)
+                return self.handle
+
+            def __exit__(self, *args: object) -> object:
+                self.exited = True
+                return self.context.__exit__(*args)
+
+        def tracking_create(path: Path, **kwargs: object) -> TrackingContext:
+            context = TrackingContext(real_create(path, **kwargs), path)
+            contexts.append(context)
+            return context
+
+        def fail_initial_source_fstat(fd: int) -> object:
+            for raw_context in contexts:
+                context = raw_context
+                handle = getattr(context, "handle", None)
+                if (
+                    handle is not None
+                    and handle.fileno() == fd
+                    and not attacked.is_set()
+                ):
+                    source = Path(str(context.path))
+                    moved = source.with_name(source.name + ".retained")
+                    source.replace(moved)
+                    source.write_text("tenth-successor", encoding="utf-8")
+                    retained.append(moved)
+                    attacked.set()
+                    raise OSError("tenth initial source fstat failure")
+            return real_fstat(fd)
+
+        try:
+            with patch.object(
+                orchestrator,
+                "_create_windows_private_file",
+                side_effect=tracking_create,
+            ), patch.object(
+                orchestrator.os, "fstat", side_effect=fail_initial_source_fstat
+            ):
+                with self.assertRaises(OSError):
+                    orchestrator._prepare_private_atomic_write(target, b"approved")
+            self.assertTrue(attacked.is_set())
+            self.assertTrue(temporary)
+            successor_survived = temporary[0].exists()
+            successor_content = (
+                temporary[0].read_text(encoding="utf-8")
+                if successor_survived
+                else None
+            )
+            self.assertTrue(successor_survived)
+            self.assertEqual(successor_content, "tenth-successor")
+            self.assertTrue(retained)
+            self.assertFalse(retained[0].exists())
+            self.assertTrue(all(getattr(context, "exited") for context in contexts))
+            self.assertTrue(
+                all(
+                    getattr(getattr(context, "handle", None), "closed", False)
+                    for context in contexts
+                )
+            )
+        finally:
+            for context in contexts:
+                if not getattr(context, "exited", False):
+                    context.__exit__(None, None, None)
+            for path in [*temporary, *retained]:
+                path.unlink(missing_ok=True)
+
+
+@unittest.skipUnless(
+    _native_unprivileged_ubuntu_or_macos(),
+    "requires native unprivileged Ubuntu or macOS",
+)
+class TenthReviewNativePublicationTests(TenthReviewFixture):
+    def test_atomic_replacement_uses_named_source_without_at_empty_path(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        target = run_dir / "tenth-native-state.json"
+        target.write_text('{"state":"before"}', encoding="utf-8")
+        target.chmod(0o600)
+        real_cdll = ctypes.CDLL
+        libc = real_cdll(None, use_errno=True)
+        flags_seen: list[int] = []
+
+        class LibcProxy:
+            def __getattr__(self, name: str) -> object:
+                return getattr(libc, name)
+
+            def linkat(self, *args: object) -> int:
+                flags_seen.append(int(args[-1]))
+                return int(libc.linkat(*args))
+
+        failure: BaseException | None = None
+        with patch.object(ctypes, "CDLL", return_value=LibcProxy()):
+            try:
+                orchestrator._atomic_write_text(target, '{"state":"after"}')
+            except BaseException as exc:
+                failure = exc
+        self.assertIsNone(failure)
+        self.assertEqual(target.read_text(encoding="utf-8"), '{"state":"after"}')
+        self.assertTrue(flags_seen)
+        self.assertTrue(all(flags == 0 for flags in flags_seen), flags_seen)
+        leftovers = [
+            path.name
+            for path in run_dir.iterdir()
+            if path.name != target.name
+        ]
+        self.assertEqual(leftovers, [])
+
+    def test_launch_lock_publication_is_exclusive_and_cleans_named_sources(self) -> None:
+        contexts = [
+            orchestrator.launch_lock(timeout_seconds=2, stale_seconds=0)
+            for _ in range(2)
+        ]
+        start = threading.Barrier(3)
+        release_first = threading.Event()
+        both_attempted = threading.Event()
+        guard = threading.Lock()
+        active = 0
+        maximum = 0
+        entries = 0
+        publish_calls = 0
+        errors: list[BaseException] = []
+        real_publish = orchestrator._publish_artifact_lock_candidate
+
+        def observed_publish(candidate: Path, target: Path) -> None:
+            nonlocal publish_calls
+            with guard:
+                publish_calls += 1
+                if publish_calls >= 2:
+                    both_attempted.set()
+            real_publish(candidate, target)
+
+        def contender(context: object) -> None:
+            nonlocal active, maximum, entries
+            try:
+                start.wait(timeout=2)
+                with context:
+                    with guard:
+                        active += 1
+                        maximum = max(maximum, active)
+                        entries += 1
+                        ordinal = entries
+                    if ordinal == 1:
+                        release_first.wait(2)
+                    with guard:
+                        active -= 1
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(
+                target=contender,
+                args=(context,),
+                name=f"tenth-native-lock-{index}",
+            )
+            for index, context in enumerate(contexts)
+        ]
+        try:
+            with patch.object(
+                orchestrator,
+                "_publish_artifact_lock_candidate",
+                side_effect=observed_publish,
+            ):
+                for thread in threads:
+                    thread.start()
+                start.wait(timeout=2)
+                self.assertTrue(both_attempted.wait(2))
+                release_first.set()
+                for thread in threads:
+                    thread.join(timeout=3)
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(errors, [])
+            self.assertEqual(entries, 2)
+            self.assertEqual(maximum, 1)
+            lock_path = self.runs_dir / ".launch.lock"
+            self.assertFalse(lock_path.exists())
+            self.assertEqual(
+                list(self.runs_dir.glob(".launch.lock.*")), []
+            )
+            key = self._launch_lock_key(lock_path)
+            with orchestrator._PROCESS_LAUNCH_LOCK_TOKENS_LOCK:
+                self.assertNotIn(key, orchestrator._PROCESS_LAUNCH_LOCK_TOKENS)
+        finally:
+            release_first.set()
+            for thread in threads:
+                thread.join(timeout=2)
+            for context in contexts:
+                self._cleanup_exact_launch_context(context)
+
+
+class TenthReviewFinalIdentityTests(TenthReviewFixture):
+    def test_one_shot_replacement_after_scope_pin_never_reaches_runtime_popen(self) -> None:
+        prepared = self._prepare_with_timeout(
+            "one_shot", "tenth one-shot adjacent identity", timeout_seconds=2
+        )
+        real_pin = orchestrator._pin_write_scope_policy
+        replaced = threading.Event()
+        runtime_calls: list[tuple[object, ...]] = []
+
+        def pin_then_replace(root: Path) -> object:
+            pinned = real_pin(root)
+            self.fake_runtime.write_text(
+                "raise SystemExit('tenth replacement')\n", encoding="utf-8"
+            )
+            replaced.set()
+            return pinned
+
+        def reject_popen(*args: object, **_kwargs: object) -> object:
+            runtime_calls.append(args)
+            raise OSError("runtime Popen must remain unreachable")
+
+        with patch.object(
+            orchestrator,
+            "capture_git_snapshot",
+            side_effect=lambda *_args, **_kwargs: self._non_git_snapshot(),
+        ), patch.object(
+            orchestrator,
+            "_pin_write_scope_policy",
+            side_effect=pin_then_replace,
+        ), patch.object(
+            orchestrator.subprocess, "Popen", side_effect=reject_popen
+        ):
+            result = orchestrator.start_prepared_worker_launch(prepared)
+
+        self.assertTrue(replaced.is_set())
+        self.assertEqual(runtime_calls, [])
+        self.assertEqual(result.get("status"), "blocked_runtime_identity", result)
+
+    def test_team_replacement_after_decision_wait_never_reaches_runtime_popen(self) -> None:
+        prepared, run_dir, metadata, protocol, environment = (
+            EighthReviewLifecycleTests._direct_stream_fixture(self)
+        )
+        team_id = "team-" + orchestrator.new_run_id()
+        metadata = orchestrator.update_metadata(
+            run_dir,
+            team_id=team_id,
+            team_manifest_path=str(self.artifact_root / "teams" / team_id / "decision.json"),
+        )
+        replaced = threading.Event()
+        runtime_calls: list[tuple[object, ...]] = []
+
+        def latest(*_args: object, **_kwargs: object) -> dict[str, object]:
+            return orchestrator.read_metadata(run_dir)
+
+        def decide_then_replace(
+            *_args: object, **_kwargs: object
+        ) -> dict[str, object]:
+            self.fake_runtime.write_text(
+                "raise SystemExit('tenth team replacement')\n", encoding="utf-8"
+            )
+            replaced.set()
+            return orchestrator.read_metadata(run_dir)
+
+        def reject_popen(*args: object, **_kwargs: object) -> object:
+            runtime_calls.append(args)
+            raise OSError("team runtime Popen must remain unreachable")
+
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+            sys, "stdin", type("FixtureStdin", (), {"buffer": io.BytesIO(protocol)})()
+        ), patch.object(
+            orchestrator,
+            "capture_git_snapshot",
+            side_effect=lambda *_args, **_kwargs: self._non_git_snapshot(),
+        ), patch.object(
+            orchestrator,
+            "_pin_write_scope_policy",
+            return_value=self._absent_scope_pin(),
+        ), patch.object(
+            orchestrator, "_complete_team_worker_preflight", side_effect=latest
+        ), patch.object(
+            orchestrator, "_wait_for_team_authorization", side_effect=decide_then_replace
+        ), patch.object(
+            orchestrator.subprocess, "Popen", side_effect=reject_popen
+        ):
+            result = orchestrator.stream_worker(str(metadata["run_id"]))
+
+        self.assertTrue(replaced.is_set())
+        self.assertEqual(runtime_calls, [])
+        self.assertEqual(result.get("status"), "blocked_runtime_identity", result)
+
+
+class TenthReviewDeadlineChannelTests(TenthReviewFixture):
+    def test_silent_open_peer_frame_read_stops_at_total_deadline(self) -> None:
+        prepared = self._prepare_with_timeout(
+            "streaming", "tenth silent frame peer", timeout_seconds=1
+        )
+        run_dir, metadata = orchestrator._initialize_prepared_run(prepared)
+        deadline = time.monotonic() + 0.25
+        orchestrator.update_metadata(
+            run_dir, transaction_deadline_monotonic=deadline
+        )
+        read_fd, write_fd = os.pipe()
+        reader = os.fdopen(read_fd, "rb", buffering=0)
+        read_entered = threading.Event()
+        results: list[dict[str, object]] = []
+        errors: list[BaseException] = []
+
+        class ObservedReader:
+            def read(self, size: int = -1) -> bytes:
+                read_entered.set()
+                return reader.read(size)
+
+            def fileno(self) -> int:
+                return reader.fileno()
+
+            def close(self) -> None:
+                reader.close()
+
+        fixture_stdin = type(
+            "TenthSilentStdin", (), {"buffer": ObservedReader()}
+        )()
+
+        def consume() -> None:
+            try:
+                results.append(orchestrator.stream_worker(str(metadata["run_id"])))
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=consume, name="tenth-silent-frame-reader")
+        started = time.monotonic()
+        try:
+            with patch.object(sys, "stdin", fixture_stdin):
+                thread.start()
+                self.assertTrue(read_entered.wait(1))
+                thread.join(timeout=1)
+                elapsed = time.monotonic() - started
+                self.assertFalse(thread.is_alive())
+                self.assertLess(elapsed, 0.9, elapsed)
+                self.assertEqual(errors, [])
+                self.assertTrue(results)
+                self.assertIn(
+                    results[0].get("status"),
+                    {"blocked_runtime_security", "blocked_runtime_launch"},
+                    results[0],
+                )
+        finally:
+            os.close(write_fd)
+            thread.join(timeout=2)
+            reader.close()
+
+    def test_peer_that_never_reads_large_frame_write_stops_at_deadline(self) -> None:
+        prepared = self._prepare_with_timeout(
+            "streaming", "x" * (512 * 1024), timeout_seconds=1
+        )
+        real_popen = orchestrator.subprocess.Popen
+        peers: list[subprocess.Popen[bytes]] = []
+        peer_spawned = threading.Event()
+        results: list[dict[str, object]] = []
+        errors: list[BaseException] = []
+
+        def silent_peer(*_args: object, **_kwargs: object) -> subprocess.Popen[bytes]:
+            kwargs: dict[str, object] = {
+                "stdin": subprocess.PIPE,
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+            }
+            if os.name == "posix":
+                kwargs["start_new_session"] = True
+            elif os.name == "nt":
+                kwargs["creationflags"] = getattr(
+                    subprocess, "CREATE_NO_WINDOW", 0
+                )
+            peer = real_popen(
+                [
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    "import threading; threading.Event().wait()",
+                ],
+                **kwargs,
+            )
+            peers.append(peer)
+            peer_spawned.set()
+            return peer
+
+        def launch() -> None:
+            try:
+                results.append(orchestrator.start_prepared_worker_launch(prepared))
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=launch, name="tenth-stalled-frame-writer")
+        started = time.monotonic()
+        try:
+            with patch.object(
+                orchestrator.subprocess, "Popen", side_effect=silent_peer
+            ):
+                thread.start()
+                self.assertTrue(peer_spawned.wait(2))
+                thread.join(timeout=1.75)
+                elapsed = time.monotonic() - started
+                self.assertFalse(thread.is_alive())
+                self.assertLess(elapsed, 1.6, elapsed)
+                self.assertEqual(errors, [])
+                self.assertTrue(results)
+                self.assertIn(
+                    results[0].get("status"),
+                    {
+                        "blocked_runtime_launch",
+                        "blocked_runtime_security",
+                        "cleanup_incomplete",
+                    },
+                    results[0],
+                )
+        finally:
+            for peer in peers:
+                orchestrator._terminate_owned_process(
+                    peer, deadline=time.monotonic() + 2
+                )
+            thread.join(timeout=2)
+
+
+class TenthReviewTeamDecisionTests(TenthReviewFixture):
+    def _team_identity(self, worker: TenthReviewFixture.FakeProcess, nonce: str) -> ProcessIdentity:
+        return ProcessIdentity(
+            pid=worker.pid,
+            creation_token=f"creation-{worker.pid}",
+            executable_path=str(Path(sys.executable).resolve()),
+            parent_pid=os.getpid(),
+            process_group_id=None,
+            session_id=None,
+            launch_nonce=nonce,
+            supported=True,
+        )
+
+    def _team_member_metadata(
+        self, team_id: str, run_id: str, identity: ProcessIdentity
+    ) -> dict[str, object]:
+        return {
+            "run_id": run_id,
+            "team_id": team_id,
+            "status": "starting",
+            "worker_pid": identity.pid,
+            "worker_process_identity": identity.to_dict(),
+            "runtime_launch": {"launch_nonce": identity.launch_nonce},
+            "worker_launch": {
+                "team_ready": True,
+                "nonce_consumed": True,
+                "team_preflight_complete": True,
+                "scope_policy_identity": "tenth-scope",
+            },
+            "git_before": {"evidence_complete": True},
+        }
+
+    def _synthetic_team_patches(
+        self, workers: dict[str, TenthReviewFixture.FakeProcess]
+    ) -> tuple[object, object]:
+        run_ids = iter(workers)
+
+        def launch_member(*_args: object, **kwargs: object) -> dict[str, object]:
+            run_id = next(run_ids)
+            reservation = kwargs["_admission_reservation"]
+            reservation.register(run_id)
+            return {
+                "run_id": run_id,
+                "status": "starting",
+                "profile": {"id": "tenth"},
+            }
+
+        def ready_members(
+            _team_id: str,
+            runs: list[dict[str, object]],
+            *,
+            deadline: float,
+        ) -> list[dict[str, object]]:
+            self.assertGreater(deadline, time.monotonic())
+            return [
+                {
+                    **item,
+                    "worker_pid": workers[str(item["run_id"])].pid,
+                    "worker_creation_token": (
+                        f"creation-{workers[str(item['run_id'])].pid}"
+                    ),
+                }
+                for item in runs
+            ]
+
+        return launch_member, ready_members
+
+    def test_member_death_during_sequential_precommit_cannot_authorize(self) -> None:
+        team_id = "team-" + orchestrator.new_run_id()
+        run_ids = [orchestrator.new_run_id(), orchestrator.new_run_id()]
+        workers = self._install_fake_workers(run_ids, 510401)
+        identities = {
+            run_id: self._team_identity(workers[run_id], f"nonce-{index}")
+            for index, run_id in enumerate(run_ids)
+        }
+        metadata = {
+            run_id: self._team_member_metadata(team_id, run_id, identities[run_id])
+            for run_id in run_ids
+        }
+        authorization = {
+            "team_id": team_id,
+            "status": "authorized",
+            "runs": [
+                {
+                    "run_id": run_id,
+                    "worker_pid": identities[run_id].pid,
+                    "worker_creation_token": identities[run_id].creation_token,
+                }
+                for run_id in run_ids
+            ],
+        }
+        first_validated = threading.Event()
+        validation_order: list[str] = []
+
+        def read_member(run_dir: Path, **_kwargs: object) -> dict[str, object]:
+            return metadata[run_dir.name]
+
+        def sequential_validation(
+            member: dict[str, object], *, expected_nonce: str, **_kwargs: object
+        ) -> ProcessIdentity:
+            run_id = str(member["run_id"])
+            validation_order.append(run_id)
+            if run_id == run_ids[0]:
+                first_validated.set()
+            else:
+                self.assertTrue(first_validated.is_set())
+                workers[run_ids[0]].force_exit()
+            self.assertEqual(expected_nonce, identities[run_id].launch_nonce)
+            return identities[run_id]
+
+        failure: BaseException | None = None
+        path: Path | None = None
+        try:
+            with patch.object(
+                orchestrator, "TEAMS_DIR", self.artifact_root / "teams"
+            ), patch.object(
+                orchestrator, "read_metadata", side_effect=read_member
+            ), patch.object(
+                orchestrator,
+                "_validate_team_worker_identity",
+                side_effect=sequential_validation,
+            ):
+                try:
+                    path = orchestrator.write_team_manifest(team_id, authorization)
+                except BaseException as exc:
+                    failure = exc
+            visible_authorization = False
+            if path is not None and path.exists():
+                visible_authorization = (
+                    json.loads(path.read_text(encoding="utf-8")).get("status")
+                    == "authorized"
+                )
+            self.assertEqual(validation_order, run_ids)
+            self.assertTrue(first_validated.is_set())
+            self.assertIsNotNone(workers[run_ids[0]].poll())
+            self.assertTrue(
+                failure is not None or not visible_authorization,
+                "a member died during sequential validation but authorization became visible",
+            )
+        finally:
+            self._remove_fake_workers(workers)
+
+    def test_member_death_after_precommit_is_abort_or_postcommit_not_rollback(self) -> None:
+        run_ids = [orchestrator.new_run_id(), orchestrator.new_run_id()]
+        workers = self._install_fake_workers(run_ids, 510411)
+        launch_member, ready_members = self._synthetic_team_patches(workers)
+        team_dir = self.artifact_root / "teams"
+        real_replace = orchestrator._replace_prepared_atomic_write
+        precommit_complete = threading.Event()
+
+        def fail_before_visibility(
+            temporary_path: Path,
+            path: Path,
+            *,
+            deadline: float | None = None,
+            precommit: object | None = None,
+        ) -> None:
+            if precommit is not None and path.parent == team_dir:
+                precommit()
+                precommit_complete.set()
+                workers[run_ids[0]].force_exit()
+                raise OSError("tenth member death before decision visibility")
+            real_replace(
+                temporary_path,
+                path,
+                deadline=deadline,
+                precommit=precommit,
+            )
+
+        try:
+            with patch.object(
+                orchestrator, "TEAMS_DIR", team_dir
+            ), patch.object(
+                orchestrator, "max_concurrent_limit", return_value=4
+            ), patch.object(
+                orchestrator, "run_status", return_value={"active_count": 0}
+            ), patch.object(
+                orchestrator, "run_streaming_agent", side_effect=launch_member
+            ), patch.object(
+                orchestrator, "_wait_for_team_members_ready", side_effect=ready_members
+            ), patch.object(
+                orchestrator, "_validate_team_authorization_manifest", return_value=None
+            ), patch.object(
+                orchestrator,
+                "_reclaim_artifact_lock_for_dead_process",
+                return_value=True,
+            ), patch.object(
+                orchestrator,
+                "_replace_prepared_atomic_write",
+                side_effect=fail_before_visibility,
+            ):
+                result = orchestrator.spawn_role_team(
+                    "tenth precommit death",
+                    roles=["testing", "review"],
+                    cwd=self.workspace,
+                    timeout_seconds=2,
+                )
+            self.assertTrue(precommit_complete.is_set())
+            self.assertIn(
+                result.get("status"),
+                {"aborted", "committed_runtime_failed", "commit_indeterminate"},
+                result,
+            )
+            self.assertNotIn(
+                result.get("status"),
+                {"rolled_back_partial_launch", "rollback_incomplete"},
+            )
+        finally:
+            self._remove_fake_workers(workers)
+
+    def test_postpublication_directory_fsync_failure_preserves_commit_decision(self) -> None:
+        run_ids = [orchestrator.new_run_id(), orchestrator.new_run_id()]
+        workers = self._install_fake_workers(run_ids, 510421)
+        launch_member, ready_members = self._synthetic_team_patches(workers)
+        team_dir = self.artifact_root / "teams"
+        real_replace = orchestrator._replace_prepared_atomic_write
+        decision_visible = threading.Event()
+
+        def fail_after_visibility(
+            temporary_path: Path,
+            path: Path,
+            *,
+            deadline: float | None = None,
+            precommit: object | None = None,
+        ) -> None:
+            real_replace(
+                temporary_path,
+                path,
+                deadline=deadline,
+                precommit=precommit,
+            )
+            if path.name == "decision.json" or (
+                precommit is not None and path.parent == team_dir
+            ):
+                decision_visible.set()
+                raise OSError("tenth directory fsync failed after visibility")
+
+        try:
+            with patch.object(
+                orchestrator, "TEAMS_DIR", team_dir
+            ), patch.object(
+                orchestrator, "max_concurrent_limit", return_value=4
+            ), patch.object(
+                orchestrator, "run_status", return_value={"active_count": 0}
+            ), patch.object(
+                orchestrator, "run_streaming_agent", side_effect=launch_member
+            ), patch.object(
+                orchestrator, "_wait_for_team_members_ready", side_effect=ready_members
+            ), patch.object(
+                orchestrator, "_validate_team_authorization_manifest", return_value=None
+            ), patch.object(
+                orchestrator,
+                "_reclaim_artifact_lock_for_dead_process",
+                return_value=True,
+            ), patch.object(
+                orchestrator,
+                "_replace_prepared_atomic_write",
+                side_effect=fail_after_visibility,
+            ):
+                result = orchestrator.spawn_role_team(
+                    "tenth postpublication fsync",
+                    roles=["testing", "review"],
+                    cwd=self.workspace,
+                    timeout_seconds=2,
+                )
+            payloads = []
+            for path in team_dir.rglob("*.json"):
+                try:
+                    payloads.append(json.loads(path.read_text(encoding="utf-8")))
+                except json.JSONDecodeError:
+                    continue
+            committed = [
+                payload
+                for payload in payloads
+                if str(
+                    payload.get("decision")
+                    or payload.get("state")
+                    or payload.get("status")
+                    or ""
+                ).upper()
+                in {"COMMIT", "COMMITTED", "AUTHORIZED"}
+            ]
+            aborted = [
+                payload
+                for payload in payloads
+                if str(
+                    payload.get("decision")
+                    or payload.get("state")
+                    or payload.get("status")
+                    or ""
+                ).upper()
+                in {"ABORT", "ABORTED"}
+            ]
+            self.assertTrue(decision_visible.is_set())
+            self.assertIn(
+                result.get("status"),
+                {"committed", "commit_indeterminate", "committed_runtime_failed"},
+                result,
+            )
+            self.assertTrue(committed, payloads)
+            self.assertEqual(aborted, [])
+            self.assertNotIn(
+                result.get("status"),
+                {"rolled_back_partial_launch", "rollback_incomplete"},
+            )
+        finally:
+            self._remove_fake_workers(workers)
+
+
+class TenthReviewGitFixture(TenthReviewFixture):
+    def _git(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return SeventhReviewGitAndDeadlineTests._git(self, *args)
+
+    def _initialize_git_scope(self, max_diff_lines: int = 1) -> Path:
+        return SeventhReviewGitAndDeadlineTests._initialize_git_scope(
+            self, max_diff_lines=max_diff_lines
+        )
+
+
+class TenthReviewGitMultiplicityTests(TenthReviewGitFixture):
+    def test_duplicate_predirty_lines_survive_layer_movement_as_counter_evidence(self) -> None:
+        target = self._initialize_git_scope(max_diff_lines=1)
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        target.write_text("base\nduplicate\n", encoding="utf-8")
+        self._git("add", target.name)
+        target.write_text("base\nduplicate\nduplicate\n", encoding="utf-8")
+        before = orchestrator.capture_git_snapshot(
+            run_dir, self.workspace, "tenth-before-layer-move"
+        )
+        self._git("add", target.name)
+        target.write_text(
+            "base\nduplicate\nduplicate\nreal-edit\n", encoding="utf-8"
+        )
+        after = orchestrator.capture_git_snapshot(
+            run_dir, self.workspace, "tenth-after-layer-move"
+        )
+        result = orchestrator._check_write_scope_with_evidence(
+            run_dir.name,
+            self.workspace,
+            before,
+            after,
+            orchestrator._pin_write_scope_policy(self.workspace),
+        )
+        self.assertEqual(result["diff_lines"], 1, result)
+        self.assertNotIn(
+            "max_diff_lines",
+            {item["type"] for item in result["violations"]},
+        )
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX surrogate-escape path regression")
+class TenthReviewPosixPathEncodingTests(TenthReviewGitFixture):
+    def test_non_utf8_unicode_and_backslash_names_recover_distinct_exact_bytes(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git is unavailable")
+        self._git("init")
+        self._git("config", "user.name", "Task Ten POSIX Fixture")
+        self._git("config", "user.email", "task-ten@example.invalid")
+        raw_names = [
+            b"invalid-\xff.txt",
+            b"invalid-\xfe.txt",
+            "unicode-\u96ea.txt".encode("utf-8"),
+            b"literal\\backslash.txt",
+        ]
+        root_bytes = os.fsencode(str(self.workspace))
+        for raw_name in raw_names:
+            fd = os.open(
+                os.path.join(root_bytes, raw_name),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            try:
+                os.write(fd, b"base\n")
+            finally:
+                os.close(fd)
+        self._git("add", "-A")
+        self._git("commit", "-m", "tenth path base")
+        for raw_name in raw_names:
+            fd = os.open(
+                os.path.join(root_bytes, raw_name), os.O_WRONLY | os.O_APPEND
+            )
+            try:
+                os.write(fd, b"edit\n")
+            finally:
+                os.close(fd)
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        snapshot = orchestrator.capture_git_snapshot(
+            run_dir, self.workspace, "tenth-posix-paths"
+        )
+        actual = list(snapshot.get("_raw_changed_paths") or [])
+        expected = [os.fsdecode(raw_name) for raw_name in raw_names]
+        self.assertTrue(snapshot.get("evidence_complete"), snapshot)
+        self.assertEqual(len(actual), len(raw_names), actual)
+        self.assertEqual(set(actual), set(expected))
+        self.assertEqual({os.fsencode(path) for path in actual}, set(raw_names))
 
 
 class ReviewFixWrapperChecks(GuardedLaunchFixture):
