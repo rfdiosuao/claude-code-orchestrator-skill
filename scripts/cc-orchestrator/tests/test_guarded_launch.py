@@ -6641,16 +6641,19 @@ class TenthReviewCleanupOwnershipTests(TenthReviewFixture):
 
     def test_nonexiting_descendant_is_contained_and_releases_inherited_pipes(self) -> None:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.settimeout(3)
+        listener.settimeout(4)
         listener.bind(("127.0.0.1", 0))
         listener.listen(1)
         port = int(listener.getsockname()[1])
         child_code = "\n".join(
             [
-                "import os, socket",
+                "import os, signal, socket, threading",
+                "if hasattr(signal, 'SIGBREAK'): signal.signal(signal.SIGBREAK, signal.SIG_IGN)",
                 f"sock = socket.create_connection(('127.0.0.1', {port}))",
                 "sock.sendall((str(os.getpid()) + '\\n').encode('ascii'))",
-                "sock.recv(1)",
+                "if sock.recv(1) != b'A': raise SystemExit(91)",
+                "sock.sendall(b'K')",
+                "threading.Event().wait()",
             ]
         )
         self.fake_runtime.write_text(
@@ -6674,6 +6677,9 @@ class TenthReviewCleanupOwnershipTests(TenthReviewFixture):
         streams: list[tuple[object | None, object | None]] = []
         connection: socket.socket | None = None
         descendant_pid: int | None = None
+        descendant_handle: int | None = None
+        results: list[dict[str, object]] = []
+        errors: list[BaseException] = []
 
         def capture_process(
             *args: object, **kwargs: object
@@ -6683,8 +6689,25 @@ class TenthReviewCleanupOwnershipTests(TenthReviewFixture):
             streams.append((process.stdout, process.stderr))
             return process
 
+        def launch() -> None:
+            try:
+                results.append(orchestrator.start_prepared_worker_launch(prepared))
+            except BaseException as exc:
+                errors.append(exc)
+
+        def exact_contained_pids(_job: int) -> list[int]:
+            if not processes or descendant_pid is None:
+                raise AssertionError(
+                    "Job membership queried before descendant PID acknowledgment"
+                )
+            return [int(processes[0].pid), descendant_pid]
+
+        launch_thread = threading.Thread(
+            target=launch,
+            name="eleventh-descendant-launch",
+            daemon=True,
+        )
         try:
-            started = time.monotonic()
             with patch.object(
                 orchestrator,
                 "capture_git_snapshot",
@@ -6695,22 +6718,51 @@ class TenthReviewCleanupOwnershipTests(TenthReviewFixture):
                 return_value=self._absent_scope_pin(),
             ), patch.object(
                 orchestrator.subprocess, "Popen", side_effect=capture_process
+            ), patch.object(
+                orchestrator,
+                "_windows_job_process_ids",
+                side_effect=exact_contained_pids,
             ):
-                result = orchestrator.start_prepared_worker_launch(prepared)
-            elapsed = time.monotonic() - started
-            connection, _address = listener.accept()
-            connection.settimeout(2)
-            payload = b""
-            while b"\n" not in payload:
-                payload += connection.recv(64)
-            descendant_pid = int(payload.splitlines()[0])
+                launch_thread.start()
+                connection, _address = listener.accept()
+                connection.settimeout(3)
+                payload = b""
+                while b"\n" not in payload:
+                    chunk = connection.recv(64)
+                    self.assertTrue(chunk, payload)
+                    payload += chunk
+                descendant_pid = int(payload.splitlines()[0])
+                if os.name == "nt":
+                    descendant_handle = (
+                        orchestrator._open_windows_process_sync_handle(
+                            descendant_pid
+                        )
+                    )
+                    self.assertIsNotNone(descendant_handle)
+                connection.sendall(b"A")
+                self.assertEqual(connection.recv(1), b"K")
+                if descendant_handle is not None:
+                    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                    self.assertEqual(
+                        int(kernel32.WaitForSingleObject(descendant_handle, 0)),
+                        0x00000102,
+                        "descendant exited instead of remaining blocked after ACK",
+                    )
+                launch_thread.join(timeout=1.5)
+            self.assertFalse(launch_thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 1, results)
+            result = results[0]
             self.assertEqual(len(processes), 1)
-            self.assertLess(elapsed, 1.75, (elapsed, result))
             self.assertIsNotNone(processes[0].poll())
-            self.assertFalse(
-                orchestrator.pid_alive(descendant_pid),
-                f"descendant {descendant_pid} escaped owned containment",
-            )
+            assert descendant_pid is not None
+            if descendant_handle is not None:
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                self.assertEqual(
+                    int(kernel32.WaitForSingleObject(descendant_handle, 0)),
+                    0x00000000,
+                    f"descendant {descendant_pid} escaped owned containment",
+                )
             self.assertTrue(
                 all(
                     stream is None or getattr(stream, "closed", False)
@@ -6728,22 +6780,44 @@ class TenthReviewCleanupOwnershipTests(TenthReviewFixture):
                     for thread in threading.enumerate()
                 )
             )
+            self.assertFalse(
+                orchestrator.pid_alive(descendant_pid),
+                f"descendant {descendant_pid} escaped owned containment",
+            )
             self.assertTrue(result.get("timed_out"), result)
         finally:
-            if connection is not None:
+            pending_owner: threading.Thread | None = None
+            if descendant_pid is not None:
+                with orchestrator._PENDING_DESCENDANT_CLEANUPS_LOCK:
+                    pending_cleanup = (
+                        orchestrator._PENDING_DESCENDANT_CLEANUPS.get(
+                            descendant_pid
+                        )
+                    )
+                if pending_cleanup is not None:
+                    pending_cleanup.request_termination()
+                    pending_owner = pending_cleanup.owner
+            if pending_owner is not None:
+                pending_owner.join(timeout=2)
+            if descendant_handle is not None:
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                if int(kernel32.WaitForSingleObject(descendant_handle, 0)) == 0x102:
+                    kernel32.TerminateProcess(descendant_handle, 1)
+                    kernel32.WaitForSingleObject(descendant_handle, 2000)
+                kernel32.CloseHandle(descendant_handle)
+            elif descendant_pid is not None and os.name == "posix":
                 try:
-                    connection.sendall(b"x")
-                    connection.shutdown(socket.SHUT_WR)
-                    while connection.recv(256):
-                        pass
+                    os.kill(descendant_pid, 9)
                 except OSError:
                     pass
+            if connection is not None:
                 connection.close()
             listener.close()
             for process in reversed(processes):
                 orchestrator._terminate_owned_process(
                     process, deadline=time.monotonic() + 2
                 )
+            launch_thread.join(timeout=2)
 
 
 @unittest.skipUnless(os.name == "nt", "Windows tenth-cycle publication regression")
