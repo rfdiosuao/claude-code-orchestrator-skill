@@ -3796,9 +3796,7 @@ class SixthReviewGitEvidenceTests(FourthReviewScopeFixture):
 
 
 class SixthReviewLifecycleTests(GuardedLaunchFixture):
-    def test_unconfirmed_deadline_cleanup_retains_owned_reaper(self) -> None:
-        release = threading.Event()
-
+    def test_expired_unreaped_cleanup_returns_bounded_incomplete_state(self) -> None:
         class Stream:
             def close(self) -> None:
                 pass
@@ -3812,6 +3810,7 @@ class SixthReviewLifecycleTests(GuardedLaunchFixture):
 
             def __init__(self) -> None:
                 self.returncode: int | None = None
+                self.wait_timeouts: list[float | None] = []
 
             def poll(self) -> int | None:
                 return self.returncode
@@ -3823,38 +3822,75 @@ class SixthReviewLifecycleTests(GuardedLaunchFixture):
                 pass
 
             def wait(self, timeout: float | None = None) -> int:
-                if timeout is not None:
-                    raise subprocess.TimeoutExpired(self.args, timeout)
-                release.wait(2)
-                self.returncode = -9
-                return self.returncode
+                self.wait_timeouts.append(timeout)
+                if timeout is None:
+                    raise AssertionError("owned cleanup attempted an unbounded wait")
+                raise subprocess.TimeoutExpired(self.args, timeout)
 
         process = UnreapedProcess()
+        deadline = time.monotonic() - 1
+        created_cleanup_threads: list[threading.Thread] = []
+        real_thread = threading.Thread
+
+        def capture_cleanup_thread(
+            *args: object, **kwargs: object
+        ) -> threading.Thread:
+            thread = real_thread(*args, **kwargs)
+            if thread.name.startswith(
+                ("cc-cleanup-owner-", "cc-worker-reaper-")
+            ):
+                created_cleanup_threads.append(thread)
+            return thread
+
         try:
-            orchestrator._terminate_owned_process(
-                process, deadline=time.monotonic() - 1
+            with patch.object(
+                orchestrator.threading,
+                "Thread",
+                side_effect=capture_cleanup_thread,
+            ):
+                confirmed = orchestrator._terminate_owned_process(
+                    process, deadline=deadline
+                )
+            record = orchestrator._owned_process_record(process)
+            self.assertFalse(confirmed)
+            self.assertIsNotNone(record)
+            assert record is not None
+            self.assertEqual(record.cleanup_result, "cleanup_incomplete")
+            self.assertEqual(record.state, "cleanup_incomplete")
+            self.assertTrue(record.completed.is_set())
+            self.assertNotEqual(record.cleanup_result, "cleanup_confirmed")
+            self.assertTrue(process.wait_timeouts)
+            self.assertTrue(
+                all(
+                    timeout is not None and 0 <= timeout <= 0.05
+                    for timeout in process.wait_timeouts
+                ),
+                process.wait_timeouts,
             )
             with orchestrator._ACTIVE_WORKER_HANDLES_LOCK:
-                retained = any(
-                    handle is process
-                    for handle in orchestrator._ACTIVE_WORKER_HANDLES.values()
-                )
-            self.assertTrue(retained)
-        finally:
-            release.set()
-            deadline = time.time() + 3
-            while time.time() < deadline:
-                with orchestrator._ACTIVE_WORKER_HANDLES_LOCK:
-                    if all(
-                        handle is not process
+                self.assertFalse(
+                    any(
+                        handle is process
                         for handle in orchestrator._ACTIVE_WORKER_HANDLES.values()
-                    ):
-                        break
-                time.sleep(0.01)
+                    )
+                )
+            with orchestrator._ACTIVE_CLEANUP_OWNERS_LOCK:
+                self.assertFalse(
+                    any(
+                        owner.is_alive()
+                        and str(process.pid) in name
+                        for name, owner in orchestrator._ACTIVE_CLEANUP_OWNERS.items()
+                    )
+                )
+            self.assertEqual(created_cleanup_threads, [])
+        finally:
+            record = orchestrator._owned_process_record(process)
+            if record is not None:
+                orchestrator._remove_owned_process_record(record)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                stream.close()
 
-    def test_unreaped_launch_returns_explicit_nonterminal_degraded_state(self) -> None:
-        release = threading.Event()
-
+    def test_unreaped_launch_returns_terminal_degraded_cleanup_state(self) -> None:
         class Stream:
             def close(self) -> None:
                 pass
@@ -3868,6 +3904,7 @@ class SixthReviewLifecycleTests(GuardedLaunchFixture):
 
             def __init__(self) -> None:
                 self.returncode: int | None = None
+                self.wait_timeouts: list[float | None] = []
 
             def poll(self) -> int | None:
                 return self.returncode
@@ -3879,11 +3916,10 @@ class SixthReviewLifecycleTests(GuardedLaunchFixture):
                 pass
 
             def wait(self, timeout: float | None = None) -> int:
-                if timeout is not None:
-                    raise subprocess.TimeoutExpired(self.args, timeout)
-                release.wait(2)
-                self.returncode = -9
-                return self.returncode
+                self.wait_timeouts.append(timeout)
+                if timeout is None:
+                    raise AssertionError("launch cleanup attempted an unbounded wait")
+                raise subprocess.TimeoutExpired(self.args, timeout)
 
         process = UnreapedLaunch()
         try:
@@ -3897,33 +3933,61 @@ class SixthReviewLifecycleTests(GuardedLaunchFixture):
                 result = orchestrator.run_agent(
                     "unreaped cleanup", cwd=self.workspace, timeout_seconds=1
                 )
-            self.assertEqual(result["status"], "cleanup_pending", result)
-            self.assertEqual(result["terminal_state_count"], 0)
+            self.assertEqual(result["status"], "cleanup_incomplete", result)
+            self.assertEqual(
+                result.get("cleanup_state"), "cleanup_incomplete", result
+            )
+            self.assertEqual(result["terminal_state_count"], 1, result)
+            self.assertNotEqual(result["status"], "succeeded", result)
+            self.assertFalse(str(result["status"]).startswith("blocked_"), result)
+            self.assertTrue(result.get("persisted"), result)
             self.assertEqual(result["persistence_state"], "persisted")
             metadata = orchestrator.read_metadata(
                 self.runs_dir / str(result["run_id"])
             )
-            self.assertNotIn(
-                metadata.get("status"),
-                {
-                    "succeeded",
-                    "failed",
-                    "timed_out",
-                    "stopped",
-                    "blocked_runtime_launch",
-                    "blocked_runtime_identity",
-                    "blocked_process_identity",
-                    "blocked_runtime_security",
-                },
+            self.assertEqual(
+                metadata.get("status"), "cleanup_incomplete", metadata
+            )
+            self.assertEqual(
+                metadata.get("cleanup_state"), "cleanup_incomplete", metadata
+            )
+            self.assertEqual(metadata.get("terminal_state_count"), 1, metadata)
+            self.assertTrue(metadata.get("persisted"), metadata)
+            self.assertEqual(
+                metadata.get("persistence_state"), "persisted", metadata
+            )
+            self.assertEqual(metadata.get("live_cleanup_threads"), [], metadata)
+            self.assertTrue(process.wait_timeouts)
+            self.assertTrue(
+                all(timeout is not None for timeout in process.wait_timeouts),
+                process.wait_timeouts,
+            )
+            with orchestrator._ACTIVE_CLEANUP_OWNERS_LOCK:
+                self.assertFalse(
+                    any(
+                        owner.is_alive()
+                        and str(result["run_id"]) in name
+                        for name, owner in orchestrator._ACTIVE_CLEANUP_OWNERS.items()
+                    ),
+                    result,
+                )
+            self.assertFalse(
+                any(
+                    thread.is_alive()
+                    and str(result["run_id"]) in thread.name
+                    and thread.name.startswith(
+                        ("cc-cleanup-owner-", "cc-worker-reaper-")
+                    )
+                    for thread in threading.enumerate()
+                ),
+                result,
             )
         finally:
-            release.set()
-            deadline = time.time() + 3
-            while time.time() < deadline and any(
-                thread.name.startswith("cc-cleanup-owner-")
-                for thread in threading.enumerate()
-            ):
-                time.sleep(0.02)
+            record = orchestrator._owned_process_record(process)
+            if record is not None:
+                orchestrator._remove_owned_process_record(record)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                stream.close()
 
     def _direct_stream_fixture(self) -> tuple[object, Path, dict[str, object], bytes, dict[str, str]]:
         prepared = self._prepare("streaming", prompt="thread lifecycle")
@@ -5813,8 +5877,8 @@ class NinthReviewLifecycleTests(EighthReviewLifecycleTests):
             "\n".join(
                 [
                     "import pathlib, subprocess, sys",
-                    "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(1.1)'], stdout=sys.stdout, stderr=sys.stderr, close_fds=False)",
-                    f"pathlib.Path({str(descendant_ready)!r}).write_text('ready')",
+                    "descendant = subprocess.Popen([sys.executable, '-c', 'import threading; threading.Event().wait(1.1)'], stdout=sys.stdout, stderr=sys.stderr, close_fds=False)",
+                    f"pathlib.Path({str(descendant_ready)!r}).write_text(str(descendant.pid))",
                     "sys.stdin.buffer.read()",
                     "print('parent-finished', flush=True)",
                 ]
@@ -5888,15 +5952,34 @@ class NinthReviewLifecycleTests(EighthReviewLifecycleTests):
             stream.close()
         elapsed = time.monotonic() - started
         self.assertEqual(pump_constructors, 2)
-        self.assertGreaterEqual(elapsed, 0.9, (elapsed, result))
-        self.assertFalse(
-            any(
-                thread.is_alive() and thread.name.startswith("cc-runtime-")
-                for thread in threading.enumerate()
-            )
+        self.assertLess(elapsed, 4.0, (elapsed, result))
+        descendant_pid = int(descendant_ready.read_text(encoding="utf-8"))
+        self._wait_for_pid_exit(descendant_pid, timeout=3)
+        self.assertTrue(
+            all(getattr(stream, "closed", False) for stream in retained_streams),
+            retained_streams,
         )
+        live_lifecycle_threads = [
+            thread.name
+            for thread in threading.enumerate()
+            if thread.is_alive()
+            and thread.name.startswith(
+                ("cc-runtime-", "cc-cleanup-owner-", "cc-worker-reaper-")
+            )
+        ]
+        self.assertEqual(live_lifecycle_threads, [])
         persisted = orchestrator.read_metadata(run_dir)
-        self.assertIn(persisted.get("live_cleanup_threads"), (None, []))
+        self.assertFalse(persisted.get("live_cleanup_threads"), persisted)
+        cleanup_proven = (
+            not orchestrator.pid_alive(descendant_pid)
+            and all(
+                getattr(stream, "closed", False) for stream in retained_streams
+            )
+            and not live_lifecycle_threads
+        )
+        for evidence in (result, persisted):
+            if evidence.get("cleanup_state") == "cleanup_confirmed":
+                self.assertTrue(cleanup_proven, evidence)
 
 
 class NinthReviewTeamTests(EighthReviewTeamTests):
