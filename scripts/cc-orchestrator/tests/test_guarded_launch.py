@@ -7025,18 +7025,20 @@ class EleventhReviewCleanupOwnershipTests(TenthReviewFixture):
             for name, function in functions.items()
         }
 
-        def routes_to_common_owner(
-            name: str, visited: set[str] | None = None
+        def routes_to_cleanup(
+            name: str,
+            accepted: set[str],
+            visited: set[str] | None = None,
         ) -> bool:
             visited = set() if visited is None else visited
             if name in visited:
                 return False
             visited.add(name)
-            if "_start_owned_process_owner" in calls.get(name, set()):
+            if calls.get(name, set()) & accepted:
                 return True
             return any(
                 called in functions
-                and routes_to_common_owner(called, visited.copy())
+                and routes_to_cleanup(called, accepted, visited.copy())
                 for called in calls.get(name, set())
             )
 
@@ -7071,12 +7073,25 @@ class EleventhReviewCleanupOwnershipTests(TenthReviewFixture):
             violations.append(
                 f"cleanup owners bypass common helper: {direct_thread_owners}"
             )
-        unrouted = sorted(
-            name for name in targets if not routes_to_common_owner(name)
-        )
+        accepted_routes = {
+            "_retain_worker_handle": {"_start_owned_process_owner"},
+            "_complete_isolated_worker_cleanup": {
+                "_bounded_process_cleanup",
+                "_start_owned_process_owner",
+            },
+            "_terminate_owned_process": {
+                "_bounded_process_cleanup",
+                "_start_owned_process_owner",
+            },
+        }
+        unrouted = {
+            name: sorted(accepted)
+            for name, accepted in accepted_routes.items()
+            if not routes_to_cleanup(name, accepted)
+        }
         if unrouted:
             violations.append(
-                f"entrypoints do not route through _start_owned_process_owner: {unrouted}"
+                f"entrypoints do not route through accepted cleanup: {unrouted}"
             )
         self.assertEqual(violations, [], "\n".join(violations))
 
