@@ -26,7 +26,7 @@ import time
 import uuid
 import zipfile
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType
@@ -185,6 +185,7 @@ PRIVATE_LAUNCH_FRAME_LIMIT = 64 * 1024
 PROMPT_BYTES_LIMIT = 1024 * 1024
 INTERNAL_WORKER_NONCE_TTL_SECONDS = 60
 WORKER_START_GATE_TIMEOUT_SECONDS = 5.0
+TRANSACTION_CLOSURE_RESERVE_SECONDS = 0.05
 WORKER_START_GATE_FILENAME = "worker-start-gate.json"
 SCRUBBED_VALUE = "[REDACTED]"
 CONTROLLER_OS_BASELINE_KEYS = (
@@ -1471,6 +1472,81 @@ def _artifact_lock_owner(payload: bytes) -> tuple[int, str | None]:
     return int(owner["pid"]), str(owner["token"])
 
 
+def _artifact_lock_file_identity(details: Any) -> tuple[int, int]:
+    if isinstance(details, Mapping):
+        file_id = details.get("file_id")
+        if (
+            isinstance(file_id, (list, tuple))
+            and len(file_id) == 2
+        ):
+            return int(file_id[0]), int(file_id[1])
+    return int(details.st_dev), int(details.st_ino)
+
+
+@contextlib.contextmanager
+def _locked_artifact_lock_generation(
+    lock_path: Path, *, deadline: float | None = None
+) -> Any:
+    """Lock and expose one exact artifact-lock file generation."""
+    effective = _effective_deadline(deadline)
+    with _open_managed_file(
+        lock_path, writable=True, verify_private=False
+    ) as (handle, details):
+        acquired = False
+        while not acquired:
+            _check_deadline(
+                effective,
+                "Artifact lock generation inspection exceeded its deadline.",
+            )
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(
+                        handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                    )
+                acquired = True
+            except OSError:
+                time.sleep(0.005)
+        try:
+            handle.seek(0)
+            payload = handle.read(257)
+            if len(payload) > 256:
+                raise OrchestratorError("Artifact lock owner exceeds its size limit.")
+            yield handle, details, payload
+        finally:
+            if acquired:
+                try:
+                    handle.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+
+
+def _artifact_lock_path_matches_generation(
+    lock_path: Path, expected_identity: tuple[int, int]
+) -> bool:
+    try:
+        with _open_managed_file(
+            lock_path, verify_private=False
+        ) as (_handle, details):
+            return _artifact_lock_file_identity(details) == expected_identity
+    except FileNotFoundError:
+        return False
+
+
 def _retire_artifact_lock_directory(lock_dir: Path, suffix: str) -> bool:
     retired = lock_dir.with_name(f"{lock_dir.name}.released-{suffix}")
     try:
@@ -1596,23 +1672,37 @@ def _reclaim_artifact_lock_for_dead_process(
             return True
         if deadline is not None and time.monotonic() >= deadline:
             return False
+        if not lock_dir.is_dir():
+            try:
+                with _locked_artifact_lock_generation(
+                    lock_dir, deadline=deadline
+                ) as (_handle, details, owner_payload):
+                    owner_pid, _owner_token = _artifact_lock_owner(owner_payload)
+                    if owner_pid != process_pid:
+                        return False
+                    generation = _artifact_lock_file_identity(details)
+                    if not _artifact_lock_path_matches_generation(
+                        lock_dir, generation
+                    ):
+                        continue
+                    if _retire_artifact_lock_file(
+                        lock_dir, uuid.uuid4().hex
+                    ):
+                        return True
+            except FileNotFoundError:
+                return True
+            except (OSError, OrchestratorError, KeyError, TypeError, ValueError):
+                time.sleep(0.005)
+                continue
+            time.sleep(0.005)
+            continue
         try:
-            if lock_dir.is_dir():
-                owner_payload = _read_bounded_regular_file(
-                    lock_dir / "owner.pid", 256, deadline=deadline
-                )
-            else:
-                owner_payload = _read_bounded_regular_file(
-                    lock_dir, 256, deadline=deadline
-                )
+            owner_payload = _read_bounded_regular_file(
+                lock_dir / "owner.pid", 256, deadline=deadline
+            )
             owner_pid, _owner_token = _artifact_lock_owner(owner_payload)
         except FileNotFoundError:
-            retire = (
-                _retire_artifact_lock_directory
-                if lock_dir.is_dir()
-                else _retire_artifact_lock_file
-            )
-            if retire(lock_dir, uuid.uuid4().hex):
+            if _retire_artifact_lock_directory(lock_dir, uuid.uuid4().hex):
                 return True
             time.sleep(0.005)
             continue
@@ -1621,12 +1711,7 @@ def _reclaim_artifact_lock_for_dead_process(
             continue
         if owner_pid != process_pid:
             return False
-        retire = (
-            _retire_artifact_lock_directory
-            if lock_dir.is_dir()
-            else _retire_artifact_lock_file
-        )
-        if retire(lock_dir, uuid.uuid4().hex):
+        if _retire_artifact_lock_directory(lock_dir, uuid.uuid4().hex):
             return True
         time.sleep(0.005)
     return not lock_dir.exists()
@@ -1684,40 +1769,86 @@ class _ArtifactLock:
                 return
             except FileExistsError:
                 _discard_prepared_atomic_write(candidate)
-                owner_token: str | None = None
-                try:
-                    legacy_directory = self.lock_dir.is_dir()
-                    owner_source = (
-                        self.lock_dir / "owner.pid"
-                        if legacy_directory
-                        else self.lock_dir
-                    )
-                    owner_pid, owner_token = _artifact_lock_owner(
-                        _read_bounded_regular_file(
-                            owner_source, 256, deadline=deadline
-                        )
-                    )
-                except (FileNotFoundError, OSError, KeyError, TypeError, ValueError):
-                    owner_pid = None
-                    legacy_directory = self.lock_dir.is_dir()
-                with _PROCESS_ARTIFACT_LOCK_TOKENS_LOCK:
-                    active_local_token = _PROCESS_ARTIFACT_LOCK_TOKENS.get(key)
-                abandoned = owner_pid is not None and not pid_alive(owner_pid)
-                if owner_pid == os.getpid():
-                    abandoned = not owner_token or active_local_token != owner_token
-                if owner_pid is None:
+                legacy_directory = self.lock_dir.is_dir()
+                retired = False
+                if not legacy_directory:
                     try:
-                        abandoned = time.time() - self.lock_dir.stat().st_mtime > 60
-                    except OSError:
-                        abandoned = False
-                if abandoned:
-                    retire = (
-                        _retire_artifact_lock_directory
-                        if legacy_directory
-                        else _retire_artifact_lock_file
-                    )
-                    if retire(self.lock_dir, uuid.uuid4().hex):
-                        continue
+                        with _locked_artifact_lock_generation(
+                            self.lock_dir, deadline=deadline
+                        ) as (owner_handle, owner_details, owner_payload):
+                            try:
+                                owner_pid, owner_token = _artifact_lock_owner(
+                                    owner_payload
+                                )
+                            except (KeyError, TypeError, ValueError):
+                                owner_pid, owner_token = None, None
+                            with _PROCESS_ARTIFACT_LOCK_TOKENS_LOCK:
+                                active_local_token = (
+                                    _PROCESS_ARTIFACT_LOCK_TOKENS.get(key)
+                                )
+                            abandoned = (
+                                owner_pid is not None and not pid_alive(owner_pid)
+                            )
+                            if owner_pid == os.getpid():
+                                abandoned = (
+                                    not owner_token
+                                    or active_local_token != owner_token
+                                )
+                            if owner_pid is None:
+                                abandoned = (
+                                    time.time()
+                                    - os.fstat(owner_handle.fileno()).st_mtime
+                                    > 60
+                                )
+                            generation = _artifact_lock_file_identity(
+                                owner_details
+                            )
+                            if abandoned and _artifact_lock_path_matches_generation(
+                                self.lock_dir, generation
+                            ):
+                                retired = _retire_artifact_lock_file(
+                                    self.lock_dir, uuid.uuid4().hex
+                                )
+                    except (FileNotFoundError, OSError, OrchestratorError):
+                        retired = False
+                else:
+                    owner_token = None
+                    try:
+                        owner_pid, owner_token = _artifact_lock_owner(
+                            _read_bounded_regular_file(
+                                self.lock_dir / "owner.pid",
+                                256,
+                                deadline=deadline,
+                            )
+                        )
+                    except (
+                        FileNotFoundError,
+                        OSError,
+                        KeyError,
+                        TypeError,
+                        ValueError,
+                    ):
+                        owner_pid = None
+                    with _PROCESS_ARTIFACT_LOCK_TOKENS_LOCK:
+                        active_local_token = _PROCESS_ARTIFACT_LOCK_TOKENS.get(key)
+                    abandoned = owner_pid is not None and not pid_alive(owner_pid)
+                    if owner_pid == os.getpid():
+                        abandoned = (
+                            not owner_token or active_local_token != owner_token
+                        )
+                    if owner_pid is None:
+                        try:
+                            abandoned = (
+                                time.time() - self.lock_dir.stat().st_mtime > 60
+                            )
+                        except OSError:
+                            abandoned = False
+                    if abandoned:
+                        retired = _retire_artifact_lock_directory(
+                            self.lock_dir, uuid.uuid4().hex
+                        )
+                if retired:
+                    continue
                 if time.monotonic() >= deadline:
                     raise OrchestratorError(
                         f"Timed out acquiring artifact lock for run: {self.run_dir.name}"
@@ -2222,6 +2353,160 @@ def _enforce_windows_private_acl(path: Path, *, is_dir: bool) -> None:
         )
 
 
+def _open_windows_relative_native_handle(
+    parent_handle: Any,
+    name: str,
+    *,
+    writable: bool,
+    is_dir: bool,
+    create: bool = False,
+) -> Any:
+    if os.name != "nt":
+        raise OrchestratorError("Windows relative handles are unavailable.")
+    import ctypes
+    from ctypes import wintypes
+
+    class UnicodeString(ctypes.Structure):
+        _fields_ = (
+            ("Length", wintypes.USHORT),
+            ("MaximumLength", wintypes.USHORT),
+            ("Buffer", wintypes.LPWSTR),
+        )
+
+    class ObjectAttributes(ctypes.Structure):
+        _fields_ = (
+            ("Length", wintypes.ULONG),
+            ("RootDirectory", wintypes.HANDLE),
+            ("ObjectName", ctypes.POINTER(UnicodeString)),
+            ("Attributes", wintypes.ULONG),
+            ("SecurityDescriptor", ctypes.c_void_p),
+            ("SecurityQualityOfService", ctypes.c_void_p),
+        )
+
+    class IoStatusBlock(ctypes.Structure):
+        _fields_ = (("Status", ctypes.c_void_p), ("Information", ctypes.c_size_t))
+
+    encoded_name = name.encode("utf-16-le")
+    name_buffer = ctypes.create_unicode_buffer(name)
+    unicode_name = UnicodeString(
+        len(encoded_name),
+        len(encoded_name) + 2,
+        ctypes.cast(name_buffer, wintypes.LPWSTR),
+    )
+    attributes = ObjectAttributes(
+        ctypes.sizeof(ObjectAttributes),
+        parent_handle,
+        ctypes.pointer(unicode_name),
+        0x40,
+        None,
+        None,
+    )
+    desired_access = 0x80000000 | 0x00020000 | 0x00100000
+    if writable:
+        desired_access |= 0x40000000 | 0x00040000 | 0x00010000
+    options = 0x00000020 | 0x00200000
+    options |= 0x00000001 if is_dir else 0x00000040
+    ntdll = ctypes.WinDLL("ntdll")
+    ntdll.NtCreateFile.argtypes = (
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.DWORD,
+        ctypes.POINTER(ObjectAttributes),
+        ctypes.POINTER(IoStatusBlock),
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
+    ntdll.NtCreateFile.restype = ctypes.c_long
+    ntdll.RtlNtStatusToDosError.argtypes = (ctypes.c_long,)
+    ntdll.RtlNtStatusToDosError.restype = wintypes.ULONG
+    opened = wintypes.HANDLE()
+    io_status = IoStatusBlock()
+    status = ntdll.NtCreateFile(
+        ctypes.byref(opened),
+        desired_access,
+        ctypes.byref(attributes),
+        ctypes.byref(io_status),
+        None,
+        0x80 if create else 0,
+        0x00000001 | 0x00000002 | 0x00000004,
+        2 if create else 1,
+        options,
+        None,
+        0,
+    )
+    if status < 0:
+        error = int(ntdll.RtlNtStatusToDosError(status))
+        if error in {2, 3}:
+            raise FileNotFoundError(error, "Managed artifact is unavailable", name)
+        if error in {80, 183}:
+            raise FileExistsError(error, "Managed artifact already exists", name)
+        raise ctypes.WinError(error)
+    return opened.value
+
+
+def _windows_list_directory_handle(native_handle: Any) -> list[str]:
+    if os.name != "nt":
+        raise OrchestratorError("Windows handle enumeration is unavailable.")
+    import ctypes
+    from ctypes import wintypes
+
+    class FileIdBothDirectoryInfo(ctypes.Structure):
+        _fields_ = (
+            ("NextEntryOffset", wintypes.DWORD),
+            ("FileIndex", wintypes.DWORD),
+            ("CreationTime", ctypes.c_longlong),
+            ("LastAccessTime", ctypes.c_longlong),
+            ("LastWriteTime", ctypes.c_longlong),
+            ("ChangeTime", ctypes.c_longlong),
+            ("EndOfFile", ctypes.c_longlong),
+            ("AllocationSize", ctypes.c_longlong),
+            ("FileAttributes", wintypes.DWORD),
+            ("FileNameLength", wintypes.DWORD),
+            ("EaSize", wintypes.DWORD),
+            ("ShortNameLength", ctypes.c_ubyte),
+            ("ShortName", wintypes.WCHAR * 12),
+            ("FileId", ctypes.c_longlong),
+            ("FileName", wintypes.WCHAR * 1),
+        )
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetFileInformationByHandleEx.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
+    kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    names: list[str] = []
+    while True:
+        buffer = ctypes.create_string_buffer(64 * 1024)
+        if not kernel32.GetFileInformationByHandleEx(
+            native_handle, 10, buffer, len(buffer)
+        ):
+            error = ctypes.get_last_error()
+            if error == 18:
+                break
+            raise ctypes.WinError(error)
+        offset = 0
+        while True:
+            address = ctypes.addressof(buffer) + offset
+            entry = FileIdBothDirectoryInfo.from_address(address)
+            name = ctypes.wstring_at(
+                address + FileIdBothDirectoryInfo.FileName.offset,
+                int(entry.FileNameLength) // 2,
+            )
+            if name not in {".", ".."}:
+                names.append(name)
+            if entry.NextEntryOffset == 0:
+                break
+            offset += int(entry.NextEntryOffset)
+    return names
+
+
 @contextlib.contextmanager
 def _open_windows_managed_file(
     path: Path, *, writable: bool = False, verify_private: bool = True
@@ -2283,14 +2568,11 @@ def _open_windows_managed_file(
     invalid_handle = ctypes.c_void_p(-1).value
     file_handle: Any | None = None
     try:
-        native_handle = kernel32.CreateFileW(
-            str(path),
-            desired_access,
-            0x00000001 | 0x00000002 | 0x00000004,
-            None,
-            3,
-            0x00200000,
-            None,
+        native_handle = _open_windows_relative_native_handle(
+            _parent_handle,
+            path.name,
+            writable=writable,
+            is_dir=False,
         )
         if native_handle in {None, invalid_handle}:
             raise ctypes.WinError(ctypes.get_last_error())
@@ -2651,7 +2933,9 @@ def _secure_private_writable_handle(handle: Any, path: Path) -> None:
 
 
 @contextlib.contextmanager
-def _create_windows_private_file(path: Path) -> Any:
+def _create_windows_private_file(
+    path: Path, *, parent_handle: Any | None = None
+) -> Any:
     import ctypes
     import msvcrt
     from ctypes import wintypes
@@ -2668,14 +2952,24 @@ def _create_windows_private_file(path: Path) -> Any:
     )
     kernel32.CreateFileW.restype = ctypes.c_void_p
     kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
-    native_handle = kernel32.CreateFileW(
-        str(path),
-        0x80000000 | 0x40000000 | 0x00020000 | 0x00040000,
-        0x00000001 | 0x00000002 | 0x00000004,
-        None,
-        1,
-        0x00200000,
-        None,
+    native_handle = (
+        _open_windows_relative_native_handle(
+            parent_handle,
+            path.name,
+            writable=True,
+            is_dir=False,
+            create=True,
+        )
+        if parent_handle is not None
+        else kernel32.CreateFileW(
+            str(path),
+            0x80000000 | 0x40000000 | 0x00020000 | 0x00040000,
+            0x00000001 | 0x00000002 | 0x00000004,
+            None,
+            1,
+            0x00200000,
+            None,
+        )
     )
     invalid_handle = ctypes.c_void_p(-1).value
     if native_handle in {None, invalid_handle}:
@@ -2717,7 +3011,7 @@ def _iter_managed_artifacts(run_dir: Path) -> list[tuple[Path, bool]]:
             names = (
                 os.listdir(handle)
                 if os.name != "nt"
-                else os.listdir(bound_directory)
+                else _windows_list_directory_handle(handle)
             )
             for name in names:
                 path = bound_directory / name
@@ -2828,7 +3122,9 @@ def _prepare_private_atomic_write(
                     pass
                 parent_context = _open_windows_managed_directory(path.parent)
                 _parent_handle, parent_details = parent_context.__enter__()
-            handle_context = _create_windows_private_file(temporary_path)
+            handle_context = _create_windows_private_file(
+                temporary_path, parent_handle=_parent_handle
+            )
             handle = handle_context.__enter__()
             source_details = os.fstat(handle.fileno())
             parent_anchor = (
@@ -3637,6 +3933,25 @@ def _git_transition_evidence(
     before_worktree = _diff_change_records(str(before.get("_raw_diff_text") or ""))
     after_worktree = _diff_change_records(str(after.get("_raw_diff_text") or ""))
     changes.update(after_worktree ^ before_worktree)
+    before_hashes = before.get("_raw_hashes") or {}
+    after_hashes = after.get("_raw_hashes") or {}
+    if isinstance(before_hashes, Mapping) and isinstance(after_hashes, Mapping):
+        unchanged_content: set[str] = set()
+        for path in set(before_hashes) & set(after_hashes):
+            old_evidence = before_hashes.get(path)
+            new_evidence = after_hashes.get(path)
+            if (
+                isinstance(old_evidence, Mapping)
+                and isinstance(new_evidence, Mapping)
+                and old_evidence.get("exists") is True
+                and new_evidence.get("exists") is True
+                and isinstance(old_evidence.get("sha256"), str)
+                and old_evidence.get("sha256") == new_evidence.get("sha256")
+            ):
+                unchanged_content.add(str(path).replace("\\", "/"))
+        changes = {
+            record for record in changes if record[0] not in unchanged_content
+        }
     return paths, changes, errors
 
 
@@ -3721,14 +4036,16 @@ def read_file_delta(path: Path, offset: int = 0, max_bytes: int = 20000) -> dict
         raise OrchestratorError("Offset cannot be negative.")
     if max_bytes < 1:
         raise OrchestratorError("max_bytes must be positive.")
-    if not path.exists():
+    try:
+        with _open_managed_file(path, verify_private=False) as (handle, _details):
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            if offset > size:
+                offset = size
+            handle.seek(offset)
+            data = handle.read(max_bytes)
+    except FileNotFoundError:
         return {"path": str(path), "text": "", "offset": offset, "next_offset": offset, "size": 0, "truncated": False}
-    size = path.stat().st_size
-    if offset > size:
-        offset = size
-    with path.open("rb") as handle:
-        handle.seek(offset)
-        data = handle.read(max_bytes)
     next_offset = offset + len(data)
     text = data.decode("utf-8", errors="replace")
     return {
@@ -3742,12 +4059,16 @@ def read_file_delta(path: Path, offset: int = 0, max_bytes: int = 20000) -> dict
 
 
 def tail_file(path: Path, chars: int = 4000) -> str:
-    if chars <= 0 or not path.exists():
+    if chars <= 0:
         return ""
-    size = path.stat().st_size
-    with path.open("rb") as handle:
-        handle.seek(max(0, size - max(chars * 4, 4096)))
-        data = handle.read()
+    try:
+        with _open_managed_file(path, verify_private=False) as (handle, _details):
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - max(chars * 4, 4096)))
+            data = handle.read()
+    except FileNotFoundError:
+        return ""
     return str(redact(data.decode("utf-8", errors="replace")[-chars:]))
 
 
@@ -3806,7 +4127,7 @@ def extract_tool_calls_from_payload(payload: Any) -> list[dict[str, Any]]:
 
 def _read_event_seq_sidecar(path: Path) -> tuple[int, int | None]:
     try:
-        with path.open("rb") as handle:
+        with _open_managed_file(path, verify_private=False) as (handle, _details):
             raw = handle.read(256)
             if handle.read(1):
                 return 0, None
@@ -3954,9 +4275,13 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def read_events(path: Path, max_lines: int | None = None) -> list[dict[str, Any]]:
-    if not path.exists():
+    try:
+        payload = _read_bounded_regular_file(
+            path, MAX_MANAGED_ARTIFACT_BYTES
+        )
+    except FileNotFoundError:
         return []
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    lines = payload.decode("utf-8", errors="replace").splitlines()
     if max_lines is not None and max_lines > 0:
         lines = lines[-max_lines:]
     events: list[dict[str, Any]] = []
@@ -5322,6 +5647,7 @@ def _scrub_guarded_value(value: Any, sensitive_values: tuple[str, ...]) -> Any:
 class _LaunchAdmissionReservation:
     team_id: str
     owner_pid: int
+    deadline: float | None = None
     active: bool = True
     registered_run_ids: list[str] | None = None
 
@@ -5352,6 +5678,9 @@ class PreparedWorkerLaunch:
     skip_cost_guard: bool = False
     sensitive_values: tuple[str, ...] = ()
     admission_reservation: _LaunchAdmissionReservation | None = None
+    _preflight_git_before: dict[str, Any] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if self.mode not in {"one_shot", "streaming"}:
@@ -6001,6 +6330,16 @@ def _remaining_deadline(deadline: float | None, ceiling: float) -> float:
     return max(0.0, min(ceiling, deadline - time.monotonic()))
 
 
+def _runtime_execution_deadline(
+    launch_deadline: float, started_monotonic: float
+) -> float:
+    remaining = max(0.0, launch_deadline - started_monotonic)
+    finalization_reserve = min(
+        remaining, 0.55, max(0.25, remaining * 0.65)
+    )
+    return launch_deadline - finalization_reserve
+
+
 def _cleanup_pending_response(
     metadata: Mapping[str, Any],
     process: subprocess.Popen[Any],
@@ -6147,6 +6486,9 @@ def _initialize_prepared_run(
     prepared: PreparedWorkerLaunch,
 ) -> tuple[Path, dict[str, Any]]:
     metadata = prepared.metadata()
+    transaction_deadline = _effective_deadline()
+    if transaction_deadline is not None:
+        metadata["transaction_deadline_monotonic"] = transaction_deadline
     run_id = str(metadata["run_id"])
     artifact_root = Path(str(metadata["artifact_root"]))
     run_dir = artifact_root / "runs" / run_id
@@ -6184,15 +6526,24 @@ def _initialize_prepared_run(
         Path(str(metadata["workspace_root"])),
         artifact_root,
     )
-    metadata["git_before"] = _git_snapshot_projection(
-        capture_git_snapshot(
+    if prepared.mode == "one_shot":
+        git_before_raw = capture_git_snapshot(
             run_dir,
             Path(str(metadata["workspace_root"])),
             "before",
             prepared.sensitive_values,
-        ),
-        prepared.sensitive_values,
-    )
+        )
+        object.__setattr__(prepared, "_preflight_git_before", git_before_raw)
+        metadata["git_before"] = _git_snapshot_projection(
+            git_before_raw, prepared.sensitive_values
+        )
+    else:
+        metadata["git_before"] = {
+            "ok": False,
+            "label": "before",
+            "evidence_complete": False,
+            "state": "pending_worker_capture",
+        }
     _scrub_run_artifacts(run_dir, prepared.sensitive_values)
     _secure_run_artifacts(run_dir)
     write_metadata(run_dir, metadata)
@@ -6277,12 +6628,15 @@ def _start_one_shot_launch_inner(
             ),
         )
     try:
-        git_before_raw = capture_git_snapshot(
-            run_dir,
-            Path(str(metadata["workspace_root"])),
-            "before",
-            prepared.sensitive_values,
-        )
+        git_before_raw = prepared._preflight_git_before
+        object.__setattr__(prepared, "_preflight_git_before", None)
+        if git_before_raw is None:
+            git_before_raw = capture_git_snapshot(
+                run_dir,
+                Path(str(metadata["workspace_root"])),
+                "before",
+                prepared.sensitive_values,
+            )
         if git_before_raw.get("is_git_repo") and not git_before_raw.get("ok"):
             raise OrchestratorError("Pre-launch Git evidence is unavailable.")
     except Exception:
@@ -6311,6 +6665,9 @@ def _start_one_shot_launch_inner(
                 "The write-scope policy could not be pinned before runtime launch.",
             ),
         )
+    launch_deadline = _effective_deadline()
+    if launch_deadline is None:
+        raise OrchestratorError("One-shot launch deadline is unavailable.")
     try:
         process = subprocess.Popen(
             command,
@@ -6321,10 +6678,8 @@ def _start_one_shot_launch_inner(
             stderr=subprocess.PIPE,
         )
         started_monotonic = time.monotonic()
-        launch_deadline = started_monotonic + spec.timeout_seconds
-        _OPERATION_DEADLINE.set(launch_deadline)
-        runtime_deadline = launch_deadline - min(
-            1.0, max(0.9, spec.timeout_seconds * 0.2)
+        runtime_deadline = _runtime_execution_deadline(
+            launch_deadline, started_monotonic
         )
     except OSError:
         return _record_blocked_launch(
@@ -6548,9 +6903,9 @@ def _start_one_shot_launch(
     run_dir: Path,
     metadata: dict[str, Any],
 ) -> dict[str, Any]:
-    deadline = _effective_deadline() or (
-        time.monotonic() + prepared.launch_spec.timeout_seconds
-    )
+    deadline = _effective_deadline()
+    if deadline is None:
+        raise OrchestratorError("One-shot transaction deadline is unavailable.")
     token = _OPERATION_DEADLINE.set(deadline)
     try:
         try:
@@ -6625,7 +6980,17 @@ def start_prepared_worker_launch(
 ) -> dict[str, Any]:
     if not isinstance(prepared, PreparedWorkerLaunch):
         raise TypeError("prepared must be a PreparedWorkerLaunch")
-    deadline = time.monotonic() + prepared.launch_spec.timeout_seconds
+    inherited_deadline = _effective_deadline()
+    reservation = prepared.admission_reservation
+    deadline = (
+        inherited_deadline
+        or (reservation.deadline if reservation is not None else None)
+        or (
+            time.monotonic()
+            + prepared.launch_spec.timeout_seconds
+            + TRANSACTION_CLOSURE_RESERVE_SECONDS
+        )
+    )
     token = _OPERATION_DEADLINE.set(deadline)
     try:
         return _start_prepared_worker_launch_inner(prepared)
@@ -6718,9 +7083,15 @@ def _validate_worker_process_identity(identity: ProcessIdentity) -> None:
 
 
 def _write_pipe_chunk(pipe: Any, payload: bytes) -> None:
+    _check_deadline(
+        message="The private worker protocol exceeded the launch deadline."
+    )
     written = pipe.write(payload)
     if written != len(payload):
         raise BrokenPipeError("short write to internal worker protocol")
+    _check_deadline(
+        message="The private worker protocol exceeded the launch deadline."
+    )
 
 
 def _worker_start_gate_payload(metadata: Mapping[str, Any]) -> dict[str, Any]:
@@ -6860,7 +7231,9 @@ def _start_streaming_controller(
             )
         admission_active = True
     worker: subprocess.Popen[bytes] | None = None
-    worker_deadline: float | None = None
+    worker_deadline = _effective_deadline()
+    if worker_deadline is None:
+        raise OrchestratorError("Streaming transaction deadline is unavailable.")
     try:
         try:
             if not prepared.skip_cost_guard:
@@ -6885,11 +7258,9 @@ def _start_streaming_controller(
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                creationflags=creationflags,
-                **popen_kwargs,
-            )
-            worker_deadline = time.monotonic() + spec.timeout_seconds
-            _OPERATION_DEADLINE.set(worker_deadline)
+            creationflags=creationflags,
+            **popen_kwargs,
+        )
         except OSError:
             return _record_blocked_launch(
                 run_dir,
@@ -7182,7 +7553,7 @@ def _read_bounded_payload(stream: Any, limit: int, label: str) -> bytes:
 
 
 def _wait_for_controller_worker_identity(run_dir: Path) -> dict[str, Any]:
-    deadline = time.monotonic() + 5.0
+    deadline = _effective_deadline() or (time.monotonic() + 5.0)
     latest: dict[str, Any] = {}
     while time.monotonic() < deadline:
         latest = read_metadata(run_dir)
@@ -7280,21 +7651,158 @@ def _parse_worker_frame(
     return metadata, identity, arguments
 
 
-def _team_start_barrier_ready(metadata: Mapping[str, Any]) -> bool:
+def _team_manifest_payload(metadata: Mapping[str, Any]) -> dict[str, Any] | None:
     team_id = metadata.get("team_id")
     if not isinstance(team_id, str) or not team_id:
-        return True
+        return None
     manifest_path = metadata.get("team_manifest_path")
     if not isinstance(manifest_path, str) or not manifest_path:
-        return False
+        return None
     try:
         payload = _read_bounded_regular_file(
             Path(manifest_path), MAX_MANAGED_ARTIFACT_BYTES
         )
         manifest = json.loads(payload.decode("utf-8"))
     except Exception:
+        return None
+    if not isinstance(manifest, dict) or manifest.get("team_id") != team_id:
+        return None
+    return manifest
+
+
+def _validate_team_worker_identity(
+    metadata: Mapping[str, Any],
+    *,
+    expected_nonce: str,
+    expected_pid: int | None = None,
+) -> ProcessIdentity:
+    try:
+        recorded = ProcessIdentity.from_dict(
+            metadata.get("worker_process_identity")
+        )
+    except (TypeError, ValueError) as exc:
+        raise _runtime_not_trusted(
+            "Controller worker identity evidence is invalid."
+        ) from exc
+    controller_pid = metadata.get("controller_pid")
+    worker_pid = metadata.get("worker_pid")
+    if (
+        not isinstance(controller_pid, int)
+        or isinstance(controller_pid, bool)
+        or controller_pid <= 0
+        or not isinstance(worker_pid, int)
+        or isinstance(worker_pid, bool)
+        or worker_pid <= 0
+        or recorded.pid != worker_pid
+        or recorded.parent_pid != controller_pid
+        or recorded.launch_nonce != expected_nonce
+        or (expected_pid is not None and worker_pid != expected_pid)
+    ):
+        raise _runtime_not_trusted(
+            "Controller worker identity ownership does not match this process."
+        )
+    comparison = compare_process_identity(
+        recorded, expected_launch_nonce=expected_nonce
+    )
+    live = comparison.live
+    if (
+        comparison.state != "match"
+        or live is None
+        or live.pid != worker_pid
+        or live.parent_pid != controller_pid
+        or live.launch_nonce != expected_nonce
+    ):
+        raise _runtime_not_trusted(
+            "Controller worker process identity is no longer stable."
+        )
+    for field_name in ("process_group_id", "session_id"):
+        expected_value = getattr(recorded, field_name)
+        if expected_value is not None and getattr(live, field_name) != expected_value:
+            raise _runtime_not_trusted(
+                "Controller worker process ownership evidence changed."
+            )
+    return recorded
+
+
+def _mark_team_worker_ready(
+    run_dir: Path, nonce: str
+) -> dict[str, Any]:
+    with artifact_lock(run_dir):
+        metadata = read_metadata(run_dir)
+        if str(metadata.get("status") or "") not in {"starting", "running"}:
+            raise _runtime_not_trusted("Controller closed the worker start gate.")
+        public = metadata.get("runtime_launch")
+        worker_launch = metadata.get("worker_launch")
+        if (
+            not isinstance(public, Mapping)
+            or not isinstance(worker_launch, Mapping)
+            or public.get("launch_nonce") != nonce
+            or worker_launch.get("nonce_consumed") is not False
+            or worker_launch.get("start_gate") != "closed"
+        ):
+            raise _runtime_not_trusted(
+                "Internal worker launch nonce is unavailable."
+            )
+        recorded = _validate_team_worker_identity(
+            metadata, expected_nonce=nonce, expected_pid=os.getpid()
+        )
+        if worker_launch.get("team_ready") is True:
+            return metadata
+        ready_at = utc_now_iso()
+        updated_launch = dict(worker_launch)
+        updated_launch.update(
+            {
+                "team_ready": True,
+                "team_ready_at": ready_at,
+                "team_ready_sha256": hashlib.sha256(
+                    (
+                        f"{metadata.get('team_id')}:{run_dir.name}:"
+                        f"{recorded.pid}:{recorded.creation_token}"
+                    ).encode("utf-8")
+                ).hexdigest(),
+            }
+        )
+        metadata["worker_launch"] = updated_launch
+        _atomic_write_bytes(run_dir / "metadata.json", _metadata_bytes(metadata))
+        return metadata
+
+
+def _team_all_members_ready(metadata: Mapping[str, Any]) -> bool:
+    manifest = _team_manifest_payload(metadata)
+    if manifest is None or manifest.get("status") not in {"prepared", "authorized"}:
         return False
-    if manifest.get("status") != "authorized" or manifest.get("team_id") != team_id:
+    runs = manifest.get("runs")
+    if not isinstance(runs, list) or not runs:
+        return False
+    for item in runs:
+        if not isinstance(item, Mapping):
+            return False
+        run_id = item.get("run_id")
+        if not isinstance(run_id, str) or not RUN_ID_RE.match(run_id):
+            return False
+        try:
+            member = read_metadata(safe_run_dir(run_id))
+        except Exception:
+            return False
+        launch = member.get("worker_launch")
+        if (
+            member.get("team_id") != metadata.get("team_id")
+            or str(member.get("status") or "") not in {"starting", "running"}
+            or not isinstance(launch, Mapping)
+            or launch.get("team_ready") is not True
+        ):
+            return False
+    return True
+
+
+def _team_start_barrier_ready(metadata: Mapping[str, Any]) -> bool:
+    team_id = metadata.get("team_id")
+    if not isinstance(team_id, str) or not team_id:
+        return True
+    manifest = _team_manifest_payload(metadata)
+    if manifest is None:
+        return False
+    if manifest.get("status") != "authorized":
         return False
     runs = manifest.get("runs")
     if not isinstance(runs, list) or not runs:
@@ -7306,6 +7814,26 @@ def _team_start_barrier_ready(metadata: Mapping[str, Any]) -> bool:
             return False
         run_id = item.get("run_id")
         if not isinstance(run_id, str) or not RUN_ID_RE.match(run_id):
+            return False
+        try:
+            member = read_metadata(safe_run_dir(run_id))
+            nonce = str(
+                (member.get("runtime_launch") or {}).get("launch_nonce") or ""
+            )
+            recorded = _validate_team_worker_identity(
+                member, expected_nonce=nonce
+            )
+        except Exception:
+            return False
+        launch = member.get("worker_launch")
+        if (
+            member.get("team_id") != team_id
+            or str(member.get("status") or "") not in {"starting", "running"}
+            or not isinstance(launch, Mapping)
+            or launch.get("team_ready") is not True
+            or item.get("worker_pid") != recorded.pid
+            or item.get("worker_creation_token") != recorded.creation_token
+        ):
             return False
         if run_id == own_run_id:
             own_entry = item
@@ -7323,11 +7851,39 @@ def _team_start_barrier_ready(metadata: Mapping[str, Any]) -> bool:
     return True
 
 
+def _team_own_authorization_ready(metadata: Mapping[str, Any]) -> bool:
+    manifest = _team_manifest_payload(metadata)
+    if manifest is None or manifest.get("status") != "authorized":
+        return False
+    own_run_id = str(metadata.get("run_id") or "")
+    identity = metadata.get("worker_process_identity")
+    if not isinstance(identity, Mapping):
+        return False
+    for item in manifest.get("runs") or []:
+        if (
+            isinstance(item, Mapping)
+            and item.get("run_id") == own_run_id
+            and item.get("worker_pid") == metadata.get("worker_pid")
+            and item.get("worker_creation_token")
+            == identity.get("creation_token")
+        ):
+            return True
+    return False
+
+
 def _consume_worker_nonce(run_dir: Path, nonce: str) -> dict[str, Any]:
-    deadline = time.monotonic() + WORKER_START_GATE_TIMEOUT_SECONDS
-    operation_deadline = _effective_deadline()
-    if operation_deadline is not None:
-        deadline = min(deadline, operation_deadline)
+    operation_deadline = _effective_deadline() or (
+        time.monotonic() + INTERNAL_WORKER_NONCE_TTL_SECONDS
+    )
+    initial = read_metadata(run_dir)
+    team_launch = bool(initial.get("team_id"))
+    if team_launch:
+        _mark_team_worker_ready(run_dir, nonce)
+        gate_deadline: float | None = None
+    else:
+        gate_deadline = (
+            time.monotonic() + WORKER_START_GATE_TIMEOUT_SECONDS
+        )
     while True:
         latest = read_metadata(run_dir)
         status = str(latest.get("status") or "")
@@ -7336,6 +7892,10 @@ def _consume_worker_nonce(run_dir: Path, nonce: str) -> dict[str, Any]:
         if latest.get("team_id"):
             if _team_start_barrier_ready(latest):
                 break
+            if gate_deadline is None and _team_all_members_ready(latest):
+                gate_deadline = (
+                    time.monotonic() + WORKER_START_GATE_TIMEOUT_SECONDS
+                )
         else:
             try:
                 _read_worker_start_gate(run_dir)
@@ -7348,7 +7908,12 @@ def _consume_worker_nonce(run_dir: Path, nonce: str) -> dict[str, Any]:
                     raise _runtime_not_trusted("Worker start gate is invalid.") from exc
             else:
                 break
-        if time.monotonic() >= deadline:
+        effective_gate_deadline = operation_deadline
+        if gate_deadline is not None:
+            effective_gate_deadline = min(
+                effective_gate_deadline, gate_deadline
+            )
+        if time.monotonic() >= effective_gate_deadline:
             raise _runtime_not_trusted("Worker start gate did not open in time.")
         time.sleep(0.01)
     with artifact_lock(run_dir):
@@ -7390,7 +7955,7 @@ def _consume_worker_nonce(run_dir: Path, nonce: str) -> dict[str, Any]:
                 "Controller worker identity ownership does not match this process."
             )
         if team_launch:
-            if not _team_start_barrier_ready(metadata):
+            if not _team_own_authorization_ready(metadata):
                 raise _runtime_not_trusted("Team authorization gate is invalid.")
         elif (
             not isinstance(gate, Mapping)
@@ -7558,6 +8123,12 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
         )
         if git_before_raw.get("is_git_repo") and not git_before_raw.get("ok"):
             raise OrchestratorError("Pre-launch Git evidence is unavailable.")
+        metadata = update_metadata(
+            run_dir,
+            git_before=_git_snapshot_projection(
+                git_before_raw, sensitive_values
+            ),
+        )
     except Exception:
         return _record_blocked_launch(
             run_dir,
@@ -7598,6 +8169,19 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
         return _worker_security_failure(
             run_dir, _runtime_identity_changed(executable_identity.canonical_path)
         )
+    if metadata.get("team_id") and not _team_start_barrier_ready(metadata):
+        return _worker_security_failure(
+            run_dir,
+            _runtime_not_trusted(
+                "Team authorization membership changed before runtime launch."
+            ),
+        )
+    launch_deadline = _effective_deadline()
+    if launch_deadline is None:
+        return _worker_security_failure(
+            run_dir,
+            _runtime_not_trusted("Streaming transaction deadline is unavailable."),
+        )
     try:
         proc = subprocess.Popen(
             command,
@@ -7610,10 +8194,8 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
             **popen_kwargs,
         )
         started_monotonic = time.monotonic()
-        launch_deadline = started_monotonic + timeout
-        _OPERATION_DEADLINE.set(launch_deadline)
-        runtime_deadline = launch_deadline - min(
-            1.0, max(0.9, timeout * 0.2)
+        runtime_deadline = _runtime_execution_deadline(
+            launch_deadline, started_monotonic
         )
     except OSError:
         return _record_blocked_launch(
@@ -7625,13 +8207,20 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
                 "runtime_launch_failed", "The approved runtime process could not be started."
             ),
         )
-    io_cancel = threading.Event()
-    io_errors: queue.Queue[tuple[str, BaseException]] = queue.Queue()
-    stdout_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=64)
-    stderr_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=64)
-    termination_lock = threading.Lock()
-    termination_requested = threading.Event()
-    cleanup_pending = threading.Event()
+    try:
+        io_cancel = threading.Event()
+        io_errors: queue.Queue[tuple[str, BaseException]] = queue.Queue()
+        stdout_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=64)
+        stderr_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=64)
+        termination_lock = threading.Lock()
+        termination_requested = threading.Event()
+        cleanup_pending = threading.Event()
+        if time.monotonic() >= runtime_deadline:
+            io_cancel.set()
+    except Exception:
+        if not _terminate_owned_process(proc, deadline=launch_deadline):
+            raise _OwnedCleanupPending(proc)
+        raise
 
     def terminate_child_once() -> None:
         with termination_lock:
@@ -7715,28 +8304,28 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
         finally:
             _OPERATION_DEADLINE.reset(token)
 
-    drain_threads = [
-        threading.Thread(
-            target=run_with_deadline,
-            args=(drain_output, proc.stdout, stdout_queue, "stdout"),
-            name=f"cc-runtime-stdout-{run_id}",
-            daemon=True,
-        ),
-        threading.Thread(
-            target=run_with_deadline,
-            args=(drain_output, proc.stderr, stderr_queue, "stderr"),
-            name=f"cc-runtime-stderr-{run_id}",
-            daemon=True,
-        ),
-    ]
-    stdin_thread = threading.Thread(
-        target=run_with_deadline,
-        args=(pump_stdin,),
-        name=f"cc-runtime-stdin-{run_id}",
-        daemon=True,
-    )
     started_io_threads: list[threading.Thread] = []
     try:
+        drain_threads = [
+            threading.Thread(
+                target=run_with_deadline,
+                args=(drain_output, proc.stdout, stdout_queue, "stdout"),
+                name=f"cc-runtime-stdout-{run_id}",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=run_with_deadline,
+                args=(drain_output, proc.stderr, stderr_queue, "stderr"),
+                name=f"cc-runtime-stderr-{run_id}",
+                daemon=True,
+            ),
+        ]
+        stdin_thread = threading.Thread(
+            target=run_with_deadline,
+            args=(pump_stdin,),
+            name=f"cc-runtime-stdin-{run_id}",
+            daemon=True,
+        )
         for thread in drain_threads:
             thread.start()
             started_io_threads.append(thread)
@@ -7756,7 +8345,9 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
             remaining = _remaining_deadline(launch_deadline, 1.0)
             if remaining > 0:
                 thread.join(timeout=remaining)
-        if cleanup_pending.is_set():
+        if cleanup_pending.is_set() or any(
+            thread.is_alive() for thread in started_io_threads
+        ):
             raise _OwnedCleanupPending(proc)
         raise
 
@@ -7983,6 +8574,15 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
                         if isinstance(raw_line, bytes)
                         else len(str(raw_line).encode("utf-8", errors="replace"))
                     )
+                    if io_cancel.is_set() or time.monotonic() >= runtime_deadline:
+                        with budget_lock:
+                            budget["observed_output_bytes"] = int(
+                                budget.get("observed_output_bytes") or 0
+                            ) + raw_bytes
+                            budget["dropped_output_bytes"] = int(
+                                budget.get("dropped_output_bytes") or 0
+                            ) + raw_bytes
+                        continue
                     with budget_lock:
                         budget["observed_output_bytes"] = int(
                             budget.get("observed_output_bytes") or 0
@@ -8133,7 +8733,13 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
                     persist_budget_unlocked("timeout")
                 io_cancel.set()
                 terminate_child_once()
-            time.sleep(min(0.2, max(0.001, _remaining_deadline(launch_deadline, 0.2))))
+            sleep_deadline = launch_deadline if (timed_out or stopped or io_failed) else runtime_deadline
+            time.sleep(
+                min(
+                    0.01 if (timed_out or stopped or io_failed) else 0.05,
+                    max(0.001, _remaining_deadline(sleep_deadline, 0.05)),
+                )
+            )
         try:
             remaining = _remaining_deadline(runtime_deadline, 5.0)
             if remaining <= 0 and proc.poll() is None:
@@ -8217,7 +8823,7 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
         budget.update(output_budget_from_metadata({"output_budget": budget}, run_dir))
         if stopped and not budget.get("stop_reason"):
             budget["stop_reason"] = "user_requested"
-        persist_budget_unlocked(str(budget.get("stop_reason") or "") or None)
+        terminal_budget = dict(budget)
     git_after_raw = capture_git_snapshot(
         run_dir,
         workspace_root,
@@ -8240,6 +8846,10 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
     git_after = _git_snapshot_projection(
         git_after_raw, sensitive_values
     )
+    scope_check = _scrub_guarded_value(scope_check_raw, sensitive_values)
+    if not scope_check.get("ok", True):
+        safe_append({"type": "write_scope_blocked", "status": "blocked", "violations": scope_check.get("violations", [])})
+    safe_append({"type": "process_exited", "status": status, "exit_code": final_exit, "duration_ms": duration_ms})
     final_metadata = update_metadata(
         run_dir,
         duration_ms=duration_ms,
@@ -8247,21 +8857,16 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
         stdout_path=str(run_dir / "stdout.txt"),
         stderr_path=str(run_dir / "stderr.txt"),
         events_path=str(run_dir / "events.ndjson"),
-        output_budget=budget,
-        stop_reason=budget.get("stop_reason") or ("timeout" if timed_out else "user_requested" if stopped else None),
+        output_budget=terminal_budget,
+        stop_reason=terminal_budget.get("stop_reason")
+        or ("timeout" if timed_out else "user_requested" if stopped else None),
         git_after=git_after,
-    )
-    scope_check = _scrub_guarded_value(scope_check_raw, sensitive_values)
-    final_metadata = update_metadata(
-        run_dir,
         write_scope_check=scope_check,
-        acceptance_status="blocked_write_scope" if not scope_check.get("ok", True) else "pending_controller_review",
-    )
-    if not scope_check.get("ok", True):
-        safe_append({"type": "write_scope_blocked", "status": "blocked", "violations": scope_check.get("violations", [])})
-    safe_append({"type": "process_exited", "status": status, "exit_code": final_exit, "duration_ms": duration_ms})
-    final_metadata = update_metadata(
-        run_dir,
+        acceptance_status=(
+            "blocked_write_scope"
+            if not scope_check.get("ok", True)
+            else "pending_controller_review"
+        ),
         status=status,
         finished_at=utc_now_iso(),
         exit_code=final_exit,
@@ -8278,7 +8883,13 @@ def stream_worker(run_id: str) -> dict[str, Any]:
     except Exception:
         initial = {"run_id": run_id}
     timeout = int(initial.get("timeout_seconds") or 1800)
-    deadline = time.monotonic() + timeout
+    recorded_deadline = initial.get("transaction_deadline_monotonic")
+    deadline = (
+        float(recorded_deadline)
+        if isinstance(recorded_deadline, (int, float))
+        and not isinstance(recorded_deadline, bool)
+        else time.monotonic() + timeout
+    )
     token = _OPERATION_DEADLINE.set(deadline)
     try:
         try:
@@ -8560,7 +9171,54 @@ def read_team_manifest(team_id: str) -> dict[str, Any]:
     return json.loads(payload.decode("utf-8"))
 
 
+def _validate_team_authorization_manifest(
+    team_id: str, data: Mapping[str, Any]
+) -> None:
+    runs = data.get("runs")
+    if not isinstance(runs, list) or not runs:
+        raise OrchestratorError("Team authorization has no members.")
+    for item in runs:
+        if not isinstance(item, Mapping):
+            raise OrchestratorError("Team authorization member is invalid.")
+        run_id = item.get("run_id")
+        if not isinstance(run_id, str) or not RUN_ID_RE.match(run_id):
+            raise OrchestratorError("Team authorization run id is invalid.")
+        member = read_metadata(safe_run_dir(run_id))
+        launch = member.get("worker_launch")
+        nonce = str(
+            (member.get("runtime_launch") or {}).get("launch_nonce") or ""
+        )
+        try:
+            recorded = _validate_team_worker_identity(
+                member, expected_nonce=nonce
+            )
+        except RuntimeSecurityError as exc:
+            raise OrchestratorError(
+                f"Team member {run_id} worker identity is no longer valid."
+            ) from exc
+        with _ACTIVE_WORKER_HANDLES_LOCK:
+            owned = _ACTIVE_WORKER_HANDLES.get(run_id)
+        if (
+            member.get("team_id") != team_id
+            or str(member.get("status") or "") not in {"starting", "running"}
+            or member.get("stop_requested_at")
+            or member.get("terminal_state_count")
+            or not isinstance(launch, Mapping)
+            or launch.get("team_ready") is not True
+            or owned is None
+            or owned.pid != recorded.pid
+            or owned.poll() is not None
+            or item.get("worker_pid") != recorded.pid
+            or item.get("worker_creation_token") != recorded.creation_token
+        ):
+            raise OrchestratorError(
+                f"Team member {run_id} is not ready for authorization."
+            )
+
+
 def write_team_manifest(team_id: str, data: dict[str, Any]) -> Path:
+    if data.get("status") == "authorized":
+        _validate_team_authorization_manifest(team_id, data)
     _set_private_directory(TEAMS_DIR)
     path = TEAMS_DIR / f"{team_id}.json"
     return write_json_file(path, data)
@@ -8660,6 +9318,77 @@ def send_instruction(
     return {"ok": True, "old_run_id": run_id, "stop": stop, "new_run": new_run, "route_drift": route_drift}
 
 
+def _wait_for_team_members_ready(
+    team_id: str,
+    runs: list[dict[str, Any]],
+    *,
+    deadline: float,
+) -> list[dict[str, Any]]:
+    while True:
+        ready: list[dict[str, Any]] = []
+        pending = False
+        for item in runs:
+            run_id = str(item["run_id"])
+            member = read_metadata(
+                safe_run_dir(run_id), deadline=deadline
+            )
+            if (
+                member.get("team_id") != team_id
+                or str(member.get("status") or "") not in {"starting", "running"}
+                or member.get("stop_requested_at")
+                or member.get("terminal_state_count")
+            ):
+                raise OrchestratorError(
+                    f"Team member {run_id} is not launchable at readiness."
+                )
+            try:
+                recorded = ProcessIdentity.from_dict(
+                    member.get("worker_process_identity")
+                )
+            except (TypeError, ValueError) as exc:
+                raise OrchestratorError(
+                    f"Team member {run_id} has invalid worker identity evidence."
+                ) from exc
+            with _ACTIVE_WORKER_HANDLES_LOCK:
+                owned = _ACTIVE_WORKER_HANDLES.get(run_id)
+            comparison = compare_process_identity(
+                recorded,
+                expected_launch_nonce=str(
+                    (member.get("runtime_launch") or {}).get("launch_nonce")
+                    or ""
+                ),
+            )
+            if (
+                owned is None
+                or owned.pid != recorded.pid
+                or owned.poll() is not None
+                or comparison.state != "match"
+            ):
+                raise OrchestratorError(
+                    f"Team member {run_id} worker ownership changed before readiness."
+                )
+            launch = member.get("worker_launch")
+            if not isinstance(launch, Mapping) or launch.get("team_ready") is not True:
+                pending = True
+                continue
+            ready.append(
+                {
+                    **item,
+                    "worker_pid": recorded.pid,
+                    "worker_creation_token": recorded.creation_token,
+                    "ready_at": launch.get("team_ready_at"),
+                    "ready_sha256": launch.get("team_ready_sha256"),
+                }
+            )
+        if not pending and len(ready) == len(runs):
+            return ready
+        if time.monotonic() >= deadline:
+            raise OrchestratorError(
+                "Team members did not reach the shared readiness barrier in time."
+            )
+        time.sleep(min(0.01, _remaining_deadline(deadline, 0.01)))
+
+
 def spawn_role_team(
     task: str,
     roles: list[str] | None = None,
@@ -8672,7 +9401,11 @@ def spawn_role_team(
     selected_roles = roles or ["requirements", "architecture", "security", "testing"]
     if not selected_roles:
         raise OrchestratorError("At least one role is required.")
-    team_deadline = time.monotonic() + max(1, int(timeout_seconds or 1800))
+    team_deadline = (
+        time.monotonic()
+        + max(1, int(timeout_seconds or 1800))
+        + TRANSACTION_CLOSURE_RESERVE_SECONDS
+    )
     team_id = "team-" + new_run_id()
     runs: list[dict[str, Any]] = []
     active_before = 0
@@ -8685,7 +9418,12 @@ def spawn_role_team(
                 "team_id": team_id,
                 "created_at": utc_now_iso(),
                 "status": "blocked_by_cost_guard",
-                "task": task,
+                "task_sha256": hashlib.sha256(task.encode("utf-8")).hexdigest(),
+                "context_sha256": (
+                    hashlib.sha256(context.encode("utf-8")).hexdigest()
+                    if context
+                    else None
+                ),
                 "cwd": str(cwd or Path.cwd()),
                 "roles": selected_roles,
                 "runs": [],
@@ -8709,7 +9447,9 @@ def spawn_role_team(
                 "rollback": manifest["rollback"],
             }
         reservation = _LaunchAdmissionReservation(
-            team_id=team_id, owner_pid=os.getpid()
+            team_id=team_id,
+            owner_pid=os.getpid(),
+            deadline=team_deadline,
         )
         manifest_path: Path | None = None
 
@@ -8720,11 +9460,35 @@ def spawn_role_team(
                 with _ACTIVE_WORKER_HANDLES_LOCK:
                     worker = _ACTIVE_WORKER_HANDLES.get(run_id)
                 if worker is None:
+                    try:
+                        member = read_metadata(safe_run_dir(run_id))
+                        worker_pid = member.get("worker_pid")
+                    except Exception:
+                        worker_pid = None
+                    already_stopped = (
+                        isinstance(worker_pid, int)
+                        and not pid_alive(worker_pid)
+                    )
+                    lock_reclaimed = (
+                        _reclaim_artifact_lock_for_dead_process(
+                            safe_run_dir(run_id),
+                            worker_pid,
+                            deadline=team_deadline,
+                        )
+                        if already_stopped
+                        else False
+                    )
                     stops.append(
                         {
-                            "ok": False,
+                            "ok": already_stopped and lock_reclaimed,
                             "run_id": run_id,
-                            "error": "owned worker handle unavailable",
+                            "stopped": already_stopped,
+                            "lock_reclaimed": lock_reclaimed,
+                            **(
+                                {}
+                                if already_stopped
+                                else {"error": "owned worker handle unavailable"}
+                            ),
                         }
                     )
                     continue
@@ -8791,7 +9555,12 @@ def spawn_role_team(
                 "team_id": team_id,
                 "created_at": utc_now_iso(),
                 "status": "prepared",
-                "task": task,
+                "task_sha256": hashlib.sha256(task.encode("utf-8")).hexdigest(),
+                "context_sha256": (
+                    hashlib.sha256(context.encode("utf-8")).hexdigest()
+                    if context
+                    else None
+                ),
                 "cwd": str(cwd or Path.cwd()),
                 "roles": selected_roles,
                 "runs": runs,
@@ -8801,57 +9570,14 @@ def spawn_role_team(
                 "rollback": None,
             }
             manifest_path = write_team_manifest(team_id, manifest)
-            authorized_runs: list[dict[str, Any]] = []
             registered = set(reservation.registered_run_ids or [])
             if registered != {str(item["run_id"]) for item in runs}:
                 raise OrchestratorError(
                     "Team authorization registration set is incomplete."
                 )
-            for item in runs:
-                run_id = str(item["run_id"])
-                run_dir = safe_run_dir(run_id)
-                member = read_metadata(run_dir, deadline=team_deadline)
-                if (
-                    member.get("team_id") != team_id
-                    or str(member.get("status") or "") not in {"starting", "running"}
-                    or member.get("stop_requested_at")
-                    or member.get("terminal_state_count")
-                ):
-                    raise OrchestratorError(
-                        f"Team member {run_id} is not launchable at authorization."
-                    )
-                try:
-                    recorded = ProcessIdentity.from_dict(
-                        member.get("worker_process_identity")
-                    )
-                except (TypeError, ValueError) as exc:
-                    raise OrchestratorError(
-                        f"Team member {run_id} has invalid worker identity evidence."
-                    ) from exc
-                with _ACTIVE_WORKER_HANDLES_LOCK:
-                    owned = _ACTIVE_WORKER_HANDLES.get(run_id)
-                comparison = compare_process_identity(
-                    recorded,
-                    expected_launch_nonce=str(
-                        (member.get("runtime_launch") or {}).get("launch_nonce") or ""
-                    ),
-                )
-                if (
-                    owned is None
-                    or owned.pid != recorded.pid
-                    or owned.poll() is not None
-                    or comparison.state != "match"
-                ):
-                    raise OrchestratorError(
-                        f"Team member {run_id} worker ownership changed before authorization."
-                    )
-                authorized_runs.append(
-                    {
-                        **item,
-                        "worker_pid": recorded.pid,
-                        "worker_creation_token": recorded.creation_token,
-                    }
-                )
+            authorized_runs = _wait_for_team_members_ready(
+                team_id, runs, deadline=team_deadline
+            )
             response = {
                 "ok": True,
                 "status": "launched",
@@ -8871,8 +9597,8 @@ def spawn_role_team(
                 "authorization_token": uuid.uuid4().hex,
                 "runs": authorized_runs,
             }
-            reservation.active = False
             write_team_manifest(team_id, authorized_manifest)
+            reservation.active = False
             return response
         except Exception as exc:
             rollback = rollback_registered_workers()
@@ -8886,7 +9612,12 @@ def spawn_role_team(
                 "created_at": utc_now_iso(),
                 "status": status_name,
                 "error": str(exc),
-                "task": task,
+                "task_sha256": hashlib.sha256(task.encode("utf-8")).hexdigest(),
+                "context_sha256": (
+                    hashlib.sha256(context.encode("utf-8")).hexdigest()
+                    if context
+                    else None
+                ),
                 "cwd": str(cwd or Path.cwd()),
                 "roles": selected_roles,
                 "runs": runs,
