@@ -120,6 +120,7 @@ jobs:
           test_guarded_launch.TenthReviewPortableIdentityEncodingTests
           test_guarded_launch.TenthReviewPosixPathEncodingTests.test_surrogateescaped_and_literal_keys_remain_distinct
           test_guarded_launch.TenthReviewPosixPathEncodingTests.test_git_subprocess_requests_surrogateescape_decoding
+          test_guarded_launch.TaskSevenStopIdentityTests.test_darwin_prelaunch_artifacts_initialize_before_containment
           test_guarded_launch.TaskSevenStopIdentityTests.test_production_posix_launch_fails_before_any_runtime_process
           test_guarded_launch.TaskSevenStopIdentityTests.test_production_posix_fails_closed_in_fresh_thread
           test_guarded_launch.TaskSevenStopIdentityTests.test_production_posix_fails_closed_in_fresh_spawn
