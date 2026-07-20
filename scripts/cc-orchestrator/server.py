@@ -49,6 +49,9 @@ from cc_orchestrator import (
     migrate_legacy_queue_payloads,
     poll_run,
     preflight_write_scope,
+    project_public_endpoint,
+    project_public_endpoints,
+    project_public_endpoint_values,
     queue_cancel,
     queue_policy,
     queue_status,
@@ -607,7 +610,9 @@ class ClaudeMdInput(BaseModel):
 
 
 def _json(data: object) -> str:
-    return json.dumps(data, ensure_ascii=False, indent=2)
+    return json.dumps(
+        project_public_endpoint_values(data), ensure_ascii=False, indent=2
+    )
 
 
 def _error(exc: Exception) -> str:
@@ -622,14 +627,18 @@ def _error(exc: Exception) -> str:
 
 
 def _profiles_markdown(profiles: list[dict]) -> str:
+    profiles = project_public_endpoint_values(profiles)
     lines = ["# Claude Code CCSwitch Profiles", ""]
     for item in profiles:
         current = " current" if item.get("current") else ""
         lines.append(f"## {item.get('name')} ({item.get('id')}){current}")
         lines.append(f"- Model: `{item.get('model')}`")
-        lines.append(f"- Base URL: `{item.get('base_url')}`")
+        lines.append(
+            f"- Base URL: `{project_public_endpoint(item.get('base_url'))}`"
+        )
         if item.get("endpoints"):
-            lines.append(f"- Endpoints: {', '.join(f'`{x}`' for x in item['endpoints'])}")
+            endpoints = project_public_endpoints(item["endpoints"])
+            lines.append(f"- Endpoints: {', '.join(f'`{x}`' for x in endpoints)}")
         lines.append("")
     return "\n".join(lines)
 
@@ -710,10 +719,13 @@ async def cc_pick_profile(params: PickProfileInput) -> str:
                 "name": provider.name,
                 "model": route.get("model_override") or provider.model,
                 "provider_default_model": provider.model,
-                "base_url": provider.env.get("ANTHROPIC_BASE_URL"),
-                "endpoints": provider.endpoints,
+                "base_url": project_public_endpoint(
+                    provider.env.get("ANTHROPIC_BASE_URL")
+                ),
+                "endpoints": project_public_endpoints(provider.endpoints),
             },
         }
+        data = project_public_endpoint_values(data)
         if params.response_format == ResponseFormat.MARKDOWN:
             return "\n".join(
                 [
@@ -721,8 +733,8 @@ async def cc_pick_profile(params: PickProfileInput) -> str:
                     "",
                     f"- Role: `{data['role']}`",
                     f"- Task type: `{data['task_type']}`",
-                    f"- Profile: `{provider.name}`",
-                    f"- Model: `{provider.model}`",
+                    f"- Profile: `{data['selected_profile']['name']}`",
+                    f"- Model: `{data['selected_profile']['provider_default_model']}`",
                     f"- Permission mode: `{data['permission_mode']}`",
                     f"- Reason: {data.get('reason') or 'No route reason configured.'}",
                 ]
@@ -1573,7 +1585,7 @@ async def cc_score_models(params: ListProfilesInput) -> str:
     role_scores for every configured worker role. Secrets are never returned.
     """
     try:
-        data = score_models()
+        data = project_public_endpoint_values(score_models())
         if params.response_format == ResponseFormat.MARKDOWN:
             lines = ["# Local CCSwitch Model Scores", "", f"Roles: {', '.join(ROLE_ORDER)}", ""]
             for item in data["models"]:

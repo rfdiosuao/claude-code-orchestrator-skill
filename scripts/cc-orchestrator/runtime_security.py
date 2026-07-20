@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import hmac
 import json
 import ctypes
 import os
+import re
 import secrets
 import shlex
 import shutil
 import string
 import sys
+import unicodedata
+from datetime import datetime
 from hashlib import sha256
 from collections.abc import Mapping as MappingABC
 from dataclasses import dataclass, field
@@ -20,6 +24,516 @@ POLICY_SCHEMA_VERSION = 1
 MAX_PROVIDER_ENV_VALUE_BYTES = 32 * 1024
 MAX_PROVIDER_ENV_BYTES = 128 * 1024
 MAX_IDENTITY_DEPTH = 4
+MAX_SECURITY_AUDIT_EVENT_BYTES = 16 * 1024
+
+SECURITY_AUDIT_POLICY: Mapping[str, Mapping[str, str]] = MappingProxyType(
+    {
+        "provider_env_invalid": MappingProxyType(
+            {
+                "severity": "medium",
+                "recommended_action": (
+                    "Remove the unsupported provider environment entry and retry."
+                ),
+            }
+        ),
+        "provider_env_forbidden": MappingProxyType(
+            {
+                "severity": "high",
+                "recommended_action": (
+                    "Remove the unsupported provider environment entry and retry."
+                ),
+            }
+        ),
+        "provider_env_unrecognized": MappingProxyType(
+            {
+                "severity": "medium",
+                "recommended_action": (
+                    "Remove the unsupported provider environment entry and retry."
+                ),
+            }
+        ),
+        "provider_env_too_large": MappingProxyType(
+            {
+                "severity": "medium",
+                "recommended_action": (
+                    "Reduce the provider environment size and retry."
+                ),
+            }
+        ),
+        "runtime_policy_invalid": MappingProxyType(
+            {
+                "severity": "high",
+                "recommended_action": (
+                    "Correct the runtime security policy and retry."
+                ),
+            }
+        ),
+        "runtime_candidate_unrecognized": MappingProxyType(
+            {
+                "severity": "high",
+                "recommended_action": "Review runtime policy and retry.",
+            }
+        ),
+        "unsafe_runtime_request_invalid": MappingProxyType(
+            {
+                "severity": "high",
+                "recommended_action": "Review runtime policy and retry.",
+            }
+        ),
+        "runtime_not_trusted": MappingProxyType(
+            {
+                "severity": "high",
+                "recommended_action": "Review runtime policy and retry.",
+            }
+        ),
+        "unsafe_runtime_policy_missing": MappingProxyType(
+            {
+                "severity": "high",
+                "recommended_action": "Review runtime policy and retry.",
+            }
+        ),
+        "unsafe_runtime_request_missing": MappingProxyType(
+            {
+                "severity": "high",
+                "recommended_action": "Review runtime policy and retry.",
+            }
+        ),
+        "runtime_identity_changed": MappingProxyType(
+            {
+                "severity": "critical",
+                "recommended_action": (
+                    "Re-run preflight and review the executable identity."
+                ),
+            }
+        ),
+        "runtime_containment_unavailable": MappingProxyType(
+            {
+                "severity": "high",
+                "recommended_action": (
+                    "Use a supported containment backend before retrying."
+                ),
+            }
+        ),
+        "process_identity_mismatch": MappingProxyType(
+            {
+                "severity": "critical",
+                "recommended_action": (
+                    "Inspect the recorded process identity and clean up manually."
+                ),
+            }
+        ),
+        "process_identity_unverified": MappingProxyType(
+            {
+                "severity": "high",
+                "recommended_action": (
+                    "Use a platform with supported process identity capture."
+                ),
+            }
+        ),
+        "secure_payload_store_unavailable": MappingProxyType(
+            {
+                "severity": "high",
+                "recommended_action": (
+                    "Restore the protected payload store and retry."
+                ),
+            }
+        ),
+        "visible_runtime_unsupported": MappingProxyType(
+            {
+                "severity": "medium",
+                "recommended_action": (
+                    "Use run-streaming and poll the guarded worker output."
+                ),
+            }
+        ),
+        "runtime_policy_drift": MappingProxyType(
+            {
+                "severity": "high",
+                "recommended_action": (
+                    "Submit a new queue job under the current policy."
+                ),
+            }
+        ),
+        "trusted_runtime_authorized": MappingProxyType(
+            {
+                "severity": "info",
+                "recommended_action": "No operator action is required.",
+            }
+        ),
+        "unsafe_runtime_authorized": MappingProxyType(
+            {
+                "severity": "high",
+                "recommended_action": (
+                    "Review the local runtime approval and monitor the run."
+                ),
+            }
+        ),
+        "security_audit_unavailable": MappingProxyType(
+            {
+                "severity": "critical",
+                "recommended_action": (
+                    "Repair the private security audit files before retrying."
+                ),
+            }
+        ),
+    }
+)
+
+_SECURITY_AUDIT_SCHEMA_VERSION = 1
+_PROVIDER_PSEUDONYM_DOMAIN = (
+    b"cc-orchestrator/security-audit/provider-pseudonym/v1\x00"
+)
+_AUDIT_DEDUPE_DOMAIN = b"cc-orchestrator/security-audit/dedupe/v1\x00"
+_SECURITY_EVENT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "timestamp",
+        "code",
+        "severity",
+        "run_id",
+        "runtime_id",
+        "trust_level",
+        "provider_pseudonym",
+        "policy_decision_id",
+        "dedupe_id",
+        "safe_fields",
+        "recommended_action",
+    }
+)
+_CHAINED_SECURITY_EVENT_FIELDS = _SECURITY_EVENT_FIELDS | {
+    "previous_hash",
+    "record_hash",
+}
+_AUDIT_IDENTIFIER_PATTERN = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}\Z"
+)
+_SAFE_FIELD_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
+_TIMESTAMP_PATTERN = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})\Z"
+)
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _contains_unicode_control(value: str) -> bool:
+    return any(unicodedata.category(character).startswith("C") for character in value)
+
+
+def _validate_audit_text(
+    value: object,
+    field: str,
+    *,
+    maximum_bytes: int,
+    allow_none: bool = False,
+) -> str | None:
+    if value is None and allow_none:
+        return None
+    if not isinstance(value, str) or not value:
+        raise TypeError(f"{field} must be a non-empty string")
+    if _contains_unicode_control(value):
+        raise ValueError(f"{field} contains a control character")
+    if len(value.encode("utf-8")) > maximum_bytes:
+        raise ValueError(f"{field} exceeds its size limit")
+    return value
+
+
+def _validate_audit_identifier(
+    value: object, field: str, *, allow_none: bool = False
+) -> str | None:
+    normalized = _validate_audit_text(
+        value, field, maximum_bytes=128, allow_none=allow_none
+    )
+    if normalized is not None and _AUDIT_IDENTIFIER_PATTERN.fullmatch(normalized) is None:
+        raise ValueError(f"{field} is not a valid identifier")
+    return normalized
+
+
+def _validate_audit_timestamp(value: object) -> str:
+    normalized = _validate_audit_text(value, "timestamp", maximum_bytes=40)
+    assert normalized is not None
+    if _TIMESTAMP_PATTERN.fullmatch(normalized) is None:
+        raise ValueError("timestamp must be an ISO 8601 timestamp with an offset")
+    parseable = normalized[:-1] + "+00:00" if normalized.endswith("Z") else normalized
+    try:
+        parsed = datetime.fromisoformat(parseable)
+    except ValueError as error:
+        raise ValueError("timestamp is not a valid calendar timestamp") from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("timestamp must include a UTC offset")
+    return normalized
+
+
+def _validate_audit_key(audit_key: object) -> bytes:
+    if type(audit_key) is not bytes:
+        raise TypeError("audit_key must be bytes")
+    if len(audit_key) != 32:
+        raise ValueError("audit_key must be exactly 32 bytes")
+    return audit_key
+
+
+def _canonical_security_json(value: object) -> bytes:
+    try:
+        serialized = json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return serialized.encode("utf-8")
+    except (TypeError, UnicodeEncodeError, ValueError) as error:
+        raise ValueError("security event is not canonical JSON data") from error
+
+
+def _validate_security_event_shape(event: object) -> dict[str, Any]:
+    if not isinstance(event, MappingABC):
+        raise TypeError("security event must be a mapping")
+    if set(event) != _SECURITY_EVENT_FIELDS:
+        raise ValueError("security event contains fields outside the allowlist")
+    if (
+        type(event["schema_version"]) is not int
+        or event["schema_version"] != _SECURITY_AUDIT_SCHEMA_VERSION
+    ):
+        raise ValueError("security event has an unsupported schema version")
+
+    timestamp = _validate_audit_timestamp(event["timestamp"])
+    code = _validate_audit_identifier(event["code"], "code")
+    assert code is not None
+    policy = SECURITY_AUDIT_POLICY.get(code)
+    if policy is None:
+        raise ValueError("security event code is not allowlisted")
+    severity = _validate_audit_identifier(event["severity"], "severity")
+    if severity != policy["severity"]:
+        raise ValueError("security event severity does not match its code policy")
+    recommended_action = _validate_audit_text(
+        event["recommended_action"],
+        "recommended_action",
+        maximum_bytes=512,
+    )
+    if recommended_action != policy["recommended_action"]:
+        raise ValueError("security event action does not match its code policy")
+
+    run_id = _validate_audit_identifier(event["run_id"], "run_id", allow_none=True)
+    runtime_id = _validate_audit_text(
+        event["runtime_id"],
+        "runtime_id",
+        maximum_bytes=128,
+        allow_none=True,
+    )
+    trust_level = _validate_audit_identifier(
+        event["trust_level"], "trust_level", allow_none=True
+    )
+    policy_decision_id = _validate_audit_identifier(
+        event["policy_decision_id"], "policy_decision_id", allow_none=True
+    )
+
+    dedupe_id = event["dedupe_id"]
+    if dedupe_id is not None:
+        dedupe_id = _validate_audit_text(
+            dedupe_id, "dedupe_id", maximum_bytes=79
+        )
+        assert dedupe_id is not None
+        prefix = "hmac-sha256:v1:"
+        if not dedupe_id.startswith(prefix) or _SHA256_PATTERN.fullmatch(
+            dedupe_id[len(prefix) :]
+        ) is None:
+            raise ValueError("dedupe_id has an invalid shape")
+
+    pseudonym = event["provider_pseudonym"]
+    if pseudonym is not None:
+        pseudonym = _validate_audit_text(
+            pseudonym, "provider_pseudonym", maximum_bytes=79
+        )
+        assert pseudonym is not None
+        prefix = "hmac-sha256:v1:"
+        if not pseudonym.startswith(prefix) or _SHA256_PATTERN.fullmatch(
+            pseudonym[len(prefix) :]
+        ) is None:
+            raise ValueError("provider_pseudonym has an invalid shape")
+
+    safe_fields = event["safe_fields"]
+    if not isinstance(safe_fields, list):
+        raise TypeError("safe_fields must be a list")
+    if len(safe_fields) > 64:
+        raise ValueError("safe_fields contains too many entries")
+    normalized_safe_fields: list[str] = []
+    for field_name in safe_fields:
+        if not isinstance(field_name, str):
+            raise TypeError("safe_fields entries must be strings")
+        if (
+            _contains_unicode_control(field_name)
+            or _SAFE_FIELD_PATTERN.fullmatch(field_name) is None
+        ):
+            raise ValueError("safe_fields contains an invalid field name")
+        normalized_safe_fields.append(field_name)
+    if normalized_safe_fields != sorted(set(normalized_safe_fields)):
+        raise ValueError("safe_fields must contain unique sorted field names")
+
+    return {
+        "schema_version": _SECURITY_AUDIT_SCHEMA_VERSION,
+        "timestamp": timestamp,
+        "code": code,
+        "severity": severity,
+        "run_id": run_id,
+        "runtime_id": runtime_id,
+        "trust_level": trust_level,
+        "provider_pseudonym": pseudonym,
+        "policy_decision_id": policy_decision_id,
+        "dedupe_id": dedupe_id,
+        "safe_fields": normalized_safe_fields,
+        "recommended_action": recommended_action,
+    }
+
+
+def provider_pseudonym(audit_key: bytes, provider_id: str) -> str:
+    normalized_key = _validate_audit_key(audit_key)
+    normalized_provider = _validate_audit_text(
+        provider_id, "provider_id", maximum_bytes=512
+    )
+    assert normalized_provider is not None
+    digest = hmac.new(
+        normalized_key,
+        _PROVIDER_PSEUDONYM_DOMAIN + normalized_provider.encode("utf-8"),
+        sha256,
+    ).hexdigest()
+    return f"hmac-sha256:v1:{digest}"
+
+
+def _audit_dedupe_id(audit_key: bytes, dedupe_key: str) -> str:
+    normalized_key = _validate_audit_key(audit_key)
+    normalized_dedupe = _validate_audit_text(
+        dedupe_key, "dedupe_key", maximum_bytes=512
+    )
+    assert normalized_dedupe is not None
+    digest = hmac.new(
+        normalized_key,
+        _AUDIT_DEDUPE_DOMAIN + normalized_dedupe.encode("utf-8"),
+        sha256,
+    ).hexdigest()
+    return f"hmac-sha256:v1:{digest}"
+
+
+def build_safe_security_event(
+    *,
+    audit_key: bytes,
+    timestamp: str,
+    code: str,
+    severity: str,
+    run_id: str | None,
+    runtime_id: str | None,
+    trust_level: str | None,
+    provider_id: str | None,
+    policy_decision_id: str | None,
+    safe_details: Mapping[str, Any],
+    recommended_action: str,
+    dedupe_key: str | None = None,
+) -> dict[str, Any]:
+    _validate_audit_key(audit_key)
+    if not isinstance(safe_details, MappingABC):
+        raise TypeError("safe_details must be a mapping")
+    if len(safe_details) > 64:
+        raise ValueError("safe_details contains too many fields")
+    safe_fields: list[str] = []
+    for field_name in safe_details:
+        if not isinstance(field_name, str):
+            raise TypeError("safe_details field names must be strings")
+        if (
+            _contains_unicode_control(field_name)
+            or _SAFE_FIELD_PATTERN.fullmatch(field_name) is None
+        ):
+            raise ValueError("safe_details contains an invalid field name")
+        safe_fields.append(field_name)
+
+    event = _validate_security_event_shape(
+        {
+            "schema_version": _SECURITY_AUDIT_SCHEMA_VERSION,
+            "timestamp": timestamp,
+            "code": code,
+            "severity": severity,
+            "run_id": run_id,
+            "runtime_id": runtime_id,
+            "trust_level": trust_level,
+            "provider_pseudonym": (
+                None
+                if provider_id is None
+                else provider_pseudonym(audit_key, provider_id)
+            ),
+            "policy_decision_id": policy_decision_id,
+            "dedupe_id": (
+                None
+                if dedupe_key is None
+                else _audit_dedupe_id(audit_key, dedupe_key)
+            ),
+            "safe_fields": sorted(safe_fields),
+            "recommended_action": recommended_action,
+        }
+    )
+    if len(_canonical_security_json(event)) > MAX_SECURITY_AUDIT_EVENT_BYTES:
+        raise ValueError("security event exceeds the size limit")
+    return event
+
+
+def chain_security_event(
+    event: Mapping[str, Any], *, previous_hash: str | None
+) -> dict[str, Any]:
+    normalized_event = _validate_security_event_shape(event)
+    if previous_hash is not None and (
+        not isinstance(previous_hash, str)
+        or _SHA256_PATTERN.fullmatch(previous_hash) is None
+    ):
+        raise ValueError("previous_hash must be a lowercase SHA-256 digest or null")
+    hash_frame = {**normalized_event, "previous_hash": previous_hash}
+    record = {
+        **hash_frame,
+        "record_hash": sha256(_canonical_security_json(hash_frame)).hexdigest(),
+    }
+    if len(_canonical_security_json(record)) > MAX_SECURITY_AUDIT_EVENT_BYTES:
+        raise ValueError("chained security event exceeds the size limit")
+    return record
+
+
+def verify_security_event_chain(records: object) -> dict[str, Any]:
+    if not isinstance(records, (list, tuple)):
+        return {"ok": False, "count": 0}
+    expected_previous_hash: str | None = None
+    verified_count = 0
+    for record in records:
+        try:
+            if not isinstance(record, MappingABC):
+                raise TypeError("chained security event must be a mapping")
+            if set(record) != _CHAINED_SECURITY_EVENT_FIELDS:
+                raise ValueError("chained security event has an invalid shape")
+            if len(_canonical_security_json(record)) > MAX_SECURITY_AUDIT_EVENT_BYTES:
+                raise ValueError("chained security event exceeds the size limit")
+
+            previous_hash = record["previous_hash"]
+            if previous_hash is not None and (
+                not isinstance(previous_hash, str)
+                or _SHA256_PATTERN.fullmatch(previous_hash) is None
+            ):
+                raise ValueError("chained security event has an invalid previous hash")
+            if not hmac.compare_digest(
+                previous_hash or "", expected_previous_hash or ""
+            ):
+                raise ValueError("chained security event has a broken predecessor link")
+
+            record_hash = record["record_hash"]
+            if not isinstance(record_hash, str) or _SHA256_PATTERN.fullmatch(
+                record_hash
+            ) is None:
+                raise ValueError("chained security event has an invalid record hash")
+            event = {field: record[field] for field in _SECURITY_EVENT_FIELDS}
+            normalized_event = _validate_security_event_shape(event)
+            hash_frame = {**normalized_event, "previous_hash": previous_hash}
+            expected_record_hash = sha256(
+                _canonical_security_json(hash_frame)
+            ).hexdigest()
+            if not hmac.compare_digest(record_hash, expected_record_hash):
+                raise ValueError("chained security event hash does not match")
+        except (KeyError, TypeError, ValueError):
+            return {"ok": False, "count": verified_count}
+        expected_previous_hash = record_hash
+        verified_count += 1
+    return {"ok": True, "count": verified_count}
 
 _DEFAULT_PROVIDER_ENV_KEYS = frozenset(
     key.casefold()
@@ -591,7 +1105,7 @@ class RuntimeLaunchSpec:
     launch_nonce: str = field(init=False, default_factory=generate_launch_nonce)
 
     def __post_init__(self) -> None:
-        _validate_nonempty_string(self.runtime_id, "runtime_id")
+        _validate_audit_text(self.runtime_id, "runtime_id", maximum_bytes=128)
         if (
             not isinstance(self.protocol_version, int)
             or isinstance(self.protocol_version, bool)
@@ -908,6 +1422,14 @@ class RuntimeSecurityPolicy:
         for approved in unsafe_runtimes:
             if not isinstance(approved, ApprovedUnsafeRuntime) or not isinstance(approved.runtime_id, str) or not approved.runtime_id:
                 raise _policy_error("Runtime policy contains an invalid unsafe runtime.")
+            try:
+                _validate_audit_text(
+                    approved.runtime_id, "runtime_id", maximum_bytes=128
+                )
+            except (TypeError, ValueError) as error:
+                raise _policy_error(
+                    "Runtime policy contains an invalid unsafe runtime."
+                ) from error
             if approved.runtime_id in runtime_ids:
                 raise _policy_error("Runtime policy contains duplicate unsafe runtime ids.")
             runtime_ids.add(approved.runtime_id)

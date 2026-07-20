@@ -12,8 +12,10 @@ import functools
 import hashlib
 import hmac
 import html as html_lib
+import ipaddress
 import json
 import math
+import ntpath
 import os
 import queue
 import re
@@ -30,13 +32,13 @@ import time
 import uuid
 import zipfile
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
-from urllib.parse import parse_qsl, unquote, unquote_plus, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, unquote_plus, urlencode, urlsplit, urlunsplit
 
 def configure_stdio() -> None:
     """Keep JSON output readable on Windows consoles with non-ASCII text."""
@@ -77,15 +79,22 @@ from process_identity import (
     capture_process_identity,
     compare_process_identity,
     open_stable_process_capability,
+    process_identity_support,
 )
 from runtime_security import (
+    MAX_SECURITY_AUDIT_EVENT_BYTES,
+    SECURITY_AUDIT_POLICY,
     ExecutableIdentity,
     RuntimeExecutableCandidate,
     RuntimeLaunchSpec,
     RuntimeSecurityError,
     RuntimeSecurityPolicy,
+    authorize_runtime,
+    build_safe_security_event,
     build_runtime_launch_spec,
     canonical_path,
+    chain_security_event,
+    verify_security_event_chain,
 )
 from secure_payload_store import (
     SecurePayloadStore,
@@ -149,10 +158,16 @@ _LEGACY_RECLAIM_LOCKS: dict[str, threading.Lock] = {}
 _LEGACY_RECLAIM_LOCKS_GUARD = threading.Lock()
 _PROCESS_LAUNCH_LOCK_TOKENS: dict[str, str] = {}
 _PROCESS_LAUNCH_LOCK_TOKENS_LOCK = threading.Lock()
+_STATIC_FILE_LOCKS: dict[str, threading.RLock] = {}
+_STATIC_FILE_LOCKS_GUARD = threading.Lock()
+_SECURITY_AUDIT_FAILURES: dict[str, dict[str, str]] = {}
+_SECURITY_AUDIT_FAILURES_GUARD = threading.Lock()
 _ACTIVE_CLEANUP_OWNERS: dict[str, threading.Thread] = {}
 _ACTIVE_CLEANUP_OWNERS_LOCK = threading.Lock()
 TERMINALIZATION_TIMEOUT_SECONDS = 1.0
+BLOCKED_TERMINALIZATION_TIMEOUT_SECONDS = 0.5
 WORKER_FINALIZATION_GRACE_SECONDS = TERMINALIZATION_TIMEOUT_SECONDS + 0.25
+SECURITY_AUDIT_LOCK_TIMEOUT_SECONDS = 2.0
 
 _LINUX_PR_SET_PDEATHSIG = 1
 _LINUX_PRCTL = None
@@ -182,10 +197,12 @@ def _check_deadline(deadline: float | None = None, message: str = "Operation exc
 
 
 @contextlib.contextmanager
-def _terminal_artifact_scope() -> Any:
+def _terminal_artifact_scope(
+    timeout_seconds: float = TERMINALIZATION_TIMEOUT_SECONDS,
+) -> Any:
     """Give best-effort terminal persistence a short, independent deadline."""
     token = _OPERATION_DEADLINE.set(
-        time.monotonic() + TERMINALIZATION_TIMEOUT_SECONDS
+        time.monotonic() + timeout_seconds
     )
     try:
         yield
@@ -1231,8 +1248,11 @@ def init_workspace(
     repair_mcp: bool = False,
 ) -> dict[str, Any]:
     paths = workspace_paths(cwd)
+    _prepare_security_audit_directories(
+        _security_audit_paths(paths["artifact_root"])
+    )
     for path in managed_dirs(paths):
-        path.mkdir(parents=True, exist_ok=True)
+        _set_private_directory(path)
     workspace_readme = paths["artifact_root"] / "README.md"
     if not workspace_readme.exists():
         workspace_readme.write_text(
@@ -1611,7 +1631,7 @@ def validate_indexed_run_dir(run_id: str, index: dict[str, Any], index_path: Pat
 def register_run_dir(run_id: str, run_dir: Path, workspace_root: Path, artifact_root: Path) -> Path:
     if not RUN_ID_RE.match(run_id):
         raise OrchestratorError(f"Invalid run id: {run_id}")
-    RUN_INDEX_DIR.mkdir(parents=True, exist_ok=True)
+    _set_private_directory(RUN_INDEX_DIR)
     return write_json_file(
         RUN_INDEX_DIR / f"{run_id}.json",
         {
@@ -2078,9 +2098,13 @@ def _publish_artifact_lock_candidate(candidate: Path, lock_path: Path) -> None:
         raise OSError(error, "Artifact lock publication failed", lock_path)
 
 
-def _reclaim_artifact_lock_for_dead_process(
-    run_dir: Path, process_pid: int, *, deadline: float | None = None
+def _reclaim_artifact_lock_for_dead_processes(
+    run_dir: Path,
+    process_pids: Collection[int],
+    *,
+    deadline: float | None = None,
 ) -> bool:
+    allowed_pids = frozenset(process_pids)
     lock_dir = run_dir.parent / f".{run_dir.name}.artifact.lock"
     for _attempt in range(100):
         if not lock_dir.exists():
@@ -2093,7 +2117,7 @@ def _reclaim_artifact_lock_for_dead_process(
                     lock_dir, deadline=deadline
                 ) as (_handle, details, owner_payload):
                     owner_pid, _owner_token = _artifact_lock_owner(owner_payload)
-                    if owner_pid != process_pid:
+                    if owner_pid not in allowed_pids:
                         return False
                     generation = _artifact_lock_file_identity(details)
                     if not _artifact_lock_path_matches_generation(
@@ -2116,7 +2140,7 @@ def _reclaim_artifact_lock_for_dead_process(
                 lock_dir, deadline=deadline
             ) as (directory_handle, directory_details, owner_payload):
                 owner_pid, _owner_token = _artifact_lock_owner(owner_payload)
-                if owner_pid != process_pid:
+                if owner_pid not in allowed_pids:
                     return False
                 generation = _artifact_lock_directory_identity(
                     directory_details
@@ -2140,6 +2164,14 @@ def _reclaim_artifact_lock_for_dead_process(
             continue
         time.sleep(0.005)
     return not lock_dir.exists()
+
+
+def _reclaim_artifact_lock_for_dead_process(
+    run_dir: Path, process_pid: int, *, deadline: float | None = None
+) -> bool:
+    return _reclaim_artifact_lock_for_dead_processes(
+        run_dir, (process_pid,), deadline=deadline
+    )
 
 
 class _ArtifactLock:
@@ -2710,6 +2742,12 @@ def _windows_security_apis() -> tuple[Any, Any, Any]:
         ctypes.POINTER(wintypes.BOOL),
     )
     advapi32.GetSecurityDescriptorDacl.restype = wintypes.BOOL
+    advapi32.GetSecurityDescriptorOwner.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.BOOL),
+    )
+    advapi32.GetSecurityDescriptorOwner.restype = wintypes.BOOL
     advapi32.OpenProcessToken.argtypes = (
         ctypes.c_void_p,
         wintypes.DWORD,
@@ -2852,7 +2890,7 @@ def _inspect_windows_private_acl(path: Path, *, is_dir: bool) -> dict[str, Any]:
                 }
             )
         expected_flags = 0x03 if is_dir else 0
-        exact = bool(control.value & 0x1000) and entries == [
+        dacl_exact = bool(control.value & 0x1000) and entries == [
             {
                 "type": 0,
                 "flags": expected_flags,
@@ -2860,6 +2898,7 @@ def _inspect_windows_private_acl(path: Path, *, is_dir: bool) -> dict[str, Any]:
                 "sid": current_user_sid,
             }
         ]
+        exact = owner_sid == current_user_sid and dacl_exact
         return {
             "protected": bool(control.value & 0x1000),
             "owner_sid": owner_sid,
@@ -2869,6 +2908,7 @@ def _inspect_windows_private_acl(path: Path, *, is_dir: bool) -> dict[str, Any]:
                 int(entry["flags"]) & 0x10 for entry in entries
             ),
             "entries": entries,
+            "dacl_exact": dacl_exact,
             "exact": exact,
         }
     finally:
@@ -2938,7 +2978,7 @@ def _inspect_windows_private_acl_handle(
                 }
             )
         expected_flags = 0x03 if is_dir else 0
-        exact = bool(control.value & 0x1000) and entries == [
+        dacl_exact = bool(control.value & 0x1000) and entries == [
             {
                 "type": 0,
                 "flags": expected_flags,
@@ -2946,6 +2986,7 @@ def _inspect_windows_private_acl_handle(
                 "sid": current_user_sid,
             }
         ]
+        exact = owner_sid == current_user_sid and dacl_exact
         return {
             "protected": bool(control.value & 0x1000),
             "owner_sid": owner_sid,
@@ -2955,6 +2996,7 @@ def _inspect_windows_private_acl_handle(
                 int(entry["flags"]) & 0x10 for entry in entries
             ),
             "entries": entries,
+            "dacl_exact": dacl_exact,
             "exact": exact,
         }
     finally:
@@ -2962,7 +3004,7 @@ def _inspect_windows_private_acl_handle(
 
 
 def _enforce_windows_private_acl_handle(
-    native_handle: Any, *, is_dir: bool
+    native_handle: Any, *, is_dir: bool, set_owner: bool = False
 ) -> None:
     ctypes, advapi32, kernel32 = _windows_security_apis()
     current_user_sid = _windows_current_user_sid(ctypes, advapi32, kernel32)
@@ -2970,7 +3012,7 @@ def _enforce_windows_private_acl_handle(
     descriptor = ctypes.c_void_p()
     size = ctypes.c_uint32()
     if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
-        f"D:P(A;{flags};FA;;;{current_user_sid})",
+        f"O:{current_user_sid}D:P(A;{flags};FA;;;{current_user_sid})",
         1,
         ctypes.byref(descriptor),
         ctypes.byref(size),
@@ -2987,11 +3029,19 @@ def _enforce_windows_private_acl_handle(
             ctypes.byref(defaulted),
         ) or not present.value:
             raise OrchestratorError("Could not read the private Windows DACL.")
+        owner = ctypes.c_void_p()
+        owner_defaulted = ctypes.c_int()
+        if set_owner and not advapi32.GetSecurityDescriptorOwner(
+            descriptor,
+            ctypes.byref(owner),
+            ctypes.byref(owner_defaulted),
+        ):
+            raise OrchestratorError("Could not read the private Windows owner.")
         result = advapi32.SetSecurityInfo(
             native_handle,
             1,
-            0x00000004 | 0x80000000,
-            None,
+            0x00000004 | 0x80000000 | (0x00000001 if set_owner else 0),
+            owner if set_owner else None,
             None,
             dacl,
             None,
@@ -3000,20 +3050,23 @@ def _enforce_windows_private_acl_handle(
             raise OSError(result, "Could not enforce the private Windows ACL")
     finally:
         kernel32.LocalFree(descriptor)
-    if not _inspect_windows_private_acl_handle(
+    inspection = _inspect_windows_private_acl_handle(
         native_handle, is_dir=is_dir
-    )["exact"]:
+    )
+    if not inspection["exact" if set_owner else "dacl_exact"]:
         raise OrchestratorError("Private Windows ACL verification failed.")
 
 
-def _enforce_windows_private_acl(path: Path, *, is_dir: bool) -> None:
+def _enforce_windows_private_acl(
+    path: Path, *, is_dir: bool, set_owner: bool = False
+) -> None:
     _lstat_managed_path(path, is_dir=is_dir)
     ctypes, advapi32, kernel32 = _windows_security_apis()
     current_user_sid = _windows_current_user_sid(
         ctypes, advapi32, kernel32
     )
     flags = "OICI" if is_dir else ""
-    sddl = f"D:P(A;{flags};FA;;;{current_user_sid})"
+    sddl = f"O:{current_user_sid}D:P(A;{flags};FA;;;{current_user_sid})"
     descriptor = ctypes.c_void_p()
     size = ctypes.c_uint32()
     if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -3023,13 +3076,19 @@ def _enforce_windows_private_acl(path: Path, *, is_dir: bool) -> None:
             f"Could not construct a private Windows ACL for {path.name}."
         )
     try:
-        if not advapi32.SetFileSecurityW(str(path), 0x00000004, descriptor):
+        security_information = 0x00000004 | (
+            0x00000001 if set_owner else 0
+        )
+        if not advapi32.SetFileSecurityW(
+            str(path), security_information, descriptor
+        ):
             raise OrchestratorError(
                 f"Could not enforce a private Windows ACL for {path.name}."
             )
     finally:
         kernel32.LocalFree(descriptor)
-    if not _inspect_windows_private_acl(path, is_dir=is_dir)["exact"]:
+    inspection = _inspect_windows_private_acl(path, is_dir=is_dir)
+    if not inspection["exact" if set_owner else "dacl_exact"]:
         raise OrchestratorError(
             f"Private Windows ACL verification failed for {path.name}."
         )
@@ -3042,6 +3101,9 @@ def _open_windows_relative_native_handle(
     writable: bool,
     is_dir: bool,
     create: bool = False,
+    security_descriptor: Any | None = None,
+    share_delete: bool = True,
+    delete_access: bool = True,
 ) -> Any:
     if os.name != "nt":
         raise OrchestratorError("Windows relative handles are unavailable.")
@@ -3080,12 +3142,16 @@ def _open_windows_relative_native_handle(
         parent_handle,
         ctypes.pointer(unicode_name),
         0x40,
-        None,
+        security_descriptor,
         None,
     )
     desired_access = 0x80000000 | 0x00020000 | 0x00100000
     if writable:
-        desired_access |= 0x40000000 | 0x00040000 | 0x00010000
+        desired_access |= 0x40000000 | 0x00040000
+        if delete_access:
+            desired_access |= 0x00010000
+        if create:
+            desired_access |= 0x00080000
     options = 0x00000020 | 0x00200000
     options |= 0x00000001 if is_dir else 0x00000040
     ntdll = ctypes.WinDLL("ntdll")
@@ -3114,7 +3180,9 @@ def _open_windows_relative_native_handle(
         ctypes.byref(io_status),
         None,
         0x80 if create else 0,
-        0x00000001 | 0x00000002 | 0x00000004,
+        0x00000001
+        | 0x00000002
+        | (0x00000004 if share_delete else 0),
         2 if create else 1,
         options,
         None,
@@ -3191,7 +3259,11 @@ def _windows_list_directory_handle(native_handle: Any) -> list[str]:
 
 @contextlib.contextmanager
 def _open_windows_managed_file(
-    path: Path, *, writable: bool = False, verify_private: bool = True
+    path: Path,
+    *,
+    writable: bool = False,
+    verify_private: bool = True,
+    verify_owner: bool = False,
 ) -> Any:
     if os.name != "nt":
         raise OrchestratorError("Windows managed-file handles are unavailable.")
@@ -3279,14 +3351,17 @@ def _open_windows_managed_file(
             raise OrchestratorError(
                 f"Managed artifact exceeds its size limit: {path.name}"
             )
-        if writable:
-            _enforce_windows_private_acl_handle(native_handle, is_dir=False)
-        elif verify_private and not _inspect_windows_private_acl_handle(
+        inspection = _inspect_windows_private_acl_handle(
             native_handle, is_dir=False
-        )["exact"]:
+        )
+        if verify_private and not inspection[
+            "exact" if verify_owner else "dacl_exact"
+        ]:
             raise OrchestratorError(
                 f"Private Windows ACL verification failed for {path.name}."
             )
+        if writable and not verify_private:
+            _enforce_windows_private_acl_handle(native_handle, is_dir=False)
         final_buffer = ctypes.create_unicode_buffer(32768)
         final_length = kernel32.GetFinalPathNameByHandleW(
             native_handle, final_buffer, len(final_buffer), 0
@@ -3318,6 +3393,7 @@ def _open_windows_managed_file(
                 (int(information.nFileIndexHigh) << 32)
                 | int(information.nFileIndexLow),
             ),
+            "number_of_links": int(information.nNumberOfLinks),
         }
     finally:
         if file_handle is not None:
@@ -3329,7 +3405,13 @@ def _open_windows_managed_file(
 
 @contextlib.contextmanager
 def _open_windows_managed_directory(
-    path: Path, *, writable: bool = False, verify_private: bool = True
+    path: Path,
+    *,
+    writable: bool = False,
+    verify_private: bool = True,
+    set_owner: bool = False,
+    verify_owner: bool = False,
+    share_delete: bool = True,
 ) -> Any:
     if os.name != "nt":
         raise OrchestratorError("Windows managed-directory handles are unavailable.")
@@ -3378,10 +3460,14 @@ def _open_windows_managed_directory(
     desired_access = 0x80000000 | 0x00020000
     if writable:
         desired_access |= 0x00040000 | 0x00010000
+        if set_owner:
+            desired_access |= 0x00080000
     native_handle = kernel32.CreateFileW(
         str(path),
         desired_access,
-        0x00000001 | 0x00000002 | 0x00000004,
+        0x00000001
+        | 0x00000002
+        | (0x00000004 if share_delete else 0),
         None,
         3,
         0x02000000 | 0x00200000,
@@ -3406,13 +3492,21 @@ def _open_windows_managed_directory(
                 f"Managed artifact is not a directory: {path.name}"
             )
         if writable:
-            _enforce_windows_private_acl_handle(native_handle, is_dir=True)
-        elif verify_private and not _inspect_windows_private_acl_handle(
-            native_handle, is_dir=True
-        )["exact"]:
-            raise OrchestratorError(
-                f"Private Windows ACL verification failed for {path.name}."
+            _enforce_windows_private_acl_handle(
+                native_handle, is_dir=True, set_owner=set_owner
             )
+        elif verify_private:
+            inspection = _inspect_windows_private_acl_handle(
+                native_handle, is_dir=True
+            )
+            if inspection[
+                "exact" if verify_owner else "dacl_exact"
+            ]:
+                inspection = None
+            if inspection is not None:
+                raise OrchestratorError(
+                    f"Private Windows ACL verification failed for {path.name}."
+                )
         final_buffer = ctypes.create_unicode_buffer(32768)
         final_length = kernel32.GetFinalPathNameByHandleW(
             native_handle, final_buffer, len(final_buffer), 0
@@ -3517,11 +3611,11 @@ def _open_posix_managed_file(
             raise OrchestratorError(
                 f"Managed artifact exceeds its size limit: {path.name}"
             )
-        if writable:
-            os.fchmod(fd, 0o600)
-            details = os.fstat(fd)
         if verify_private and stat.S_IMODE(details.st_mode) != 0o600:
             raise OrchestratorError(f"Private artifact mode is invalid: {path.name}")
+        if writable and not verify_private:
+            os.fchmod(fd, 0o600)
+            details = os.fstat(fd)
         file_handle = os.fdopen(fd, "r+b" if writable else "rb")
         fd = None
         yield file_handle, details
@@ -3540,21 +3634,43 @@ def _open_posix_managed_file(
 
 
 def _open_managed_file(
-    path: Path, *, writable: bool = False, verify_private: bool = True
+    path: Path,
+    *,
+    writable: bool = False,
+    verify_private: bool = True,
+    verify_owner: bool = False,
 ) -> Any:
-    opener = _open_windows_managed_file if os.name == "nt" else _open_posix_managed_file
-    return opener(path, writable=writable, verify_private=verify_private)
+    if os.name == "nt":
+        return _open_windows_managed_file(
+            path,
+            writable=writable,
+            verify_private=verify_private,
+            verify_owner=verify_owner,
+        )
+    return _open_posix_managed_file(
+        path, writable=writable, verify_private=verify_private
+    )
 
 
 def _open_managed_directory(
-    path: Path, *, writable: bool = False, verify_private: bool = True
+    path: Path,
+    *,
+    writable: bool = False,
+    verify_private: bool = True,
+    set_owner: bool = False,
+    verify_owner: bool = False,
 ) -> Any:
-    opener = (
-        _open_windows_managed_directory
-        if os.name == "nt"
-        else _open_posix_managed_directory
+    if os.name == "nt":
+        return _open_windows_managed_directory(
+            path,
+            writable=writable,
+            verify_private=verify_private,
+            set_owner=set_owner,
+            verify_owner=verify_owner,
+        )
+    return _open_posix_managed_directory(
+        path, writable=writable, verify_private=verify_private
     )
-    return opener(path, writable=writable, verify_private=verify_private)
 
 
 def _read_bounded_regular_file(
@@ -3580,13 +3696,164 @@ def _verify_private_path(path: Path, *, is_dir: bool = False) -> None:
         return
 
 
-def _set_private_directory(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with _open_managed_directory(
-        path, writable=True, verify_private=False
+def _create_windows_private_directory_handle(
+    parent_handle: Any, name: str
+) -> Any:
+    import ctypes
+
+    ctypes_module, advapi32, kernel32 = _windows_security_apis()
+    current_user_sid = _windows_current_user_sid(
+        ctypes_module, advapi32, kernel32
+    )
+    descriptor = ctypes.c_void_p()
+    size = ctypes.c_uint32()
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        f"O:{current_user_sid}D:P(A;OICI;FA;;;{current_user_sid})",
+        1,
+        ctypes.byref(descriptor),
+        ctypes.byref(size),
     ):
-        pass
-    _verify_private_path(path, is_dir=True)
+        raise OrchestratorError(
+            f"Could not construct a private Windows directory ACL for {name}."
+        )
+    try:
+        native_handle = _open_windows_relative_native_handle(
+            parent_handle,
+            name,
+            writable=True,
+            is_dir=True,
+            create=True,
+            security_descriptor=descriptor.value,
+            share_delete=False,
+            delete_access=False,
+        )
+    finally:
+        kernel32.LocalFree(descriptor)
+    if not _inspect_windows_private_acl_handle(
+        native_handle, is_dir=True
+    )["exact"]:
+        _close_windows_handle(native_handle)
+        raise OrchestratorError(
+            f"Private Windows directory creation was not exact for {name}."
+        )
+    return native_handle
+
+
+def _secure_windows_private_directory(
+    path: Path, *, strict_owner: bool
+) -> None:
+    with _open_windows_managed_directory(
+        path.parent, verify_private=False, share_delete=False
+    ) as (parent_handle, _parent_details):
+        created = False
+        try:
+            native_handle = _create_windows_private_directory_handle(
+                parent_handle, path.name
+            )
+            created = True
+        except FileExistsError:
+            native_handle = _open_windows_relative_native_handle(
+                parent_handle,
+                path.name,
+                writable=True,
+                is_dir=True,
+                delete_access=False,
+                share_delete=False,
+            )
+        try:
+            details = _windows_relative_handle_details(
+                native_handle, path.name
+            )
+            if not details["attributes"] & 0x10:
+                raise OrchestratorError(
+                    f"Managed artifact is not a directory: {path.name}"
+                )
+            inspection = _inspect_windows_private_acl_handle(
+                native_handle, is_dir=True
+            )
+            if created or strict_owner:
+                if not inspection["exact"]:
+                    raise OrchestratorError(
+                        f"Private Windows directory owner is invalid: {path.name}."
+                    )
+            elif not inspection["dacl_exact"]:
+                _enforce_windows_private_acl_handle(
+                    native_handle, is_dir=True, set_owner=False
+                )
+            final = _inspect_windows_private_acl_handle(
+                native_handle, is_dir=True
+            )
+            if not final["exact" if strict_owner or created else "dacl_exact"]:
+                raise OrchestratorError(
+                    f"Private Windows directory verification failed: {path.name}."
+                )
+        finally:
+            _close_windows_handle(native_handle)
+
+
+def _set_private_directory(path: Path) -> None:
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        if current == current.parent:
+            raise OrchestratorError(
+                "Private directory parent is unavailable."
+            )
+        current = current.parent
+    if not current.is_dir():
+        raise OrchestratorError(
+            f"Private directory parent is invalid: {current.name}"
+        )
+    if os.name == "nt":
+        directories = list(reversed(missing)) if missing else [path]
+        for directory in directories:
+            _secure_windows_private_directory(
+                directory, strict_owner=False
+            )
+        return
+    directories: list[tuple[Path, bool]] = []
+    for directory in reversed(missing):
+        created = False
+        try:
+            directory.mkdir(mode=0o700)
+            created = True
+        except FileExistsError:
+            pass
+        directories.append((directory, created))
+    if not missing:
+        directories.append((path, False))
+    for directory, created in directories:
+        if not created:
+            try:
+                _verify_private_path(directory, is_dir=True)
+                continue
+            except (OSError, OrchestratorError):
+                pass
+        deadline = time.monotonic() + 1.0
+        effective = _effective_deadline()
+        if effective is not None:
+            deadline = min(deadline, effective)
+        while True:
+            try:
+                with _open_managed_directory(
+                    directory,
+                    writable=True,
+                    verify_private=False,
+                    set_owner=created,
+                ):
+                    pass
+            except (OSError, OrchestratorError):
+                try:
+                    _verify_private_path(directory, is_dir=True)
+                    break
+                except (OSError, OrchestratorError):
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.005)
+                    continue
+            _verify_private_path(directory, is_dir=True)
+            break
 
 
 def _set_private_file(path: Path) -> None:
@@ -3629,7 +3896,9 @@ def _secure_private_writable_handle(handle: Any, path: Path) -> None:
         import msvcrt
 
         native_handle = msvcrt.get_osfhandle(handle.fileno())
-        _enforce_windows_private_acl_handle(native_handle, is_dir=False)
+        _enforce_windows_private_acl_handle(
+            native_handle, is_dir=False, set_owner=True
+        )
         if not _inspect_windows_private_acl_handle(
             native_handle, is_dir=False
         )["exact"]:
@@ -3675,7 +3944,11 @@ def _create_windows_private_file(
         if parent_handle is not None
         else kernel32.CreateFileW(
             str(path),
-            0x80000000 | 0x40000000 | 0x00020000 | 0x00040000,
+            0x80000000
+            | 0x40000000
+            | 0x00020000
+            | 0x00040000
+            | 0x00080000,
             0x00000001 | 0x00000002 | 0x00000004,
             None,
             1,
@@ -3688,7 +3961,9 @@ def _create_windows_private_file(
         raise ctypes.WinError(ctypes.get_last_error())
     file_handle: Any | None = None
     try:
-        _enforce_windows_private_acl_handle(native_handle, is_dir=False)
+        _enforce_windows_private_acl_handle(
+            native_handle, is_dir=False, set_owner=True
+        )
         fd = msvcrt.open_osfhandle(int(native_handle), os.O_RDWR | os.O_BINARY)
         native_handle = None
         file_handle = os.fdopen(fd, "w+b")
@@ -3738,6 +4013,7 @@ def _windows_relative_handle_details(native_handle: Any, name: str) -> dict[str,
         "attributes": attributes,
         "size": (int(information.nFileSizeHigh) << 32)
         | int(information.nFileSizeLow),
+        "number_of_links": int(information.nNumberOfLinks),
         "file_id": (
             int(information.dwVolumeSerialNumber),
             (int(information.nFileIndexHigh) << 32)
@@ -4008,7 +4284,7 @@ def _prepare_private_atomic_write(
     _check_deadline(deadline)
     if len(payload) > MAX_MANAGED_ARTIFACT_BYTES:
         raise OrchestratorError(f"Atomic artifact exceeds its size limit: {path.name}")
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _set_private_directory(path.parent)
     temporary_path: Path | None = None
     parent_anchor: tuple[str, Any, Any] | None = None
     try:
@@ -4019,7 +4295,9 @@ def _prepare_private_atomic_write(
                 _parent_handle, parent_details = parent_context.__enter__()
             except OrchestratorError:
                 with _open_windows_managed_directory(
-                    path.parent, writable=True, verify_private=False
+                    path.parent,
+                    writable=True,
+                    verify_private=False,
                 ):
                     pass
                 parent_context = _open_windows_managed_directory(path.parent)
@@ -4516,6 +4794,790 @@ def _atomic_write_text(
         )
 
 
+def _security_audit_paths(artifact_root: str | Path) -> dict[str, Path]:
+    root = Path(os.path.abspath(Path(artifact_root).expanduser()))
+    bootstrap_root = root.parent / ".runtime-security-audit-bootstrap"
+    bootstrap_scope = bootstrap_root / hashlib.sha256(
+        os.path.normcase(str(root)).encode("utf-8")
+    ).hexdigest()
+    return {
+        "root": root,
+        "config": root / "config",
+        "logs": root / "logs",
+        "key": root / "config" / "runtime_security.audit.key",
+        "lock": root / "config" / "runtime_security.audit.lock",
+        "failures": root / "config" / "runtime_security.audit.failures",
+        "bootstrap_root": bootstrap_root,
+        "bootstrap_failures": bootstrap_scope,
+        "log": root / "logs" / "security-events.ndjson",
+        "checkpoint": root / "logs" / "security-events.checkpoint.json",
+    }
+
+
+def _verify_strict_private_directory(path: Path) -> None:
+    with _open_managed_directory(
+        path, verify_private=True, verify_owner=True
+    ) as (handle, _details):
+        if os.name != "nt":
+            details = os.fstat(handle)
+            if details.st_uid != os.geteuid():
+                raise OrchestratorError(
+                    f"Private artifact owner is invalid: {path.name}"
+                )
+
+
+def _ensure_strict_private_directory(path: Path) -> None:
+    if os.name == "nt":
+        _secure_windows_private_directory(path, strict_owner=True)
+        return
+    created = False
+    try:
+        path.mkdir(mode=0o700)
+        created = True
+    except FileExistsError:
+        pass
+    if created:
+        with _open_managed_directory(
+            path,
+            writable=True,
+            verify_private=False,
+            set_owner=True,
+        ):
+            pass
+    verification_deadline = time.monotonic() + 1.0
+    effective = _effective_deadline()
+    if effective is not None:
+        verification_deadline = min(verification_deadline, effective)
+    while True:
+        try:
+            _verify_strict_private_directory(path)
+            return
+        except (OSError, OrchestratorError):
+            if created or time.monotonic() >= verification_deadline:
+                raise
+            time.sleep(0.005)
+
+
+@contextlib.contextmanager
+def _open_strict_private_file(path: Path, *, writable: bool = False) -> Any:
+    with _open_managed_file(
+        path,
+        writable=writable,
+        verify_private=True,
+        verify_owner=True,
+    ) as (handle, details):
+        current = os.fstat(handle.fileno())
+        link_count = (
+            int(details.get("number_of_links", current.st_nlink))
+            if isinstance(details, Mapping)
+            else int(current.st_nlink)
+        )
+        if link_count != 1:
+            raise OrchestratorError(
+                f"Private artifact hard links are forbidden: {path.name}"
+            )
+        if os.name != "nt" and current.st_uid != os.geteuid():
+            raise OrchestratorError(
+                f"Private artifact owner is invalid: {path.name}"
+            )
+        yield handle, details
+
+
+def _create_private_file_once(path: Path, payload: bytes) -> bool:
+    candidate = _prepare_private_atomic_write(path, payload)
+    try:
+        _publish_artifact_lock_candidate(candidate, path)
+        return True
+    except FileExistsError:
+        deadline = time.monotonic() + SECURITY_AUDIT_LOCK_TIMEOUT_SECONDS
+        inherited = _effective_deadline()
+        if inherited is not None:
+            deadline = min(deadline, inherited)
+        while True:
+            try:
+                with _open_strict_private_file(path):
+                    return False
+            except OrchestratorError as exc:
+                if "hard links are forbidden" not in str(exc):
+                    raise
+                _check_deadline(
+                    deadline,
+                    "Private file publication did not become stable.",
+                )
+                time.sleep(0.005)
+    finally:
+        _discard_prepared_atomic_write(candidate)
+
+
+@contextlib.contextmanager
+def _static_private_file_lock(path: Path) -> Any:
+    _create_private_file_once(path, b"0")
+    key = os.path.normcase(str(path))
+    with _STATIC_FILE_LOCKS_GUARD:
+        local_lock = _STATIC_FILE_LOCKS.setdefault(key, threading.RLock())
+    effective = time.monotonic() + SECURITY_AUDIT_LOCK_TIMEOUT_SECONDS
+    inherited = _effective_deadline()
+    if inherited is not None:
+        effective = min(effective, inherited)
+    while not local_lock.acquire(blocking=False):
+        _check_deadline(effective, "Security audit lock acquisition timed out.")
+        time.sleep(0.005)
+    try:
+        with _open_strict_private_file(path, writable=True) as (handle, details):
+            identity = _artifact_lock_file_identity(details)
+            acquired = False
+            while not acquired:
+                _check_deadline(
+                    effective, "Security audit lock acquisition timed out."
+                )
+                try:
+                    handle.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(
+                            handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                        )
+                    acquired = True
+                except OSError as exc:
+                    if exc.errno not in {
+                        errno.EACCES,
+                        errno.EAGAIN,
+                        errno.EBUSY,
+                        errno.EDEADLK,
+                    }:
+                        raise
+                    time.sleep(0.005)
+            try:
+                if not _artifact_lock_path_matches_generation(path, identity):
+                    raise OrchestratorError(
+                        "Security audit lock generation changed."
+                    )
+                yield
+                if not _artifact_lock_path_matches_generation(path, identity):
+                    raise OrchestratorError(
+                        "Security audit lock generation changed."
+                    )
+            finally:
+                if acquired:
+                    try:
+                        handle.seek(0)
+                        if os.name == "nt":
+                            import msvcrt
+
+                            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                        else:
+                            import fcntl
+
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+    finally:
+        local_lock.release()
+
+
+def _prepare_security_audit_directories(paths: Mapping[str, Path]) -> None:
+    _prepare_security_audit_bootstrap_directories(paths)
+    root = paths["root"]
+    _set_private_directory(root)
+    _ensure_strict_private_directory(paths["config"])
+    _ensure_strict_private_directory(paths["logs"])
+    _ensure_strict_private_directory(paths["failures"])
+
+
+def _prepare_security_audit_bootstrap_directories(
+    paths: Mapping[str, Path]
+) -> None:
+    _set_private_directory(paths["bootstrap_failures"])
+    _verify_strict_private_directory(paths["bootstrap_root"])
+    _verify_strict_private_directory(paths["bootstrap_failures"])
+
+
+def _load_or_create_security_audit_key(
+    paths: Mapping[str, Path]
+) -> tuple[bytes, bool]:
+    key_path = paths["key"]
+    created = False
+    if not key_path.exists():
+        if paths["log"].exists() or paths["checkpoint"].exists():
+            raise OrchestratorError(
+                "Security audit key is missing for existing audit records."
+            )
+        created = _create_private_file_once(key_path, os.urandom(32))
+    with _open_strict_private_file(key_path) as (handle, _details):
+        key = handle.read(33)
+    if len(key) != 32:
+        raise OrchestratorError("Security audit key has an invalid length.")
+    return key, created
+
+
+def _canonical_security_json(value: Mapping[str, Any]) -> bytes:
+    try:
+        return json.dumps(
+            dict(value),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise OrchestratorError("Security audit record is not canonical JSON.") from exc
+
+
+def _security_checkpoint_payload(
+    key: bytes, *, count: int, last_hash: str | None, log_bytes: int
+) -> bytes:
+    body: dict[str, Any] = {
+        "schema_version": 1,
+        "count": count,
+        "last_hash": last_hash,
+        "log_bytes": log_bytes,
+    }
+    signature = hmac.new(key, _canonical_security_json(body), hashlib.sha256).hexdigest()
+    body["checkpoint_hmac"] = f"hmac-sha256:v1:{signature}"
+    return _canonical_security_json(body) + b"\n"
+
+
+def _read_security_records(handle: Any) -> tuple[list[dict[str, Any]], int]:
+    handle.seek(0)
+    payload = handle.read(MAX_MANAGED_ARTIFACT_BYTES + 1)
+    if len(payload) > MAX_MANAGED_ARTIFACT_BYTES:
+        raise OrchestratorError("Security audit log exceeds its size limit.")
+    if payload and not payload.endswith(b"\n"):
+        raise OrchestratorError("Security audit log has an incomplete tail.")
+    records: list[dict[str, Any]] = []
+    for line in payload.splitlines():
+        if not line or len(line) + 1 > MAX_SECURITY_AUDIT_EVENT_BYTES:
+            raise OrchestratorError("Security audit record has an invalid size.")
+        try:
+            record = json.loads(
+                line.decode("utf-8"),
+                parse_constant=lambda _value: (_ for _ in ()).throw(
+                    ValueError("non-finite number")
+                ),
+            )
+        except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+            raise OrchestratorError("Security audit record is invalid JSON.") from exc
+        if not isinstance(record, dict):
+            raise OrchestratorError("Security audit record must be an object.")
+        records.append(record)
+    verification = verify_security_event_chain(records)
+    if not verification.get("ok"):
+        raise OrchestratorError("Security audit hash chain verification failed.")
+    return records, len(payload)
+
+
+def _read_security_checkpoint(path: Path, key: bytes) -> dict[str, Any] | None:
+    try:
+        with _open_strict_private_file(path) as (handle, _details):
+            payload = handle.read(MAX_SECURITY_AUDIT_EVENT_BYTES + 1)
+    except FileNotFoundError:
+        return None
+    if len(payload) > MAX_SECURITY_AUDIT_EVENT_BYTES:
+        raise OrchestratorError("Security audit checkpoint exceeds its size limit.")
+    try:
+        checkpoint = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise OrchestratorError("Security audit checkpoint is invalid JSON.") from exc
+    if not isinstance(checkpoint, dict):
+        raise OrchestratorError("Security audit checkpoint must be an object.")
+    signature = checkpoint.pop("checkpoint_hmac", None)
+    expected = "hmac-sha256:v1:" + hmac.new(
+        key, _canonical_security_json(checkpoint), hashlib.sha256
+    ).hexdigest()
+    if not isinstance(signature, str) or not hmac.compare_digest(signature, expected):
+        raise OrchestratorError("Security audit checkpoint authentication failed.")
+    return checkpoint
+
+
+def _verify_security_checkpoint(
+    checkpoint: Mapping[str, Any] | None,
+    records: list[dict[str, Any]],
+    log_bytes: int,
+) -> None:
+    if checkpoint is None:
+        raise OrchestratorError("Security audit checkpoint is missing.")
+    expected = {
+        "schema_version": 1,
+        "count": len(records),
+        "last_hash": (
+            records[-1].get("record_hash") if records else None
+        ),
+        "log_bytes": log_bytes,
+    }
+    if dict(checkpoint) != expected:
+        raise OrchestratorError("Security audit checkpoint does not match the log.")
+
+
+def _security_scalar_equals(value: Any, secret: str) -> bool:
+    if isinstance(value, Mapping):
+        return any(_security_scalar_equals(item, secret) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_security_scalar_equals(item, secret) for item in value)
+    return isinstance(value, str) and value == secret
+
+
+def _assert_security_record_contains_no_secret(
+    record: Mapping[str, Any], payload: bytes, known_secrets: tuple[str, ...]
+) -> None:
+    text = payload.decode("utf-8")
+    if _contains_secret_value(text) or SECRET_ASSIGN_RE.search(text):
+        raise OrchestratorError("Security audit record matched a secret pattern.")
+    opaque_projection = _canonical_security_json(
+        {
+            key: record.get(key)
+            for key in (
+                "provider_pseudonym",
+                "policy_decision_id",
+                "dedupe_id",
+                "previous_hash",
+                "record_hash",
+            )
+        }
+    ).decode("utf-8")
+    for secret in _normalize_sensitive_values(known_secrets):
+        encoded_forms = {
+            secret,
+            json.dumps(secret, ensure_ascii=False)[1:-1],
+            quote(secret, safe=""),
+            quote(secret, safe="", encoding="utf-8").replace("%", "%25"),
+        }
+        if any(
+            candidate and candidate in opaque_projection
+            for candidate in encoded_forms
+        ):
+            raise OrchestratorError("Security audit record contains a secret value.")
+
+
+def _append_security_event_inner(
+    *,
+    artifact_root: str | Path,
+    code: str,
+    severity: str,
+    run_id: str | None,
+    runtime_id: str | None,
+    trust_level: str | None,
+    provider_id: str | None,
+    policy_decision_id: str | None,
+    safe_details: Mapping[str, Any],
+    recommended_action: str,
+    known_secrets: tuple[str, ...] = (),
+    dedupe_key: str | None = None,
+) -> Path:
+    paths = _security_audit_paths(artifact_root)
+    _prepare_security_audit_directories(paths)
+    with _static_private_file_lock(paths["lock"]):
+        observed_failure_paths = _security_audit_failure_marker_paths(paths)
+        key, key_created = _load_or_create_security_audit_key(paths)
+        if key_created:
+            if not _create_private_file_once(paths["log"], b""):
+                raise OrchestratorError(
+                    "Security audit log already exists during key initialization."
+                )
+            zero_checkpoint = _security_checkpoint_payload(
+                key, count=0, last_hash=None, log_bytes=0
+            )
+            if not _create_private_file_once(
+                paths["checkpoint"], zero_checkpoint
+            ):
+                raise OrchestratorError(
+                    "Security audit checkpoint already exists during key initialization."
+                )
+        elif not paths["log"].exists():
+            raise OrchestratorError("Security audit log is missing.")
+        with _open_strict_private_file(paths["log"], writable=True) as (
+            handle,
+            _details,
+        ):
+            records, log_bytes = _read_security_records(handle)
+            checkpoint = _read_security_checkpoint(paths["checkpoint"], key)
+            _verify_security_checkpoint(checkpoint, records, log_bytes)
+            event = build_safe_security_event(
+                audit_key=key,
+                timestamp=utc_now_iso(),
+                code=code,
+                severity=severity,
+                run_id=run_id,
+                runtime_id=runtime_id,
+                trust_level=trust_level,
+                provider_id=provider_id,
+                policy_decision_id=policy_decision_id,
+                safe_details=safe_details,
+                recommended_action=recommended_action,
+                dedupe_key=dedupe_key,
+            )
+            dedupe_id = event.get("dedupe_id")
+            if dedupe_id is not None and any(
+                item.get("dedupe_id") == dedupe_id for item in records
+            ):
+                _clear_security_audit_failures(observed_failure_paths)
+                return paths["log"]
+            previous_hash = records[-1].get("record_hash") if records else None
+            record = chain_security_event(event, previous_hash=previous_hash)
+            encoded = _canonical_security_json(record) + b"\n"
+            if len(encoded) > MAX_SECURITY_AUDIT_EVENT_BYTES:
+                raise OrchestratorError("Security audit record exceeds 16 KiB.")
+            _assert_security_record_contains_no_secret(record, encoded, known_secrets)
+            if log_bytes + len(encoded) > MAX_MANAGED_ARTIFACT_BYTES:
+                raise OrchestratorError("Security audit log exceeds its size limit.")
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() != log_bytes:
+                raise OrchestratorError("Security audit log changed during append.")
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+            final_size = handle.tell()
+        checkpoint_payload = _security_checkpoint_payload(
+            key,
+            count=len(records) + 1,
+            last_hash=str(record["record_hash"]),
+            log_bytes=final_size,
+        )
+        _atomic_write_bytes(paths["checkpoint"], checkpoint_payload)
+        with _open_strict_private_file(paths["checkpoint"]):
+            pass
+        _clear_security_audit_failures(observed_failure_paths)
+    return paths["log"]
+
+
+def _security_audit_failure_key(artifact_root: str | Path) -> str:
+    return os.path.normcase(str(_security_audit_paths(artifact_root)["root"]))
+
+
+def _mark_security_audit_failure(
+    artifact_root: str | Path, error: BaseException
+) -> None:
+    failure_id = uuid.uuid4().hex
+    failure = {
+        "schema_version": 1,
+        "failure_id": failure_id,
+        "component": type(error).__name__,
+        "observed_at": utc_now_iso(),
+    }
+    with _SECURITY_AUDIT_FAILURES_GUARD:
+        _SECURITY_AUDIT_FAILURES[
+            _security_audit_failure_key(artifact_root)
+        ] = {**failure, "marker_persisted": False}
+    paths = _security_audit_paths(artifact_root)
+    payload = _canonical_security_json(failure)
+    persisted = False
+    marker_errors: list[BaseException] = []
+    normal_tree_initialized = paths["failures"].exists()
+    for failure_dir in (
+        paths["bootstrap_failures"],
+        paths["failures"],
+    ):
+        try:
+            if failure_dir == paths["bootstrap_failures"]:
+                _prepare_security_audit_bootstrap_directories(paths)
+            elif failure_dir.exists():
+                _verify_strict_private_directory(failure_dir)
+            else:
+                continue
+            if not _create_private_file_once(
+                failure_dir / f"{failure_id}.json", payload
+            ):
+                raise OrchestratorError(
+                    "Security audit failure marker generation collided."
+                )
+            persisted = True
+        except Exception as marker_error:
+            marker_errors.append(marker_error)
+    expected_marker_count = 2 if normal_tree_initialized else 1
+    if persisted and not marker_errors:
+        marker_paths = tuple(
+            directory / f"{failure_id}.json"
+            for directory in (
+                paths["bootstrap_failures"],
+                paths["failures"],
+            )
+            if directory.exists()
+        )
+        if len(marker_paths) != expected_marker_count or not all(
+            marker.exists() for marker in marker_paths
+        ):
+            marker_errors.append(
+                OrchestratorError(
+                    "Security audit failure marker set is incomplete."
+                )
+            )
+    if persisted and not marker_errors:
+        with _SECURITY_AUDIT_FAILURES_GUARD:
+            current = _SECURITY_AUDIT_FAILURES.get(
+                _security_audit_failure_key(artifact_root)
+            )
+            if current is not None and current.get("failure_id") == failure_id:
+                current["marker_persisted"] = True
+        return
+    raise OrchestratorError(
+        "Security audit failure could not be persisted independently."
+    ) from (marker_errors[-1] if marker_errors else error)
+
+
+def _security_audit_failure_marker_paths(
+    paths: Mapping[str, Path]
+) -> tuple[Path, ...]:
+    markers: list[Path] = []
+    for failure_dir in (
+        paths["bootstrap_failures"],
+        paths["failures"],
+    ):
+        if not failure_dir.exists():
+            continue
+        _verify_strict_private_directory(failure_dir)
+        for marker in failure_dir.iterdir():
+            if (
+                not marker.is_file()
+                or re.fullmatch(r"[0-9a-f]{32}\.json", marker.name) is None
+            ):
+                raise OrchestratorError(
+                    "Security audit failure marker directory is invalid."
+                )
+            markers.append(marker)
+    return tuple(sorted(markers, key=lambda item: (item.name, str(item.parent))))
+
+
+def _read_persisted_security_audit_failures(
+    paths: Mapping[str, Path]
+) -> list[dict[str, Any]]:
+    failures: dict[str, dict[str, Any]] = {}
+    for marker in _security_audit_failure_marker_paths(paths):
+        with _open_strict_private_file(marker) as (handle, _details):
+            payload = handle.read(MAX_SECURITY_AUDIT_EVENT_BYTES + 1)
+        if len(payload) > MAX_SECURITY_AUDIT_EVENT_BYTES:
+            raise OrchestratorError(
+                "Security audit failure marker is oversized."
+            )
+        try:
+            failure = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise OrchestratorError(
+                "Security audit failure marker is invalid."
+            ) from exc
+        if (
+            not isinstance(failure, dict)
+            or set(failure)
+            != {
+                "schema_version",
+                "failure_id",
+                "component",
+                "observed_at",
+            }
+            or failure.get("schema_version") != 1
+            or failure.get("failure_id") != marker.stem
+            or not isinstance(failure.get("component"), str)
+            or not isinstance(failure.get("observed_at"), str)
+        ):
+            raise OrchestratorError(
+                "Security audit failure marker is invalid."
+            )
+        failure_id = str(failure["failure_id"])
+        previous = failures.get(failure_id)
+        if previous is not None and previous != failure:
+            raise OrchestratorError(
+                "Security audit failure marker generations disagree."
+            )
+        failures[failure_id] = failure
+    return list(failures.values())
+
+
+def _clear_security_audit_failures(markers: tuple[Path, ...]) -> None:
+    for marker in markers:
+        _unlink_managed_file(marker)
+
+
+def append_security_event(
+    *,
+    artifact_root: str | Path,
+    code: str,
+    severity: str,
+    run_id: str | None,
+    runtime_id: str | None,
+    trust_level: str | None,
+    provider_id: str | None,
+    policy_decision_id: str | None,
+    safe_details: Mapping[str, Any],
+    recommended_action: str,
+    known_secrets: tuple[str, ...] = (),
+    dedupe_key: str | None = None,
+) -> Path:
+    failure_key = _security_audit_failure_key(artifact_root)
+    with _SECURITY_AUDIT_FAILURES_GUARD:
+        observed_memory_failure = _SECURITY_AUDIT_FAILURES.get(failure_key)
+    try:
+        result = _append_security_event_inner(
+            artifact_root=artifact_root,
+            code=code,
+            severity=severity,
+            run_id=run_id,
+            runtime_id=runtime_id,
+            trust_level=trust_level,
+            provider_id=provider_id,
+            policy_decision_id=policy_decision_id,
+            safe_details=safe_details,
+            recommended_action=recommended_action,
+            known_secrets=known_secrets,
+            dedupe_key=dedupe_key,
+        )
+    except Exception as exc:
+        _mark_security_audit_failure(artifact_root, exc)
+        raise
+    with _SECURITY_AUDIT_FAILURES_GUARD:
+        current = _SECURITY_AUDIT_FAILURES.get(failure_key)
+        if current is not None and current is observed_memory_failure:
+            failure_id = str(current.get("failure_id") or "")
+            marker = _security_audit_paths(artifact_root)["failures"] / (
+                f"{failure_id}.json"
+            )
+            if not marker.exists():
+                _SECURITY_AUDIT_FAILURES.pop(failure_key, None)
+    return result
+
+
+def security_audit_health(artifact_root: str | Path) -> dict[str, Any]:
+    paths = _security_audit_paths(artifact_root)
+    with _SECURITY_AUDIT_FAILURES_GUARD:
+        observed_failure = _SECURITY_AUDIT_FAILURES.get(
+            _security_audit_failure_key(artifact_root)
+        )
+    result: dict[str, Any] = {
+        "ok": True,
+        "initialized": False,
+        "tamper_evident_local_only": True,
+        "event_count": 0,
+        "counts_by_code": {},
+        "counts_by_severity": {},
+        "failure_count": 0,
+        "recommended_action": None,
+        "log_bytes": 0,
+        "max_log_bytes": MAX_MANAGED_ARTIFACT_BYTES,
+        "remaining_log_bytes": MAX_MANAGED_ARTIFACT_BYTES,
+        "capacity_ratio": 0.0,
+    }
+    try:
+        persisted_failures = _read_persisted_security_audit_failures(paths)
+        persisted_ids = {
+            str(item.get("failure_id")) for item in persisted_failures
+        }
+        observed_active = bool(
+            observed_failure is not None
+            and (
+                not observed_failure.get("marker_persisted")
+                or str(observed_failure.get("failure_id")) in persisted_ids
+            )
+        )
+        if (
+            observed_failure is not None
+            and observed_failure.get("marker_persisted")
+            and not observed_active
+        ):
+            with _SECURITY_AUDIT_FAILURES_GUARD:
+                current = _SECURITY_AUDIT_FAILURES.get(
+                    _security_audit_failure_key(artifact_root)
+                )
+                if current is observed_failure:
+                    _SECURITY_AUDIT_FAILURES.pop(
+                        _security_audit_failure_key(artifact_root), None
+                    )
+        if observed_active:
+            memory_failure = {
+                key: value
+                for key, value in observed_failure.items()
+                if key != "marker_persisted"
+            }
+            if str(memory_failure.get("failure_id")) not in persisted_ids:
+                persisted_failures.append(memory_failure)
+        if persisted_failures:
+            latest_failure = max(
+                persisted_failures,
+                key=lambda item: str(item.get("observed_at") or ""),
+            )
+            result.update(
+                {
+                    "ok": False,
+                    "last_failure": latest_failure,
+                    "failure_count": len(persisted_failures),
+                    "recommended_action": (
+                        "Repair the private security audit component and complete "
+                        "one verified audit append."
+                    ),
+                }
+            )
+        if not paths["root"].exists():
+            return result
+        material = (paths["key"], paths["log"], paths["checkpoint"])
+        if (
+            not any(path.exists() for path in material)
+            and not persisted_failures
+            and not observed_active
+        ):
+            return result
+        _verify_private_path(paths["root"], is_dir=True)
+        _verify_strict_private_directory(paths["config"])
+        if not any(path.exists() for path in material):
+            return result
+        _verify_strict_private_directory(paths["logs"])
+        if not paths["lock"].exists():
+            raise OrchestratorError("Security audit lock is missing.")
+        with _static_private_file_lock(paths["lock"]):
+            key, _key_created = _load_or_create_security_audit_key(paths)
+            with _open_strict_private_file(paths["log"]) as (handle, _details):
+                records, log_bytes = _read_security_records(handle)
+            checkpoint = _read_security_checkpoint(paths["checkpoint"], key)
+            _verify_security_checkpoint(checkpoint, records, log_bytes)
+        result.update(
+            {
+                "initialized": True,
+                "event_count": len(records),
+                "counts_by_code": dict(
+                    sorted(Counter(str(item.get("code")) for item in records).items())
+                ),
+                "counts_by_severity": dict(
+                    sorted(
+                        Counter(str(item.get("severity")) for item in records).items()
+                    )
+                ),
+                "log_bytes": log_bytes,
+                "remaining_log_bytes": max(
+                    0, MAX_MANAGED_ARTIFACT_BYTES - log_bytes
+                ),
+                "capacity_ratio": round(
+                    log_bytes / MAX_MANAGED_ARTIFACT_BYTES, 6
+                ),
+            }
+        )
+        if (
+            MAX_MANAGED_ARTIFACT_BYTES - log_bytes
+            < MAX_SECURITY_AUDIT_EVENT_BYTES
+        ):
+            result.update(
+                {
+                    "ok": False,
+                    "capacity_exhausted": True,
+                    "recommended_action": (
+                        "Archive the security audit log with its checkpoint "
+                        "before another guarded launch."
+                    ),
+                }
+            )
+    except Exception as exc:
+        result.update(
+            {
+                "ok": False,
+                "error": type(exc).__name__,
+                "recommended_action": (
+                    "Inspect the private audit key, lock, log, and checkpoint files; "
+                    "restore the last known-good set before retrying an unsafe launch."
+                ),
+            }
+        )
+    return result
+
+
 def _metadata_bytes(metadata: Mapping[str, Any]) -> bytes:
     return json.dumps(
         sanitize_for_json(dict(metadata)), ensure_ascii=False, indent=2
@@ -4924,6 +5986,9 @@ class _LaunchLock:
         return True
 
     def __enter__(self) -> None:
+        _prepare_security_audit_directories(
+            _security_audit_paths(RUNS_DIR.parent)
+        )
         _set_private_directory(RUNS_DIR)
         deadline = time.monotonic() + self.timeout_seconds
         operation_deadline = _effective_deadline()
@@ -6496,9 +7561,23 @@ def list_profiles(ccswitch_home: str | Path | None = None, include_secrets: bool
                 "model": provider.model,
                 "models": provider.models,
                 "model_entries": provider.model_entries,
-                "base_url": provider.env.get("ANTHROPIC_BASE_URL"),
-                "endpoints": provider.endpoints,
-                "settings": provider.settings if include_secrets else redact(provider.settings),
+                "base_url": (
+                    provider.env.get("ANTHROPIC_BASE_URL")
+                    if include_secrets
+                    else project_public_endpoint(
+                        provider.env.get("ANTHROPIC_BASE_URL")
+                    )
+                ),
+                "endpoints": (
+                    provider.endpoints
+                    if include_secrets
+                    else project_public_endpoints(provider.endpoints)
+                ),
+                "settings": (
+                    provider.settings
+                    if include_secrets
+                    else project_public_endpoint_values(redact(provider.settings))
+                ),
             }
             profiles.append(payload)
         return profiles
@@ -6838,13 +7917,163 @@ def resolve_route(role: str = "implementation", task_type: str | None = None, pr
     }
 
 
+@contextlib.contextmanager
+def _hold_verified_runtime_files(
+    identity: ExecutableIdentity,
+) -> Any:
+    if os.name != "nt":
+        if not identity.matches_current_file():
+            raise _runtime_identity_changed(identity.canonical_path)
+        yield
+        return
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+    )
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    invalid_handle = ctypes.c_void_p(-1).value
+    held: list[Any] = []
+    try:
+        current: ExecutableIdentity | None = identity
+        while current is not None:
+            native_handle = kernel32.CreateFileW(
+                current.canonical_path,
+                0x80000000,
+                0x00000001,
+                None,
+                3,
+                0x00000080 | 0x00200000,
+                None,
+            )
+            if native_handle in {None, invalid_handle}:
+                raise ctypes.WinError(ctypes.get_last_error())
+            handle: Any | None = None
+            try:
+                fd = msvcrt.open_osfhandle(
+                    int(native_handle), os.O_RDONLY | os.O_BINARY
+                )
+                native_handle = None
+                handle = os.fdopen(fd, "rb")
+                details = os.fstat(handle.fileno())
+                digest = hashlib.sha256()
+                for chunk in iter(
+                    lambda: handle.read(1024 * 1024), b""
+                ):
+                    digest.update(chunk)
+                observed_file_id = (
+                    int(details.st_dev),
+                    int(details.st_ino),
+                )
+                if (
+                    int(details.st_size) != current.size
+                    or int(details.st_mtime_ns) != current.mtime_ns
+                    or digest.hexdigest() != current.sha256
+                    or (
+                        current.file_id is not None
+                        and observed_file_id != current.file_id
+                    )
+                ):
+                    raise _runtime_identity_changed(
+                        current.canonical_path
+                    )
+                held.append(handle)
+                handle = None
+            finally:
+                if handle is not None:
+                    handle.close()
+                if native_handle not in {None, invalid_handle}:
+                    kernel32.CloseHandle(native_handle)
+            current = current.interpreter_identity
+        yield
+    finally:
+        for handle in reversed(held):
+            handle.close()
+
+
+def _guarded_runtime_version(
+    identity: ExecutableIdentity, *, timeout_seconds: float = 15.0
+) -> subprocess.CompletedProcess[str]:
+    deadline = time.monotonic() + timeout_seconds
+    token = _OPERATION_DEADLINE.set(deadline)
+    process: subprocess.Popen[Any] | None = None
+    try:
+        launch_nonce = uuid.uuid4().hex
+
+        def validate_started(process_to_validate: subprocess.Popen[Any]) -> None:
+            process_identity = capture_process_identity(
+                process_to_validate.pid, launch_nonce=launch_nonce
+            )
+            _validate_started_identity(
+                process_identity,
+                identity,
+                process_kind="healthcheck runtime",
+            )
+            if not identity.matches_current_file():
+                raise _runtime_identity_changed(identity.canonical_path)
+
+        with _hold_verified_runtime_files(identity):
+            process = _owned_process_popen(
+                _runtime_command(identity, ("--version",)),
+                final_identity=identity,
+                ownership_deadline=deadline,
+                started_validator=validate_started,
+                env=build_worker_env({}),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            remaining = _remaining_deadline(deadline, timeout_seconds)
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, 0)
+            stdout, stderr = process.communicate(timeout=remaining)
+            return_code = int(process.returncode or 0)
+            if not _release_owned_containment(
+                process,
+                terminate_descendants=True,
+                deadline=deadline,
+            ):
+                raise OrchestratorError(
+                    "Runtime version containment could not be released safely."
+                )
+            return subprocess.CompletedProcess(
+                process.args, return_code, stdout, stderr
+            )
+    except Exception:
+        if process is not None:
+            if process.poll() is None:
+                _terminate_and_drain_owned_process(
+                    process, deadline=deadline
+                )
+            else:
+                _release_owned_containment(
+                    process,
+                    terminate_descendants=True,
+                    deadline=deadline,
+                )
+        raise
+    finally:
+        _OPERATION_DEADLINE.reset(token)
+
+
 def healthcheck() -> dict[str, Any]:
     ccswitch_home = resolve_ccswitch_home()
     db_path = cc_db_path(ccswitch_home)
     settings_path = cc_settings_path(ccswitch_home)
     result: dict[str, Any] = {
         "ok": True,
-        "claude_bin": claude_bin_path(),
         "claude_candidates": _existing_claude_candidates(),
         "ccswitch_home": str(ccswitch_home),
         "ccswitch_db_exists": db_path.exists(),
@@ -6857,6 +8086,108 @@ def healthcheck() -> dict[str, Any]:
         "prompt_pack_exists": PROMPT_PACK_DIR.exists(),
         "prompt_pack_path": str(PROMPT_PACK_DIR),
     }
+    runtime_summary: dict[str, Any] = {
+        "policy_path": str(RUNTIME_SECURITY_POLICY_PATH),
+        "policy_exists": RUNTIME_SECURITY_POLICY_PATH.exists(),
+        "canonical_default_path": None,
+        "configured_runtime_path": None,
+        "active_runtime_path": None,
+        "trust_decision": None,
+        "version_execution_allowed": False,
+        "audit": security_audit_health(ARTIFACT_ROOT),
+        "protected_payload_store": None,
+        "process_identity": process_identity_support(),
+        "process_tree_containment": runtime_tree_containment_support(),
+    }
+    try:
+        default_candidate = discover_claude_candidate(
+            ignore_environment_override=True
+        )
+        runtime_summary["canonical_default_path"] = (
+            default_candidate.canonical_path
+        )
+    except Exception as exc:
+        runtime_summary["default_runtime_error"] = type(exc).__name__
+    candidate: RuntimeExecutableCandidate | None = None
+    runtime_identity: ExecutableIdentity | None = None
+    try:
+        runtime_policy = load_runtime_security_policy()
+        runtime_summary["configured_runtime_path"] = (
+            runtime_policy.runtime_executable
+        )
+        candidate = resolve_runtime_candidate(runtime_policy)
+        runtime_summary["active_runtime_path"] = candidate.canonical_path
+        trusted_default = candidate.trust_class == "trusted_default"
+        if trusted_default:
+            runtime_identity = ExecutableIdentity.capture(
+                candidate.canonical_path
+            )
+            decision = authorize_runtime(
+                candidate=candidate,
+                identity=runtime_identity,
+                policy=runtime_policy,
+                allow_unsafe_runtime=False,
+            )
+            if decision.trust_level != "trusted_default":
+                raise OrchestratorError(
+                    "Healthcheck runtime authorization was not trusted."
+                )
+            if not runtime_identity.matches_current_file():
+                raise _runtime_identity_changed(candidate.canonical_path)
+            runtime_summary.update(
+                {
+                    "trust_decision": decision.trust_level,
+                    "runtime_id": decision.runtime_id,
+                    "policy_decision_id": decision.policy_decision_id,
+                    "runtime_identity_sha256": runtime_identity.sha256,
+                    "version_execution_allowed": bool(
+                        runtime_summary["process_identity"].get("supported")
+                        and runtime_summary["process_tree_containment"].get(
+                            "supported"
+                        )
+                    ),
+                }
+            )
+        else:
+            runtime_summary["trust_decision"] = (
+                "local_unsafe_requires_policy_and_request_approval"
+            )
+        result["claude_bin"] = candidate.canonical_path
+    except Exception as exc:
+        runtime_summary["ok"] = False
+        runtime_summary["runtime_error"] = (
+            exc.code if isinstance(exc, RuntimeSecurityError) else type(exc).__name__
+        )
+        result["ok"] = False
+    try:
+        runtime_summary["protected_payload_store"] = (
+            get_secure_payload_store().health()
+        )
+    except Exception as exc:
+        runtime_summary["protected_payload_store"] = {
+            "ok": False,
+            "error": type(exc).__name__,
+            "recommended_action": (
+                "Restore the platform protected payload-store backend before "
+                "submitting deferred queue work."
+            ),
+        }
+    audit_health = runtime_summary["audit"]
+    if isinstance(audit_health, Mapping) and not audit_health.get("ok", False):
+        runtime_summary["ok"] = False
+        result["ok"] = False
+    runtime_summary.setdefault(
+        "ok",
+        bool(
+            runtime_summary["process_identity"].get("supported")
+            and runtime_summary["process_tree_containment"].get("supported")
+            and isinstance(runtime_summary["protected_payload_store"], Mapping)
+            and runtime_summary["protected_payload_store"].get("ok")
+        ),
+    )
+    if not runtime_summary["ok"]:
+        result["ok"] = False
+    result["runtime_security"] = runtime_summary
     try:
         profiles = list_profiles()
         result["profile_count"] = len(profiles)
@@ -6867,23 +8198,25 @@ def healthcheck() -> dict[str, Any]:
     except Exception as exc:
         result["ok"] = False
         result["profiles_error"] = str(exc)
-    try:
-        proc = subprocess.run(
-            [claude_bin_path(), "--version"],
-            env=build_worker_env({}),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=15,
-        )
-        result["claude_version_exit_code"] = proc.returncode
-        result["claude_version"] = (proc.stdout or proc.stderr).strip()
-        if proc.returncode != 0:
+    if (
+        candidate is not None
+        and runtime_identity is not None
+        and runtime_summary["version_execution_allowed"]
+    ):
+        try:
+            proc = _guarded_runtime_version(runtime_identity)
+            result["claude_version_exit_code"] = proc.returncode
+            result["claude_version"] = (proc.stdout or proc.stderr).strip()
+            if proc.returncode != 0:
+                result["ok"] = False
+        except Exception as exc:
             result["ok"] = False
-    except Exception as exc:
-        result["ok"] = False
-        result["claude_error"] = str(exc)
+            result["claude_error"] = type(exc).__name__
+    else:
+        result["claude_version_skipped"] = True
+        result["claude_version_skip_reason"] = (
+            "Only a policy-recognized trusted-default runtime may be executed by healthcheck."
+        )
     return result
 
 
@@ -6976,30 +8309,159 @@ def _endpoint_sensitive_values(value: str) -> tuple[str, ...]:
 
 
 def _sanitize_endpoint(value: str) -> str:
+    lowered = value.casefold()
+    looks_http = lowered.startswith(("http:", "https:"))
+    if not looks_http:
+        return value
+    if (
+        any(character.isspace() or ord(character) < 32 for character in value)
+        or "\\" in value
+        or re.search(r"%(?![0-9A-Fa-f]{2})", value)
+    ):
+        return SCRUBBED_VALUE
     try:
         parsed = urlsplit(value)
     except ValueError:
-        return (
-            SCRUBBED_VALUE
-            if value.casefold().startswith(("http:", "https:"))
-            else value
-        )
-    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
-        return (
-            SCRUBBED_VALUE
-            if parsed.scheme.casefold() in {"http", "https"}
-            else value
-        )
-    hostname = parsed.hostname
-    if not hostname:
         return SCRUBBED_VALUE
-    host = f"[{hostname}]" if ":" in hostname and not hostname.startswith("[") else hostname
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
+        return SCRUBBED_VALUE
     try:
+        hostname = parsed.hostname
         port = parsed.port
     except ValueError:
-        port = None
+        return SCRUBBED_VALUE
+    if not hostname:
+        return SCRUBBED_VALUE
+    try:
+        hostname.encode("ascii")
+    except UnicodeEncodeError:
+        return SCRUBBED_VALUE
+    normalized_hostname = hostname.casefold()
+    is_ip = False
+    try:
+        ipaddress.ip_address(normalized_hostname)
+        is_ip = True
+    except ValueError:
+        labels = normalized_hostname[:-1].split(".") if normalized_hostname.endswith(".") else normalized_hostname.split(".")
+        if (
+            len(normalized_hostname.rstrip(".")) > 253
+            or any(
+                not label
+                or len(label) > 63
+                or re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+                is None
+                for label in labels
+            )
+        ):
+            return SCRUBBED_VALUE
+    if port is not None and not 1 <= port <= 65535:
+        return SCRUBBED_VALUE
+    host = (
+        f"[{normalized_hostname}]"
+        if is_ip and ":" in normalized_hostname
+        else normalized_hostname
+    )
     netloc = f"{host}:{port}" if port is not None else host
+    authority = parsed.netloc.rsplit("@", 1)[-1]
+    if authority.casefold() != netloc.casefold():
+        return SCRUBBED_VALUE
     return urlunsplit((parsed.scheme.casefold(), netloc, "", "", ""))
+
+
+def project_public_endpoint(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        return SCRUBBED_VALUE
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
+        return SCRUBBED_VALUE
+    return _sanitize_endpoint(text)
+
+
+def project_public_endpoints(values: Any) -> list[str]:
+    if not isinstance(values, (list, tuple)):
+        return []
+    return [
+        projected
+        for value in values
+        if (projected := project_public_endpoint(value)) is not None
+    ]
+
+
+def project_public_endpoint_values(
+    value: Any, *, endpoint_context: bool = False
+) -> Any:
+    if isinstance(value, Mapping):
+        projected: dict[str, Any] = {}
+        for key, item in value.items():
+            name = str(key)
+            if _contains_public_uri(name):
+                continue
+            normalized = re.sub(r"[^a-z0-9]", "", name.casefold())
+            endpoint_suffix = re.search(
+                r"(?:^|[^A-Za-z0-9])(?:url|uri)$", name, re.IGNORECASE
+            ) is not None
+            is_endpoint = normalized in {"url", "uri"} or endpoint_suffix or any(
+                marker in normalized
+                for marker in ("baseurl", "endpoint", "proxyurl", "proxy")
+            )
+            projected[name] = project_public_endpoint_values(
+                item, endpoint_context=endpoint_context or is_endpoint
+            )
+        return projected
+    if isinstance(value, list):
+        return [
+            project_public_endpoint_values(
+                item, endpoint_context=endpoint_context
+            )
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return [
+            project_public_endpoint_values(
+                item, endpoint_context=endpoint_context
+            )
+            for item in value
+        ]
+    if isinstance(value, str):
+        uri_match = _first_public_uri(value)
+        if endpoint_context:
+            return project_public_endpoint(value)
+        if uri_match is not None:
+            if uri_match.span() == (0, len(value)):
+                return project_public_endpoint(value)
+            return SCRUBBED_VALUE
+        return value
+    if endpoint_context and value is not None:
+        return SCRUBBED_VALUE
+    return value
+
+
+_PUBLIC_URI_RE = re.compile(
+    r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*):(?P<body>[^\s]+)"
+)
+
+
+def _first_public_uri(value: str) -> re.Match[str] | None:
+    for match in _PUBLIC_URI_RE.finditer(value):
+        candidate = match.group(0)
+        drive, tail = ntpath.splitdrive(candidate)
+        if (
+            re.fullmatch(r"[A-Za-z]:", drive) is not None
+            and tail
+            and not tail.startswith(("//", "\\\\"))
+            and (tail.startswith(("/", "\\")) or "\\" in tail)
+        ):
+            continue
+        return match
+    return None
+
+
+def _contains_public_uri(value: str) -> bool:
+    return _first_public_uri(value) is not None
 
 
 def _collect_route_sensitive_values(value: Any) -> tuple[str, ...]:
@@ -7013,6 +8475,29 @@ def _collect_route_sensitive_values(value: Any) -> tuple[str, ...]:
     elif isinstance(value, str):
         collected.extend(_endpoint_sensitive_values(value))
     return tuple(collected)
+
+
+def _audit_sensitive_values(
+    provider_env: Mapping[str, str], safe_route_metadata: Mapping[str, Any]
+) -> tuple[str, ...]:
+    provider_secrets = tuple(
+        str(value)
+        for key, value in provider_env.items()
+        if value and should_redact_key(str(key), value)
+    )
+    provider_endpoint_secrets = tuple(
+        secret
+        for value in provider_env.values()
+        if value
+        for secret in _endpoint_sensitive_values(str(value))
+    )
+    return _normalize_sensitive_values(
+        (
+            *provider_secrets,
+            *provider_endpoint_secrets,
+            *_collect_route_sensitive_values(safe_route_metadata),
+        )
+    )
 
 
 def _prompt_sensitive_values(prompt: bytes | str) -> tuple[str, ...]:
@@ -7055,7 +8540,7 @@ def _scrub_output_text(text: str, sensitive_values: tuple[str, ...]) -> str:
         parsed = json.loads(text)
     except json.JSONDecodeError:
         return _scrub_exact_text(text, sensitive_values)
-    scrubbed = _scrub_guarded_value(parsed, sensitive_values)
+    scrubbed = _scrub_untrusted_runtime_value(parsed, sensitive_values)
     ending = "\n" if text.endswith(("\n", "\r")) else ""
     return json.dumps(scrubbed, ensure_ascii=False) + ending
 
@@ -7068,6 +8553,32 @@ def _scrub_guarded_value(value: Any, sensitive_values: tuple[str, ...]) -> Any:
         }
     if isinstance(value, (list, tuple)):
         return [_scrub_guarded_value(item, sensitive_values) for item in value]
+    if isinstance(value, str):
+        return _scrub_exact_text(value, sensitive_values)
+    return value
+
+
+def _scrub_untrusted_runtime_value(
+    value: Any, sensitive_values: tuple[str, ...]
+) -> Any:
+    if isinstance(value, Mapping):
+        scrubbed: dict[str, Any] = {}
+        for key, item in value.items():
+            base_key = _scrub_exact_text(str(key), sensitive_values)
+            safe_key = base_key
+            suffix = 2
+            while safe_key in scrubbed:
+                safe_key = f"{base_key}#{suffix}"
+                suffix += 1
+            scrubbed[safe_key] = _scrub_untrusted_runtime_value(
+                item, sensitive_values
+            )
+        return scrubbed
+    if isinstance(value, (list, tuple)):
+        return [
+            _scrub_untrusted_runtime_value(item, sensitive_values)
+            for item in value
+        ]
     if isinstance(value, str):
         return _scrub_exact_text(value, sensitive_values)
     return value
@@ -7120,6 +8631,7 @@ class PreparedWorkerLaunch:
     selected_model: str | None = None
     skip_cost_guard: bool = False
     sensitive_values: tuple[str, ...] = ()
+    audit_secret_values: tuple[str, ...] = ()
     admission_reservation: _LaunchAdmissionReservation | None = None
     _preflight_git_before: dict[str, Any] | None = field(
         default=None, init=False, repr=False, compare=False
@@ -7175,6 +8687,11 @@ class PreparedWorkerLaunch:
             self,
             "sensitive_values",
             _normalize_sensitive_values(self.sensitive_values),
+        )
+        object.__setattr__(
+            self,
+            "audit_secret_values",
+            _normalize_sensitive_values(self.audit_secret_values),
         )
 
     def metadata(self) -> dict[str, Any]:
@@ -7281,23 +8798,13 @@ def _prepare_worker_launch_inner(
     frame = launch_spec.private_frame()
     if len(frame) > PRIVATE_LAUNCH_FRAME_LIMIT:
         raise OrchestratorError("Private launch frame exceeds the 64 KiB limit.")
-    provider_secrets = tuple(
-        str(value)
-        for key, value in provider_env.items()
-        if value and should_redact_key(str(key), value)
-    )
-    provider_endpoint_secrets = tuple(
-        secret
-        for value in provider_env.values()
-        if value
-        for secret in _endpoint_sensitive_values(str(value))
+    audit_secret_values = _audit_sensitive_values(
+        provider_env, safe_route_metadata
     )
     exact_values = _normalize_sensitive_values(
         (
             *_prompt_sensitive_values(prompt_bytes),
-            *provider_secrets,
-            *provider_endpoint_secrets,
-            *_collect_route_sensitive_values(safe_route_metadata),
+            *audit_secret_values,
             *sensitive_values,
         )
     )
@@ -7333,6 +8840,7 @@ def _prepare_worker_launch_inner(
         selected_model=selected_model,
         skip_cost_guard=skip_cost_guard,
         sensitive_values=exact_values,
+        audit_secret_values=audit_secret_values,
         admission_reservation=admission_reservation,
     )
 
@@ -7380,25 +8888,37 @@ def prepare_worker_launch(
         )
     token = _OPERATION_DEADLINE.set(float(deadline))
     try:
-        return _prepare_worker_launch_inner(
-            mode=mode,
-            prompt=prompt,
-            provider_env=provider_env,
-            model_override=model_override,
-            cwd=cwd,
-            workspace_root=workspace_root,
-            artifact_root=artifact_root,
-            permission_mode=permission_mode,
-            timeout_seconds=timeout_seconds,
-            arguments=arguments,
-            safe_route_metadata=safe_route_metadata,
-            expected_child_launches=expected_child_launches,
-            allow_unsafe_runtime=allow_unsafe_runtime,
-            selected_model=selected_model,
-            skip_cost_guard=skip_cost_guard,
-            sensitive_values=sensitive_values,
-            admission_reservation=admission_reservation,
-        )
+        try:
+            return _prepare_worker_launch_inner(
+                mode=mode,
+                prompt=prompt,
+                provider_env=provider_env,
+                model_override=model_override,
+                cwd=cwd,
+                workspace_root=workspace_root,
+                artifact_root=artifact_root,
+                permission_mode=permission_mode,
+                timeout_seconds=timeout_seconds,
+                arguments=arguments,
+                safe_route_metadata=safe_route_metadata,
+                expected_child_launches=expected_child_launches,
+                allow_unsafe_runtime=allow_unsafe_runtime,
+                selected_model=selected_model,
+                skip_cost_guard=skip_cost_guard,
+                sensitive_values=sensitive_values,
+                admission_reservation=admission_reservation,
+            )
+        except RuntimeSecurityError as error:
+            try:
+                _audit_prepared_launch_rejection(
+                    error,
+                    artifact_root=artifact_root,
+                    provider_env=provider_env,
+                    safe_route_metadata=safe_route_metadata,
+                )
+            except Exception:
+                pass
+            raise
     finally:
         _OPERATION_DEADLINE.reset(token)
 
@@ -7452,6 +8972,146 @@ def _security_error(
         safe_details=dict(safe_details or {}),
         suggested_action=suggested_action,
     )
+
+
+def _security_audit_profile_id(metadata: Mapping[str, Any]) -> str | None:
+    profile = metadata.get("profile")
+    if isinstance(profile, Mapping):
+        value = profile.get("id")
+        return str(value) if value else None
+    return None
+
+
+def _append_policy_security_audit(
+    *,
+    artifact_root: str | Path,
+    code: str,
+    run_id: str | None,
+    runtime_id: str | None,
+    trust_level: str | None,
+    provider_id: str | None,
+    policy_decision_id: str | None,
+    safe_details: Mapping[str, Any],
+    known_secrets: tuple[str, ...] = (),
+    dedupe_key: str | None = None,
+) -> Path | None:
+    policy = SECURITY_AUDIT_POLICY.get(code)
+    if policy is None:
+        return None
+    return append_security_event(
+        artifact_root=artifact_root,
+        code=code,
+        severity=policy["severity"],
+        run_id=run_id,
+        runtime_id=runtime_id,
+        trust_level=trust_level,
+        provider_id=provider_id,
+        policy_decision_id=policy_decision_id,
+        safe_details=safe_details,
+        recommended_action=policy["recommended_action"],
+        known_secrets=known_secrets,
+        dedupe_key=dedupe_key,
+    )
+
+
+def _audit_prepared_launch_rejection(
+    error: RuntimeSecurityError,
+    *,
+    artifact_root: str | Path,
+    provider_env: Mapping[str, str],
+    safe_route_metadata: Mapping[str, Any],
+) -> None:
+    known = _audit_sensitive_values(
+        provider_env, safe_route_metadata
+    )
+    _append_policy_security_audit(
+        artifact_root=artifact_root,
+        code=error.code,
+        run_id=None,
+        runtime_id=None,
+        trust_level=None,
+        provider_id=_security_audit_profile_id(safe_route_metadata),
+        policy_decision_id=None,
+        safe_details=error.safe_details,
+        known_secrets=known,
+    )
+
+
+def _audit_runtime_authorization(prepared: PreparedWorkerLaunch) -> bool:
+    spec = prepared.launch_spec
+    metadata = prepared.metadata()
+    local_unsafe = spec.trust_level == "local_unsafe"
+    code = (
+        "unsafe_runtime_authorized"
+        if local_unsafe
+        else "trusted_runtime_authorized"
+    )
+    try:
+        _append_policy_security_audit(
+            artifact_root=str(metadata["artifact_root"]),
+            code=code,
+            run_id=str(metadata["run_id"]),
+            runtime_id=spec.runtime_id,
+            trust_level=spec.trust_level,
+            provider_id=_security_audit_profile_id(metadata),
+            policy_decision_id=spec.policy_decision_id,
+            safe_details={
+                "canonical_path": spec.executable_identity.canonical_path,
+                "environment_keys": [key for key, _value in spec.environment_items],
+            },
+            known_secrets=prepared.audit_secret_values,
+        )
+        return False
+    except Exception as exc:
+        if local_unsafe:
+            raise _security_error(
+                "security_audit_unavailable",
+                "The unsafe runtime was not started because its security audit could not be recorded.",
+                safe_details={"audit_component": type(exc).__name__},
+                suggested_action=(
+                    "Repair the private security audit files before retrying."
+                ),
+            ) from exc
+        return True
+
+
+def _audit_run_security_error(
+    run_dir: Path,
+    metadata: Mapping[str, Any],
+    error: RuntimeSecurityError,
+    sensitive_values: tuple[str, ...],
+    *,
+    dedupe_key: str | None = None,
+) -> bool:
+    runtime_launch = metadata.get("runtime_launch")
+    launch = runtime_launch if isinstance(runtime_launch, Mapping) else {}
+    audit_deadline = time.monotonic() + 0.2
+    effective = _effective_deadline()
+    if effective is not None:
+        audit_deadline = min(audit_deadline, effective)
+    token = _OPERATION_DEADLINE.set(audit_deadline)
+    try:
+        _append_policy_security_audit(
+            artifact_root=str(metadata.get("artifact_root") or run_dir.parent.parent),
+            code=error.code,
+            run_id=str(metadata.get("run_id") or run_dir.name),
+            runtime_id=(str(launch.get("runtime_id")) if launch.get("runtime_id") else None),
+            trust_level=(str(launch.get("trust_level")) if launch.get("trust_level") else None),
+            provider_id=_security_audit_profile_id(metadata),
+            policy_decision_id=(
+                str(launch.get("policy_decision_id"))
+                if launch.get("policy_decision_id")
+                else None
+            ),
+            safe_details=error.safe_details,
+            known_secrets=sensitive_values,
+            dedupe_key=dedupe_key,
+        )
+        return False
+    except Exception:
+        return True
+    finally:
+        _OPERATION_DEADLINE.reset(token)
 
 
 def _runtime_identity_changed(path: str) -> RuntimeSecurityError:
@@ -7851,8 +9511,47 @@ def _record_blocked_launch(
         effective_deadline is not None
         and time.monotonic() >= effective_deadline
     )
+    needs_terminal_scope = (
+        status == "timed_out"
+        or deadline_expired
+        or _has_timeout_evidence(metadata, updates)
+    )
+    scope = (
+        _terminal_artifact_scope(BLOCKED_TERMINALIZATION_TIMEOUT_SECONDS)
+        if needs_terminal_scope
+        else contextlib.nullcontext()
+    )
+    with scope:
+        return _record_blocked_launch_inner(
+            run_dir,
+            metadata,
+            status=status,
+            error=error,
+            sensitive_values=sensitive_values,
+            effective_deadline=effective_deadline,
+            deadline_expired=deadline_expired,
+            **updates,
+        )
+
+
+def _record_blocked_launch_inner(
+    run_dir: Path,
+    metadata: Mapping[str, Any],
+    *,
+    status: str,
+    error: RuntimeSecurityError,
+    sensitive_values: tuple[str, ...],
+    effective_deadline: float | None,
+    deadline_expired: bool,
+    **updates: Any,
+) -> dict[str, Any]:
+    audit_degraded = _audit_run_security_error(
+        run_dir, metadata, error, sensitive_values
+    )
     proposed = _scrub_guarded_value(dict(metadata), sensitive_values)
     proposed.update(_scrub_guarded_value(updates, sensitive_values))
+    if audit_degraded:
+        proposed["audit_degraded"] = True
     timeout_primary = (
         status == "timed_out"
         or deadline_expired
@@ -7888,6 +9587,8 @@ def _record_blocked_launch(
             blocked = _scrub_guarded_value(dict(metadata), sensitive_values)
             blocked.update(_scrub_guarded_value(current, sensitive_values))
             blocked.update(_scrub_guarded_value(updates, sensitive_values))
+            if audit_degraded:
+                blocked["audit_degraded"] = True
             blocked_timeout = (
                 status == "timed_out"
                 or deadline_expired
@@ -8773,6 +10474,7 @@ def _owned_process_popen(
     *,
     final_identity: ExecutableIdentity | None = None,
     ownership_deadline: float | None = None,
+    started_validator: Any | None = None,
     **kwargs: Any,
 ) -> subprocess.Popen[Any]:
     """Create a process inside containment, with identity validation adjacent."""
@@ -8818,6 +10520,10 @@ def _owned_process_popen(
             _close_windows_handle(job)
         raise _runtime_identity_changed(final_identity.canonical_path)
     try:
+        _check_deadline(
+            launch_deadline,
+            "Owned process creation exceeded the launch deadline.",
+        )
         process = subprocess.Popen(command, **kwargs)
         generation = uuid.uuid4().hex
         if os.name == "nt":
@@ -8835,6 +10541,12 @@ def _owned_process_popen(
             )
             _publish_owned_process_record(record)
             job = None
+            if started_validator is not None:
+                started_validator(process)
+            _check_deadline(
+                launch_deadline,
+                "Owned process creation exceeded the launch deadline.",
+            )
             _resume_windows_process(process)
         else:
             record = _OwnedProcessTree(
@@ -8846,6 +10558,12 @@ def _owned_process_popen(
                 owner_token=f"caller:{generation}",
             )
             _publish_owned_process_record(record)
+            _check_deadline(
+                launch_deadline,
+                "Owned process creation exceeded the launch deadline.",
+            )
+            if started_validator is not None:
+                started_validator(process)
         return process
     except Exception as launch_error:
         if process is not None:
@@ -9938,6 +11656,7 @@ def _complete_isolated_worker_cleanup(
         pending_state = {
             "status": "cleanup_pending",
             "cleanup_state": "owned_worker_cleanup",
+            "child_pid": process.pid,
             "owned_process_pid": process.pid,
             "live_cleanup_threads": live_names,
             "terminal_state_count": 0,
@@ -10166,9 +11885,17 @@ def _spawn_detached_internal_worker(
         raise OrchestratorError(
             "The detached internal worker command is not approved."
         )
+    _check_deadline(
+        ownership_deadline,
+        "Internal worker creation exceeded the launch deadline.",
+    )
     worker = subprocess.Popen(command, **kwargs)
     try:
         _ensure_owned_process_record(worker, deadline=ownership_deadline)
+        _check_deadline(
+            ownership_deadline,
+            "Internal worker creation exceeded the launch deadline.",
+        )
     except Exception:
         try:
             worker.terminate()
@@ -10330,6 +12057,9 @@ def _initialize_prepared_run(
     run_dir = artifact_root / "runs" / run_id
     if run_dir.exists():
         raise FileExistsError(run_dir)
+    _prepare_security_audit_directories(
+        _security_audit_paths(artifact_root)
+    )
     _set_private_directory(run_dir)
     metadata.update(
         {
@@ -11063,6 +12793,22 @@ def _start_prepared_worker_launch_inner(
                 "artifact_write_failed", "Run artifacts could not be initialized atomically."
             ),
         )
+    try:
+        audit_degraded = _audit_runtime_authorization(prepared)
+    except RuntimeSecurityError as error:
+        return _record_blocked_launch(
+            run_dir,
+            metadata,
+            sensitive_values=prepared.sensitive_values,
+            status="blocked_runtime_launch",
+            error=error,
+        )
+    if audit_degraded:
+        metadata["audit_degraded"] = True
+        try:
+            metadata = update_metadata(run_dir, audit_degraded=True)
+        except Exception:
+            pass
     containment = runtime_tree_containment_support()
     if not containment["supported"]:
         return _record_blocked_launch(
@@ -11207,7 +12953,7 @@ def run_agent(
                 "name": provider.name,
                 "model": selected_model,
                 "provider_default_model": provider.model,
-                "endpoints": provider.endpoints,
+                "endpoints": project_public_endpoints(provider.endpoints),
             },
             "permission_mode": permission_mode,
             "allow_write": write_enabled,
@@ -11805,7 +13551,7 @@ def _prepare_streaming_agent(
                 "name": provider.name,
                 "model": selected_model,
                 "provider_default_model": provider.model,
-                "endpoints": provider.endpoints,
+                "endpoints": project_public_endpoints(provider.endpoints),
             },
             "route": {
                 "profile": provider.name,
@@ -13387,7 +15133,7 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
                     if source == "stdout":
                         try:
                             raw_payload = json.loads(line)
-                            parsed_payload: Any = _scrub_guarded_value(
+                            parsed_payload: Any = _scrub_untrusted_runtime_value(
                                 raw_payload, sensitive_values
                             )
                             safe_line = json.dumps(
@@ -14286,6 +16032,123 @@ def _process_identity_observation(
     }
 
 
+def _audit_status_identity_observations(
+    run_dir: Path,
+    metadata: Mapping[str, Any],
+    observations: tuple[tuple[str, Mapping[str, Any]], ...],
+) -> dict[str, Any]:
+    allowed_markers = {
+        f"{process_kind}:{state}"
+        for process_kind in ("runtime_child", "internal_worker")
+        for state in ("mismatch", "unverified")
+    }
+    candidates: dict[str, tuple[str, Mapping[str, Any]]] = {}
+    for process_kind, observation in observations:
+        state = str(observation.get("state") or "")
+        if state not in {"mismatch", "unverified"}:
+            continue
+        marker = f"{process_kind}:{state}"
+        candidates[marker] = (process_kind, observation)
+    if not candidates and not metadata.get("identity_audit_pending"):
+        return dict(metadata)
+    try:
+        with artifact_lock(run_dir):
+            current = _read_metadata_unlocked(run_dir)
+            markers = {
+                str(item)
+                for item in current.get("identity_audit_markers", [])
+                if isinstance(item, str)
+            }
+            pending = {
+                str(item)
+                for item in current.get("identity_audit_pending", [])
+                if isinstance(item, str) and item in allowed_markers
+            }
+            pending.difference_update(markers)
+            claimed = sorted((set(candidates) | pending) - markers)
+            if claimed or current.get("identity_audit_pending") != sorted(pending):
+                current["identity_audit_pending"] = sorted(
+                    pending | set(claimed)
+                )
+                _atomic_write_bytes(
+                    run_dir / "metadata.json", _metadata_bytes(current)
+                )
+    except Exception:
+        failed = dict(metadata)
+        failed["audit_degraded"] = True
+        return failed
+    if not claimed:
+        return current
+    degraded = bool(current.get("audit_degraded", False))
+    failed_claims: set[str] = set()
+    for marker in claimed:
+        process_kind, state = marker.rsplit(":", 1)
+        observation = candidates.get(marker, (process_kind, {}))[1]
+        code = (
+            "process_identity_mismatch"
+            if state == "mismatch"
+            else "process_identity_unverified"
+        )
+        error = _security_error(
+            code,
+            (
+                "A live process no longer matches its recorded identity."
+                if state == "mismatch"
+                else "A live process identity could not be verified."
+            ),
+            safe_details={
+                "process_kind": process_kind,
+                "differing_fields": list(
+                    observation.get("differing_fields") or []
+                ),
+            },
+            suggested_action=SECURITY_AUDIT_POLICY[code][
+                "recommended_action"
+            ],
+        )
+        audit_failed = _audit_run_security_error(
+            run_dir,
+            current,
+            error,
+            (),
+            dedupe_key=(
+                f"status-identity:{run_dir.name}:{marker}"
+            ),
+        )
+        if audit_failed:
+            failed_claims.add(marker)
+            degraded = True
+    try:
+        with artifact_lock(run_dir):
+            latest = _read_metadata_unlocked(run_dir)
+            markers = {
+                str(item)
+                for item in latest.get("identity_audit_markers", [])
+                if isinstance(item, str)
+            }
+            pending = {
+                str(item)
+                for item in latest.get("identity_audit_pending", [])
+                if isinstance(item, str)
+            }
+            completed_claims = set(claimed) - failed_claims
+            markers.update(completed_claims)
+            pending.difference_update(completed_claims)
+            pending.update(failed_claims)
+            pending.difference_update(markers)
+            latest["identity_audit_markers"] = sorted(markers)
+            latest["identity_audit_pending"] = sorted(pending)
+            if degraded:
+                latest["audit_degraded"] = True
+            _atomic_write_bytes(
+                run_dir / "metadata.json", _metadata_bytes(latest)
+            )
+            return latest
+    except Exception:
+        current["audit_degraded"] = True
+        return current
+
+
 def single_run_status(run_id: str, include_output_tail: bool = True, tail_chars: int = 4000) -> dict[str, Any]:
     run_dir = safe_run_dir(run_id)
     metadata = read_metadata(run_dir)
@@ -14302,6 +16165,14 @@ def single_run_status(run_id: str, include_output_tail: bool = True, tail_chars:
         metadata,
         pid_field="worker_pid",
         identity_field="worker_process_identity",
+    )
+    metadata = _audit_status_identity_observations(
+        run_dir,
+        metadata,
+        (
+            ("runtime_child", child_identity),
+            ("internal_worker", worker_identity),
+        ),
     )
     child_alive = bool(child_identity["alive"])
     worker_alive = bool(worker_identity["alive"])
@@ -14389,6 +16260,11 @@ def single_run_status(run_id: str, include_output_tail: bool = True, tail_chars:
         "persistence_state": metadata.get("persistence_state"),
         "finalization_state": metadata.get("finalization_state"),
         "finalization_error": metadata.get("finalization_error"),
+        "audit_degraded": bool(metadata.get("audit_degraded", False)),
+        "security_error": metadata.get("security_error"),
+        "identity_audit_pending": list(
+            metadata.get("identity_audit_pending") or []
+        ),
         "started_at": started_at,
         "finished_at": finished_at,
         "elapsed_ms": elapsed_ms,
@@ -14547,7 +16423,16 @@ def _stop_identity_failure(
             "Do not retry termination by PID; inspect the run and clean up the owned process manually."
         ),
     )
-    return {
+    audit_degraded = False
+    try:
+        run_dir = safe_run_dir(run_id)
+        metadata = read_metadata(run_dir)
+        audit_degraded = _audit_run_security_error(
+            run_dir, metadata, error, ()
+        )
+    except Exception:
+        audit_degraded = True
+    response = {
         "ok": False,
         "run_id": run_id,
         "previous_status": status.get("status"),
@@ -14560,6 +16445,9 @@ def _stop_identity_failure(
         "next_step": error.suggested_action,
         "stop_results": [],
     }
+    if audit_degraded:
+        response["audit_degraded"] = True
+    return response
 
 
 def _valid_stop_request(run_dir: Path, metadata: Mapping[str, Any]) -> bool:
@@ -15001,7 +16889,7 @@ def _wait_for_team_members_ready(
         if not pending and len(ready) == len(runs):
             return ready
         if time.monotonic() >= deadline:
-            raise OrchestratorError(
+            raise TimeoutError(
                 "Team members did not reach the shared readiness barrier in time."
             )
         time.sleep(min(0.01, _remaining_deadline(deadline, 0.01)))
@@ -15066,69 +16954,129 @@ def spawn_role_team(
         manifest_path: Path | None = None
         authorization_attempted = False
 
-        def rollback_registered_workers() -> dict[str, Any]:
-            stops: list[dict[str, Any]] = []
+        def rollback_registered_workers(*, deadline: float) -> dict[str, Any]:
+            worker_states: list[dict[str, Any]] = []
+            owned_workers: list[tuple[dict[str, Any], subprocess.Popen[Any]]] = []
             for item in runs:
                 run_id = str(item["run_id"])
                 with _ACTIVE_WORKER_HANDLES_LOCK:
                     worker = _ACTIVE_WORKER_HANDLES.get(run_id)
+                worker_pid: int | None
                 if worker is None:
                     try:
-                        member = read_metadata(safe_run_dir(run_id))
+                        member = read_metadata(
+                            safe_run_dir(run_id), deadline=deadline
+                        )
                         worker_pid = member.get("worker_pid")
                     except Exception:
                         worker_pid = None
-                    already_stopped = (
+                    stopped = (
                         isinstance(worker_pid, int)
                         and not pid_alive(worker_pid)
                     )
-                    lock_reclaimed = (
-                        _reclaim_artifact_lock_for_dead_process(
-                            safe_run_dir(run_id),
-                            worker_pid,
-                            deadline=team_deadline,
-                        )
-                        if already_stopped
-                        else False
+                    error = (
+                        None if stopped else "owned worker handle unavailable"
                     )
-                    stops.append(
-                        {
-                            "ok": already_stopped and lock_reclaimed,
-                            "run_id": run_id,
-                            "stopped": already_stopped,
-                            "lock_reclaimed": lock_reclaimed,
-                            **(
-                                {}
-                                if already_stopped
-                                else {"error": "owned worker handle unavailable"}
-                            ),
-                        }
-                    )
-                    continue
+                else:
+                    worker_pid = worker.pid
+                    stopped = False
+                    error = None
+                state = {
+                    "run_id": run_id,
+                    "worker_pid": worker_pid,
+                    "stopped": stopped,
+                    **({} if error is None else {"error": error}),
+                }
+                worker_states.append(state)
+                if worker is not None:
+                    owned_workers.append((state, worker))
+
+            def terminate_member(
+                state: dict[str, Any], worker: subprocess.Popen[Any]
+            ) -> None:
                 try:
-                    _terminate_owned_process(worker, deadline=team_deadline)
-                    stopped = worker.poll() is not None
-                    lock_reclaimed = (
-                        _reclaim_artifact_lock_for_dead_process(
-                            safe_run_dir(run_id),
-                            worker.pid,
-                            deadline=team_deadline,
-                        )
-                        if stopped
-                        else False
+                    cleanup_complete = _terminate_owned_process(
+                        worker, deadline=deadline
                     )
-                    stops.append(
-                        {
-                            "ok": stopped and lock_reclaimed,
-                            "run_id": run_id,
-                            "stopped": stopped,
-                            "lock_reclaimed": lock_reclaimed,
-                        }
-                    )
+                    root_stopped = worker.poll() is not None
+                    stopped = cleanup_complete is True and root_stopped
+                    state["stopped"] = stopped
+                    if stopped:
+                        state.pop("error", None)
+                    elif root_stopped:
+                        state["error"] = "worker tree cleanup incomplete"
+                    else:
+                        state["error"] = "worker did not stop"
                 except Exception as stop_exc:
-                    stops.append(
-                        {"ok": False, "run_id": run_id, "error": str(stop_exc)}
+                    state["stopped"] = False
+                    state["error"] = str(stop_exc)
+
+            # Every worker owns an absolute durable cleanup deadline. Start
+            # all terminations together so one slow member cannot consume the
+            # grace period before another member begins cleanup.
+            termination_threads = [
+                threading.Thread(
+                    target=terminate_member,
+                    args=(state, worker),
+                    name=f"cc-team-rollback-{state['run_id']}",
+                )
+                for state, worker in owned_workers
+            ]
+            for thread in termination_threads:
+                thread.start()
+            for thread in termination_threads:
+                thread.join()
+
+            owner_names = {
+                f"cc-worker-reaper-{state['run_id']}"
+                for state in worker_states
+            }
+            cleanup_owners_quiescent = False
+            while time.monotonic() < deadline:
+                with _ACTIVE_CLEANUP_OWNERS_LOCK:
+                    cleanup_owners = [
+                        owner
+                        for name, owner in _ACTIVE_CLEANUP_OWNERS.items()
+                        if name in owner_names
+                    ]
+                if not cleanup_owners:
+                    cleanup_owners_quiescent = True
+                    break
+                remaining = max(0.0, deadline - time.monotonic())
+                for owner in cleanup_owners:
+                    owner.join(timeout=min(0.025, remaining))
+
+            # Team workers read one another's metadata while waiting at the
+            # start barrier, and controller cleanup owners may finalize a run
+            # just after its worker exits. Establish a team-wide quiescent
+            # point before reclaiming any lock, then permit locks owned by any
+            # confirmed dead member to be removed from every member run.
+            dead_worker_pids = {
+                int(state["worker_pid"])
+                for state in worker_states
+                if state.get("stopped")
+                and isinstance(state.get("worker_pid"), int)
+            }
+            stops: list[dict[str, Any]] = []
+            for state in worker_states:
+                lock_reclaimed = False
+                if state.get("stopped") and cleanup_owners_quiescent:
+                    lock_reclaimed = _reclaim_artifact_lock_for_dead_processes(
+                        safe_run_dir(str(state["run_id"])),
+                        dead_worker_pids,
+                        deadline=deadline,
                     )
+                elif state.get("stopped"):
+                    state["error"] = (
+                        "controller cleanup owner did not quiesce"
+                    )
+                stops.append(
+                    {
+                        **state,
+                        "ok": bool(state.get("stopped")) and lock_reclaimed,
+                        "lock_reclaimed": lock_reclaimed,
+                    }
+                )
             failed = sum(1 for item in stops if not item.get("ok"))
             return {
                 "attempted": True,
@@ -15235,15 +17183,21 @@ def spawn_role_team(
             write_team_manifest(team_id, authorized_manifest)
             return response
         except Exception as exc:
-            rollback = rollback_registered_workers()
             security_fields = _security_response_fields(exc)
+            closure_seconds = max(
+                WORKER_FINALIZATION_GRACE_SECONDS,
+                len(runs) * WORKER_FINALIZATION_GRACE_SECONDS,
+            )
+            cleanup_deadline = time.monotonic() + closure_seconds
             decision_visible = False
             decision_payload: dict[str, Any] = {}
             candidate_manifest = manifest_path or (TEAMS_DIR / f"{team_id}.json")
             try:
                 decision_payload = json.loads(
                     _read_bounded_regular_file(
-                        candidate_manifest, MAX_MANAGED_ARTIFACT_BYTES
+                        candidate_manifest,
+                        MAX_MANAGED_ARTIFACT_BYTES,
+                        deadline=cleanup_deadline,
                     ).decode("utf-8")
                 )
                 decision_visible = str(
@@ -15253,8 +17207,34 @@ def spawn_role_team(
                 ).upper() in {"COMMIT", "COMMITTED", "AUTHORIZED"}
             except Exception:
                 decision_visible = False
+            timed_out = isinstance(exc, TimeoutError) or (
+                time.monotonic() >= team_deadline
+            )
+            if decision_visible:
+                rollback = {"attempted": False, "force": False, "stops": []}
+            else:
+                rollback = rollback_registered_workers(
+                    deadline=cleanup_deadline
+                )
             if decision_visible:
                 status_name = "commit_indeterminate"
+            elif timed_out:
+                status_name = "timed_out"
+                security_fields = {
+                    "timed_out": True,
+                    "stop_reason": "timeout",
+                    "exit_code": 124,
+                    "security_error": {
+                        "code": "launch_deadline_exceeded",
+                        "message": (
+                            "Runtime preparation exceeded the launch deadline."
+                        ),
+                        "safe_details": {},
+                        "suggested_action": (
+                            "Retry with a longer explicitly approved timeout."
+                        ),
+                    },
+                }
             elif authorization_attempted:
                 status_name = "aborted"
             else:
@@ -15280,7 +17260,10 @@ def spawn_role_team(
             if decision_visible:
                 path = candidate_manifest
             else:
-                path = write_team_manifest(team_id, manifest)
+                with _terminal_artifact_scope(
+                    max(0.001, cleanup_deadline - time.monotonic())
+                ):
+                    path = write_team_manifest(team_id, manifest)
             return {
                 "ok": False,
                 "status": status_name,
@@ -16355,9 +18338,33 @@ def _legacy_dashboard(include_finished: bool = True, limit: int = 12, open_brows
     return {"ok": True, "path": str(path), "run_count": data.get("count", 0), "opened": open_browser}
 
 
+def _identity_risk_observed(item: Mapping[str, Any]) -> bool:
+    security_error = item.get("security_error")
+    security_code = (
+        str(security_error.get("code") or "")
+        if isinstance(security_error, Mapping)
+        else ""
+    )
+    return (
+        security_code
+        in {"process_identity_mismatch", "process_identity_unverified"}
+        or str(item.get("status") or "")
+        in {"identity_mismatch", "identity_unverified"}
+        or str(item.get("worker_identity_state") or "")
+        in {"mismatch", "unverified"}
+        or str(item.get("child_identity_state") or "")
+        in {"mismatch", "unverified"}
+    )
+
+
 def dashboard(include_finished: bool = True, limit: int = 12, open_browser: bool = False) -> dict[str, Any]:
     DASHBOARD_DIR.mkdir(parents=True, exist_ok=True)
     data = run_status(include_finished=include_finished, include_output_tail=True, tail_chars=1000, limit=limit)
+    audit = security_audit_health(ARTIFACT_ROOT)
+    identity_unverified_count = 0
+    for item in data.get("runs", []):
+        if _identity_risk_observed(item):
+            identity_unverified_count += 1
     route_cards: list[str] = []
     for role in ("development", "review", "security", "supervisor", "multimodal"):
         try:
@@ -16455,7 +18462,8 @@ def dashboard(include_finished: bool = True, limit: int = 12, open_browser: bool
             "<!doctype html><html><head><meta charset='utf-8'><title>Claude Code Workers</title>",
             "<style>body{font-family:system-ui;background:#0d1117;color:#e6edf3;margin:0}header{padding:16px 20px;border-bottom:1px solid #30363d;background:#161b22}.routes,.filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-top:12px}.route,.filter{border:1px solid #30363d;border-radius:8px;padding:10px;background:#0d1117}.route b,.route span,.route small{display:block}.route span{color:#7ee787}.route small,.filter label{color:#8b949e;margin-top:4px}.filter select,.filter input{width:100%;box-sizing:border-box;background:#010409;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:8px;margin-top:6px}.grid{display:grid;grid-template-columns:300px minmax(360px,1fr) 420px;gap:16px;padding:16px}.panel,.worker{border:1px solid #30363d;border-radius:8px;background:#161b22}.panel{padding:14px;margin-bottom:12px}.worker{width:100%;text-align:left;color:#e6edf3;padding:12px;margin-bottom:10px;display:block}.worker[hidden]{display:none}.worker span{display:flex;justify-content:space-between;gap:8px}.worker small{display:block;color:#8b949e;margin-top:6px}code{color:#7ee787;overflow-wrap:anywhere}ol,ul{padding-left:22px}li{margin:8px 0;line-height:1.35}p{color:#c9d1d9}h3{margin-bottom:4px}@media(max-width:980px){.grid{grid-template-columns:1fr}}</style>",
             "</head><body><header><h1>Claude Code Worker Dashboard</h1>",
-            f"<p>Generated at {utc_now_iso()} / Runs {data.get('count', 0)} / Active {data.get('active_count', 0)}</p>",
+            f"<p>Generated at {utc_now_iso()} / Runs {data.get('count', 0)} / Active {data.get('active_count', 0)} / Identity unverified {identity_unverified_count}</p>",
+            f"<p>Security audit {'healthy' if audit.get('ok') else 'degraded'} / Events {audit.get('event_count', 0)} / Codes {html_lib.escape(json.dumps(audit.get('counts_by_code') or {}, sort_keys=True))}</p>",
             "<h2>Model Routing</h2><div class='routes'>",
             "".join(route_cards),
             "</div><h2>Filters</h2><div class='filters'><div class='filter'><label>Role<input id='roleFilter' placeholder='security'></label></div><div class='filter'><label>Status<input id='statusFilter' placeholder='running'></label></div><div class='filter'><label>Risk<select id='riskFilter'><option value=''>all</option><option>critical</option><option>high</option><option>medium</option><option>low</option><option>none</option></select></label></div><div class='filter'><label>Active<select id='activeFilter'><option value=''>all</option><option>active</option><option>inactive</option></select></label></div></div></header>",
@@ -16476,7 +18484,14 @@ def dashboard(include_finished: bool = True, limit: int = 12, open_browser: bool
             subprocess.Popen(["cmd", "/c", "start", "", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             subprocess.Popen(["xdg-open", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return {"ok": True, "path": str(path), "run_count": data.get("count", 0), "opened": open_browser}
+    return {
+        "ok": True,
+        "path": str(path),
+        "run_count": data.get("count", 0),
+        "opened": open_browser,
+        "security_audit": audit,
+        "identity_unverified_run_count": identity_unverified_count,
+    }
 
 
 def open_run_folder(run_id: str, open_folder: bool = True) -> dict[str, Any]:
@@ -16559,6 +18574,8 @@ def controller_report(
     max_severity = "none"
     blocking_runs = 0
     secret_summary: dict[str, int] = {}
+    identity_unverified_runs = 0
+    audit = security_audit_health(ARTIFACT_ROOT)
     for rid in run_ids:
         try:
             status = single_run_status(rid, include_output_tail=False)
@@ -16582,6 +18599,8 @@ def controller_report(
             secret_summary[str(key)] = secret_summary.get(str(key), 0) + int(count)
         budget = status.get("output_budget") or {}
         actual_route = status.get("actual_route") or {}
+        if _identity_risk_observed(status):
+            identity_unverified_runs += 1
         run_rows.append(
             {
                 "run_id": rid,
@@ -16606,6 +18625,7 @@ def controller_report(
                 "source_change_count": source.get("changed_count", 0),
                 "artifact_change_count": artifacts.get("changed_count", 0),
                 "route_drift": status.get("route_drift"),
+                "security_error_code": security_code or None,
                 "secret_scan": {
                     "finding_count": scan.get("finding_count"),
                     "blocking_count": scan.get("blocking_count"),
@@ -16635,6 +18655,11 @@ def controller_report(
         f"- Active now: `{run_status(include_finished=False).get('active_count', 0)}`",
         f"- Max risk severity: `{max_severity}`",
         f"- Blocking risk runs: `{blocking_runs}`",
+        f"- Identity mismatch/unverified runs: `{identity_unverified_runs}`",
+        f"- Security audit healthy: `{bool(audit.get('ok'))}`",
+        f"- Security audit events: `{audit.get('event_count', 0)}`",
+        f"- Security audit codes: `{json.dumps(audit.get('counts_by_code') or {}, sort_keys=True)}`",
+        f"- Security audit severities: `{json.dumps(audit.get('counts_by_severity') or {}, sort_keys=True)}`",
         f"- Dashboard: `{dashboard_result.get('path')}`",
         f"- Usage summary: `{usage_summary.get('report_path')}`",
         f"- Estimated tokens: `{usage_summary.get('total_tokens_est')}`",
@@ -16693,6 +18718,8 @@ def controller_report(
         "active_count": run_status(include_finished=False).get("active_count", 0),
         "max_severity": max_severity,
         "blocking_runs": blocking_runs,
+        "identity_unverified_run_count": identity_unverified_runs,
+        "security_audit": audit,
         "by_model_usage": by_model,
         "secret_classification_counts": secret_summary,
         "source_change_count": len(set(source_paths)),
@@ -17488,6 +19515,36 @@ def queue_policy(config: dict[str, Any] | None = None, apply: bool = False) -> d
     return {"ok": True, "applied": apply, "path": str(QUEUE_POLICY_PATH), "policy": current}
 
 
+def _audit_queue_security_error(
+    error: RuntimeSecurityError,
+    *,
+    cwd: Path,
+    job_id: str,
+    prepared: PreparedWorkerLaunch | None = None,
+    known_secrets: tuple[str, ...] = (),
+) -> bool:
+    metadata = prepared.metadata() if prepared is not None else {}
+    spec = prepared.launch_spec if prepared is not None else None
+    try:
+        _append_policy_security_audit(
+            artifact_root=workspace_paths(cwd)["artifact_root"],
+            code=error.code,
+            run_id=None,
+            runtime_id=spec.runtime_id if spec is not None else None,
+            trust_level=spec.trust_level if spec is not None else None,
+            provider_id=_security_audit_profile_id(metadata),
+            policy_decision_id=(
+                spec.policy_decision_id if spec is not None else None
+            ),
+            safe_details=error.safe_details,
+            known_secrets=known_secrets,
+            dedupe_key=f"queue-security:{job_id}:{error.code}",
+        )
+        return False
+    except Exception:
+        return True
+
+
 def queue_submit(
     task: str,
     role: str = "implementation",
@@ -17517,17 +19574,29 @@ def queue_submit(
         store = get_secure_payload_store()
         payload_reference = store.put(payload_id=job_id, value=payload)
     except (SecurePayloadStoreUnavailable, SecurePayloadStoreError) as exc:
-        return {
+        error = _security_error(
+            "secure_payload_store_unavailable",
+            "Deferred prompt could not be placed in an OS-protected store.",
+            safe_details={"queue_component": "protected_payload_store"},
+            suggested_action=SECURITY_AUDIT_POLICY[
+                "secure_payload_store_unavailable"
+            ]["recommended_action"],
+        )
+        audit_degraded = _audit_queue_security_error(
+            error,
+            cwd=effective_cwd,
+            job_id=job_id,
+            known_secrets=(task, context or "", str(exc)),
+        )
+        response = {
             "ok": False,
             "status": "secure_payload_store_unavailable",
-            "error": "Deferred prompt could not be placed in an OS-protected store.",
-            "security_error": {
-                "code": "secure_payload_store_unavailable",
-                "message": str(exc),
-                "safe_details": {"job_id": job_id},
-                "suggested_action": "Enable the native protected store and submit a new queue job.",
-            },
+            "error": error.message,
+            "security_error": error.to_dict(),
         }
+        if audit_degraded:
+            response["audit_degraded"] = True
+        return response
     grant: dict[str, Any] | None = None
     grant_reference: str | None = None
     try:
@@ -17898,8 +19967,12 @@ def queue_tick(max_concurrent: int | None = None) -> dict[str, Any]:
         save_queue(queue)
 
     started: list[dict[str, Any]] = []
+    attempts: list[dict[str, Any]] = []
     for claim in claims:
         run: dict[str, Any] | None = None
+        prepared: PreparedWorkerLaunch | None = None
+        task: str | None = None
+        context: str | None = None
         error_code: str | None = None
         error_message: str | None = None
         error_security_fields: dict[str, Any] = {}
@@ -17908,7 +19981,9 @@ def queue_tick(max_concurrent: int | None = None) -> dict[str, Any]:
             reference = claim.get("payload_reference")
             if not isinstance(reference, str):
                 raise SecurePayloadStoreError("Secure payload reference is missing.")
-            task, context = _decode_queue_payload(get_secure_payload_store().get(reference))
+            task, context = _decode_queue_payload(
+                get_secure_payload_store().get(reference)
+            )
             prepared = _prepare_streaming_agent(
                 task=task,
                 role=str(claim.get("role") or "implementation"),
@@ -17999,13 +20074,70 @@ def queue_tick(max_concurrent: int | None = None) -> dict[str, Any]:
                     "Queue launch returned a run id different from its "
                     "persisted intent."
                 )
-        except (RuntimeSecurityError, SecurePayloadStoreError, SecurePayloadStoreUnavailable) as exc:
+        except RuntimeSecurityError as exc:
             error_code = getattr(exc, "code", None) or type(exc).__name__
             error_message = str(exc)
             error_security_fields = _security_response_fields(exc)
+            if exc.code in {"runtime_policy_drift", "runtime_identity_changed"}:
+                if _audit_queue_security_error(
+                    exc,
+                    cwd=Path(str(claim.get("cwd") or Path.cwd())),
+                    job_id=str(claim["job_id"]),
+                    prepared=prepared,
+                    known_secrets=(task or "", context or ""),
+                ):
+                    error_security_fields["audit_degraded"] = True
+        except (SecurePayloadStoreError, SecurePayloadStoreUnavailable) as exc:
+            security_error = _security_error(
+                "secure_payload_store_unavailable",
+                "Deferred prompt could not be retrieved from the OS-protected store.",
+                safe_details={"queue_component": "protected_payload_store"},
+                suggested_action=SECURITY_AUDIT_POLICY[
+                    "secure_payload_store_unavailable"
+                ]["recommended_action"],
+            )
+            error_code = security_error.code
+            error_message = security_error.message
+            error_security_fields = _security_response_fields(security_error)
+            if _audit_queue_security_error(
+                security_error,
+                cwd=Path(str(claim.get("cwd") or Path.cwd())),
+                job_id=str(claim["job_id"]),
+                prepared=prepared,
+                known_secrets=(str(exc),),
+            ):
+                error_security_fields["audit_degraded"] = True
         except Exception as exc:
             error_code = type(exc).__name__
             error_message = str(exc)
+        launch_succeeded = _launch_response_succeeded(run)
+        attempt: dict[str, Any] = {
+            "job_id": str(claim["job_id"]),
+            "ok": launch_succeeded,
+            "status": (
+                str(run.get("status") or "failed")
+                if isinstance(run, Mapping)
+                else (
+                    "blocked_runtime_security"
+                    if error_security_fields.get("security_error")
+                    else "failed"
+                )
+            ),
+        }
+        if isinstance(run, Mapping):
+            for key in (
+                "run_id",
+                "child_pid",
+                "timed_out",
+                "stop_reason",
+                "exit_code",
+                "security_error",
+                "audit_degraded",
+            ):
+                if key in run:
+                    attempt[key] = run.get(key)
+        attempt.update(error_security_fields)
+        attempts.append(attempt)
         with queue_lock():
             queue = load_queue()
             job = next((item for item in queue.get("jobs", []) if item.get("job_id") == claim["job_id"]), None)
@@ -18068,7 +20200,6 @@ def queue_tick(max_concurrent: int | None = None) -> dict[str, Any]:
                 save_queue(queue)
                 continue
             job.pop("launch_claim", None)
-            launch_succeeded = _launch_response_succeeded(run)
             if launch_succeeded:
                 job["status"] = "running"
                 job["run_id"] = run["run_id"]
@@ -18130,7 +20261,15 @@ def queue_tick(max_concurrent: int | None = None) -> dict[str, Any]:
     with queue_lock():
         final_queue = load_queue()
         public_jobs = [_public_queue_job(job) for job in final_queue.get("jobs", [])]
-    return {"ok": True, "queue_path": str(QUEUE_PATH), "max_concurrent": limit, "slots_used": len(started), "started": started, "jobs": public_jobs}
+    return {
+        "ok": True,
+        "queue_path": str(QUEUE_PATH),
+        "max_concurrent": limit,
+        "slots_used": len(started),
+        "started": started,
+        "attempts": attempts,
+        "jobs": public_jobs,
+    }
 
 
 def queue_status(include_finished: bool = True) -> dict[str, Any]:
@@ -18619,7 +20758,7 @@ def run_visible_agent(
                 "name": provider.name,
                 "model": selected_model,
                 "provider_default_model": provider.model,
-                "endpoints": provider.endpoints,
+                "endpoints": project_public_endpoints(provider.endpoints),
             },
             "permission_mode": permission_mode,
             "allow_write": write_enabled,
@@ -18636,12 +20775,31 @@ def run_visible_agent(
             "Visible runtime launch is unavailable on this platform.",
             suggested_action="Use run-streaming and poll the guarded worker output.",
         )
-        return {
+        prepared_metadata = prepared.metadata()
+        audit_degraded = False
+        try:
+            _append_policy_security_audit(
+                artifact_root=str(prepared_metadata["artifact_root"]),
+                code=error.code,
+                run_id=None,
+                runtime_id=prepared.launch_spec.runtime_id,
+                trust_level=prepared.launch_spec.trust_level,
+                provider_id=_security_audit_profile_id(prepared_metadata),
+                policy_decision_id=prepared.launch_spec.policy_decision_id,
+                safe_details=error.safe_details,
+                known_secrets=prepared.sensitive_values,
+            )
+        except Exception:
+            audit_degraded = True
+        response = {
             "ok": False,
             "status": "visible_runtime_unsupported",
             "error": error.message,
             "security_error": error.to_dict(),
         }
+        if audit_degraded:
+            response["audit_degraded"] = True
+        return response
     return start_prepared_worker_launch(prepared)
 
 
@@ -19727,8 +21885,10 @@ def write_auto_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
 def write_reports(output_dir: Path | None = None) -> dict[str, Any]:
     report_dir = output_dir or REPORTS_DIR
     report_dir.mkdir(parents=True, exist_ok=True)
-    scores = score_models()
-    plan = run_workflow_plan("local multi-agent routing calibration")
+    scores = project_public_endpoint_values(score_models())
+    plan = project_public_endpoint_values(
+        run_workflow_plan("local multi-agent routing calibration")
+    )
     scores_path = report_dir / "model_scores.json"
     strategy_path = report_dir / "multi_agent_strategy.md"
     scores_path.write_text(json.dumps(scores, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -20220,11 +22380,56 @@ def last_run(run_id: str | None = None, include_output: bool = True) -> dict[str
 
 
 def print_json(data: Any) -> None:
-    text = json.dumps(sanitize_for_json(data), ensure_ascii=False, indent=2)
+    projected = project_public_endpoint_values(sanitize_for_json(data))
+    text = json.dumps(projected, ensure_ascii=False, indent=2)
     try:
         print(text)
     except UnicodeEncodeError:
         sys.stdout.buffer.write(text.encode("utf-8", errors="replace") + b"\n")
+
+
+def _cli_launch_result_exit_code(result: Any) -> int:
+    if not isinstance(result, (Mapping, list, tuple)):
+        return 0
+    observed: list[Mapping[str, Any]] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, Mapping):
+            observed.append(value)
+            for item in value.values():
+                collect(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                collect(item)
+
+    collect(result)
+    if any(
+        item.get("timed_out") is True
+        or item.get("stop_reason") == "timeout"
+        or str(item.get("status") or "") == "timed_out"
+        for item in observed
+    ):
+        return 124
+    if any(
+        isinstance(item.get("security_error"), Mapping)
+        for item in observed
+    ):
+        return 2
+    for item in observed:
+        raw_exit_code = item.get("exit_code")
+        if (
+            isinstance(raw_exit_code, int)
+            and not isinstance(raw_exit_code, bool)
+            and raw_exit_code != 0
+            and (
+                item.get("child_pid") is not None
+                or item.get("run_id") is not None
+            )
+        ):
+            return int(raw_exit_code)
+    if any(item.get("ok") is False for item in observed):
+        return 2
+    return 0
 
 
 def split_csv(value: str | None) -> list[str]:
@@ -20632,42 +22837,52 @@ def main() -> int:
         elif args.command == "pick":
             route = resolve_route(args.role, args.task_type, args.profile)
             provider = get_provider(route["profile"])
-            print_json({**route, "selected_provider": redact(provider.settings), "model": route.get("model_override") or provider.model})
+            print_json(
+                project_public_endpoint_values(
+                    {
+                        **route,
+                        "selected_provider": redact(provider.settings),
+                        "base_url": provider.env.get("ANTHROPIC_BASE_URL"),
+                        "endpoints": provider.endpoints,
+                        "model": route.get("model_override") or provider.model,
+                    }
+                )
+            )
         elif args.command == "run":
-            print_json(
-                run_agent(
-                    task=args.task,
-                    role=args.role,
-                    task_type=args.task_type,
-                    profile=args.profile,
-                    allow_write=args.allow_write,
-                    timeout_seconds=args.timeout_seconds,
-                    cwd=Path(args.cwd) if args.cwd else None,
-                    allow_unsafe_runtime=args.allow_unsafe_runtime,
-                )
+            launch_result = run_agent(
+                task=args.task,
+                role=args.role,
+                task_type=args.task_type,
+                profile=args.profile,
+                allow_write=args.allow_write,
+                timeout_seconds=args.timeout_seconds,
+                cwd=Path(args.cwd) if args.cwd else None,
+                allow_unsafe_runtime=args.allow_unsafe_runtime,
             )
+            print_json(launch_result)
+            return _cli_launch_result_exit_code(launch_result)
         elif args.command == "run-streaming":
-            print_json(
-                run_streaming_agent(
-                    task=args.task,
-                    role=args.role,
-                    task_type=args.task_type,
-                    profile=args.profile,
-                    allow_write=args.allow_write,
-                    timeout_seconds=args.timeout_seconds,
-                    cwd=Path(args.cwd) if args.cwd else None,
-                    context=args.context,
-                    include_partial_messages=not args.no_include_partial_messages,
-                    max_output_bytes=args.max_output_bytes,
-                    max_events_bytes=args.max_events_bytes,
-                    soft_output_bytes=args.soft_output_bytes,
-                    output_budget_policy=args.output_budget_policy,
-                    kill_on_excessive_output=args.kill_on_excessive_output,
-                    final_only=args.final_only,
-                    final_max_chars=args.final_max_chars,
-                    allow_unsafe_runtime=args.allow_unsafe_runtime,
-                )
+            launch_result = run_streaming_agent(
+                task=args.task,
+                role=args.role,
+                task_type=args.task_type,
+                profile=args.profile,
+                allow_write=args.allow_write,
+                timeout_seconds=args.timeout_seconds,
+                cwd=Path(args.cwd) if args.cwd else None,
+                context=args.context,
+                include_partial_messages=not args.no_include_partial_messages,
+                max_output_bytes=args.max_output_bytes,
+                max_events_bytes=args.max_events_bytes,
+                soft_output_bytes=args.soft_output_bytes,
+                output_budget_policy=args.output_budget_policy,
+                kill_on_excessive_output=args.kill_on_excessive_output,
+                final_only=args.final_only,
+                final_max_chars=args.final_max_chars,
+                allow_unsafe_runtime=args.allow_unsafe_runtime,
             )
+            print_json(launch_result)
+            return _cli_launch_result_exit_code(launch_result)
         elif args.command == "poll-run":
             print_json(
                 poll_run(
@@ -20710,44 +22925,44 @@ def main() -> int:
                 )
             )
         elif args.command == "send-instruction":
-            print_json(
-                send_instruction(
-                    run_id=args.run_id,
-                    instruction=args.instruction,
-                    force=args.force,
-                    role=args.role,
-                    task_type=args.task_type,
-                    timeout_seconds=args.timeout_seconds,
-                    preserve_route=not args.no_preserve_route,
-                    reroute=args.reroute,
-                    route_profile=args.route_profile,
-                    route_model=args.route_model,
-                    allow_unsafe_runtime=args.allow_unsafe_runtime,
-                )
+            launch_result = send_instruction(
+                run_id=args.run_id,
+                instruction=args.instruction,
+                force=args.force,
+                role=args.role,
+                task_type=args.task_type,
+                timeout_seconds=args.timeout_seconds,
+                preserve_route=not args.no_preserve_route,
+                reroute=args.reroute,
+                route_profile=args.route_profile,
+                route_model=args.route_model,
+                allow_unsafe_runtime=args.allow_unsafe_runtime,
             )
+            print_json(launch_result)
+            return _cli_launch_result_exit_code(launch_result)
         elif args.command == "spawn-role-team":
-            print_json(
-                spawn_role_team(
-                    task=args.task,
-                    roles=split_csv(args.roles),
-                    cwd=Path(args.cwd) if args.cwd else None,
-                    context=args.context,
-                    timeout_seconds=args.timeout_seconds,
-                    allow_unsafe_runtime=args.allow_unsafe_runtime,
-                )
+            launch_result = spawn_role_team(
+                task=args.task,
+                roles=split_csv(args.roles),
+                cwd=Path(args.cwd) if args.cwd else None,
+                context=args.context,
+                timeout_seconds=args.timeout_seconds,
+                allow_unsafe_runtime=args.allow_unsafe_runtime,
             )
+            print_json(launch_result)
+            return _cli_launch_result_exit_code(launch_result)
         elif args.command == "collect-team-results":
             print_json(collect_team_results(team_id=args.team_id, run_ids=args.run_ids, tail_chars=args.tail_chars))
         elif args.command == "cross-review":
-            print_json(
-                cross_review(
-                    run_ids=args.run_ids,
-                    reviewer_roles=split_csv(args.reviewer_roles),
-                    cwd=Path(args.cwd) if args.cwd else None,
-                    timeout_seconds=args.timeout_seconds,
-                    allow_unsafe_runtime=args.allow_unsafe_runtime,
-                )
+            launch_result = cross_review(
+                run_ids=args.run_ids,
+                reviewer_roles=split_csv(args.reviewer_roles),
+                cwd=Path(args.cwd) if args.cwd else None,
+                timeout_seconds=args.timeout_seconds,
+                allow_unsafe_runtime=args.allow_unsafe_runtime,
             )
+            print_json(launch_result)
+            return _cli_launch_result_exit_code(launch_result)
         elif args.command == "preflight-write-scope":
             print_json(
                 preflight_write_scope(
@@ -20775,18 +22990,20 @@ def main() -> int:
                 )
             )
         elif args.command == "benchmark-model":
-            print_json(
-                benchmark_model(
-                    profile=args.profile,
-                    role=args.role,
-                    task=args.task,
-                    timeout_seconds=args.timeout_seconds,
-                    execute=args.execute,
-                    allow_unsafe_runtime=args.allow_unsafe_runtime,
-                )
+            launch_result = benchmark_model(
+                profile=args.profile,
+                role=args.role,
+                task=args.task,
+                timeout_seconds=args.timeout_seconds,
+                execute=args.execute,
+                allow_unsafe_runtime=args.allow_unsafe_runtime,
             )
+            print_json(launch_result)
+            return _cli_launch_result_exit_code(launch_result)
         elif args.command == "benchmark-suite":
-            print_json(benchmark_suite(profile=args.profile, execute=args.execute, timeout_seconds=args.timeout_seconds, allow_unsafe_runtime=args.allow_unsafe_runtime))
+            launch_result = benchmark_suite(profile=args.profile, execute=args.execute, timeout_seconds=args.timeout_seconds, allow_unsafe_runtime=args.allow_unsafe_runtime)
+            print_json(launch_result)
+            return _cli_launch_result_exit_code(launch_result)
         elif args.command == "calibrate-policy":
             preferences = parse_json_arg(args.preferences_json)
             preferences.update(parse_key_values(args.preferences))
@@ -20801,21 +23018,23 @@ def main() -> int:
         elif args.command == "usage-summary":
             print_json(daily_usage_summary(date=args.date, write_report=args.write_report))
         elif args.command == "queue-submit":
-            print_json(
-                queue_submit(
-                    task=args.task,
-                    role=args.role,
-                    priority=args.priority,
-                    cwd=Path(args.cwd) if args.cwd else None,
-                    context=args.context,
-                    timeout_seconds=args.timeout_seconds,
-                    max_retries=args.max_retries,
-                    allow_write=args.allow_write,
-                    allow_unsafe_runtime=args.allow_unsafe_runtime,
-                )
+            launch_result = queue_submit(
+                task=args.task,
+                role=args.role,
+                priority=args.priority,
+                cwd=Path(args.cwd) if args.cwd else None,
+                context=args.context,
+                timeout_seconds=args.timeout_seconds,
+                max_retries=args.max_retries,
+                allow_write=args.allow_write,
+                allow_unsafe_runtime=args.allow_unsafe_runtime,
             )
+            print_json(launch_result)
+            return _cli_launch_result_exit_code(launch_result)
         elif args.command == "queue-tick":
-            print_json(queue_tick(max_concurrent=args.max_concurrent))
+            launch_result = queue_tick(max_concurrent=args.max_concurrent)
+            print_json(launch_result)
+            return _cli_launch_result_exit_code(launch_result)
         elif args.command == "queue-status":
             print_json(queue_status(include_finished=not args.active_only))
         elif args.command == "queue-cancel":
@@ -20877,17 +23096,17 @@ def main() -> int:
                 )
             )
         elif args.command == "run-visible":
-            print_json(
-                run_visible_agent(
-                    task=args.task,
-                    role=args.role,
-                    task_type=args.task_type,
-                    profile=args.profile,
-                    allow_write=args.allow_write,
-                    cwd=Path(args.cwd) if args.cwd else None,
-                    allow_unsafe_runtime=args.allow_unsafe_runtime,
-                )
+            launch_result = run_visible_agent(
+                task=args.task,
+                role=args.role,
+                task_type=args.task_type,
+                profile=args.profile,
+                allow_write=args.allow_write,
+                cwd=Path(args.cwd) if args.cwd else None,
+                allow_unsafe_runtime=args.allow_unsafe_runtime,
             )
+            print_json(launch_result)
+            return _cli_launch_result_exit_code(launch_result)
         elif args.command == "diff":
             print_json(git_diff(cwd=Path(args.cwd) if args.cwd else None))
         elif args.command == "workflow-plan":
@@ -20897,7 +23116,9 @@ def main() -> int:
         elif args.command == "workflow-dry-run":
             print_json(workflow_dry_run(args.file, task=args.task, cwd=Path(args.cwd) if args.cwd else None))
         elif args.command == "workflow-run":
-            print_json(workflow_run(args.file, task=args.task, cwd=Path(args.cwd) if args.cwd else None, mock=args.mock, loop_guard=args.loop_guard, allow_unsafe_runtime=args.allow_unsafe_runtime))
+            launch_result = workflow_run(args.file, task=args.task, cwd=Path(args.cwd) if args.cwd else None, mock=args.mock, loop_guard=args.loop_guard, allow_unsafe_runtime=args.allow_unsafe_runtime)
+            print_json(launch_result)
+            return _cli_launch_result_exit_code(launch_result)
         elif args.command == "workflow-status":
             print_json(workflow_status(args.workflow_id, cwd=Path(args.cwd) if args.cwd else None))
         elif args.command == "workflow-retry-node":

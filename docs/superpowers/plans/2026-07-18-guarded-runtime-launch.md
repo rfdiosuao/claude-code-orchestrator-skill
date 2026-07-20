@@ -924,8 +924,9 @@ Run: `git add scripts/cc-orchestrator/cc_orchestrator.py scripts/cc-orchestrator
 - Modify: `scripts/cc-orchestrator/server.py`
 - Modify: `scripts/cc-orchestrator/tests/test_runtime_security.py`
 - Modify: `scripts/cc-orchestrator/tests/test_guarded_launch.py`
+- Modify: `scripts/cc-orchestrator/tests/test_public_surfaces.py`
 
-- [ ] **Step 1: Write failing audit-schema and secret-scan tests**
+- [x] **Step 1: Write failing audit-schema and secret-scan tests**
 
 For each security error code, generate an event with a fixture API key and assert:
 
@@ -936,7 +937,7 @@ For each security error code, generate an event with a fixture API key and asser
 - simultaneous first-use key creation in spawned processes produces one valid key and verifiable chain;
 - symlink/reparse targets, short non-pattern secrets, and URL userinfo are rejected or sanitized.
 
-- [ ] **Step 2: Implement one append-only audit writer**
+- [x] **Step 2: Implement one append-only audit writer**
 
 ```python
 def append_security_event(
@@ -969,13 +970,17 @@ def append_security_event(
     )
 ```
 
-Serialize only an explicit allowlist of fields. Pseudonymize provider ids with HMAC-SHA-256 and a locally generated 32-byte audit key stored in `config/runtime_security.audit.key`; never use an unkeyed hash for low-entropy identifiers. Reject symlink/reparse-point log targets, cap each event at 16 KiB, and reject the event before writing when either the serialized payload matches the existing secret regexes or contains any exact provider secret value known to the launch. Use the artifact lock, hash-chain each record to the previous record for local tamper evidence, and create the key, run directories, and log files with current-user-only permissions where supported.
+Serialize only an explicit allowlist of fields and persist safe field names, never their values. Pseudonymize provider ids with HMAC-SHA-256 and a locally generated 32-byte audit key stored at `<artifact_root>/config/runtime_security.audit.key`; never use an unkeyed hash for low-entropy identifiers. Reject symlink/reparse-point log targets, cap each event at 16 KiB, and reject the event before writing when either the serialized payload matches the existing secret regexes or an opaque pseudonym/hash field contains an exact provider credential or endpoint secret known to the launch. Prompt/task text is not serialized and is not compared against fixed audit vocabulary. Use a bounded private-file lock, hash-chain each record to the previous record for local tamper evidence, and create the key, run directories, and log files with current-user-only permissions where supported.
+
+Authenticate the zero-event state with a checkpoint as soon as the key is created. An existing key with a missing log/checkpoint fails closed. Append and fsync the log before atomically replacing the HMAC checkpoint; a crash in between requires operator restoration of the last known-good pair and must not trigger automatic re-signing. Persist each append failure as a unique strict-private generation marker in an independently initialized bootstrap directory keyed by the artifact-root path and, once the normal audit config tree exists, in that tree as well. Every applicable destination is mandatory, so even first-initialization failure remains visible to a later process and partial marker persistence fails explicitly. A complete verified append clears only the marker generations observed after acquiring the audit lock; a newer concurrent failure survives, and long-lived processes reconcile stale in-memory state from the shared generation set. Health always reports `failure_count`, plus log bytes, remaining capacity, and utilization, and fails when less than one maximum-size event remains.
+
+On Windows, create private directories atomically with `NtCreateFile(FILE_CREATE)` relative to a retained parent handle and attach the owner/protected DACL security descriptor at creation time. Both the retained parent handle and the creation handle deny delete sharing through relative creation and identity/ACL verification. `ERROR_ALREADY_EXISTS` objects are verified by handle and never have their owner changed. A pre-existing artifact root may receive a protected current-user-only DACL without changing its owner; newly created audit `config`/`logs` directories and all key/lock/log/checkpoint/failure files retain the strict owner check. Health reports a root with no audit material as healthy and uninitialized.
 
 Audit failure policy is explicit: a security rejection remains rejected even when its audit append fails; a `local_unsafe` launch fails closed when its high-severity event cannot be recorded; a trusted-default launch may continue with `audit_degraded=true`, and healthcheck must surface the repair action. The log is tamper-evident within the current user boundary, not a trusted external audit sink.
 
 Inject key creation, lock acquisition, open, append, flush, and permission-setting failures. Assert each rejection stays rejected, unsafe launch never calls `Popen`, trusted-default behavior follows the degraded policy exactly, and a later healthcheck identifies the failed audit component.
 
-- [ ] **Step 3: Emit events at every policy and identity decision boundary**
+- [x] **Step 3: Emit events at every policy and identity decision boundary**
 
 Emit at least:
 
@@ -983,21 +988,23 @@ Emit at least:
 - missing unsafe policy/request approval;
 - successful `local_unsafe` authorization;
 - pre/post launch executable identity change;
-- process identity mismatch/unverified during status or stop.
+- process identity mismatch/unverified during status or stop. Status polling first acquires a cross-process pending claim in run metadata, then emits and finalizes the marker. Interrupted pending claims are replayed from the allowlisted persisted marker even when the observed process has since exited. A deterministic HMAC `dedupe_id` is checked while the audit lock is held so pre-append and post-append interruptions, concurrent polls, and recovery attempts append exactly one event without persisting the raw dedupe key. Failed appends remain pending.
 
 Security failures before run creation use the cwd-derived artifact root and `run_id=None`.
 
-- [ ] **Step 4: Extend healthcheck and operational reports**
+- [x] **Step 4: Extend healthcheck and operational reports**
 
-`healthcheck()` adds a `runtime_security` object with canonical default path, configured runtime path when present, trust decision summary, policy path/existence, audit health, protected payload-store health, and process identity support. It may execute `--version` only for the trusted default runtime; a `local_unsafe` runtime is reported without execution. Dashboard/controller reports show counts by event code/severity and identity-unverified runs, never environment values. Every run/team/queue/workflow/report/health metadata builder projects provider base URLs/endpoints through one fixed `scheme://host:port` sanitizer that strips userinfo, paths, query strings, and fragments.
+`healthcheck()` adds a `runtime_security` object with canonical default path, configured runtime path when present, trust decision summary, policy path/existence, audit health/capacity, protected payload-store health, and process identity support. It may execute `--version` only after executable capture, formal trusted-default authorization, held-file identity verification, owned-process containment, and post-start process identity validation; a `local_unsafe` runtime is reported without execution. Dashboard/controller reports show counts by event code/severity and worker/child identity-unverified states, never environment values.
 
-- [ ] **Step 5: Test MCP and CLI security envelopes**
+Every CLI/MCP JSON envelope, profile Markdown renderer, and persisted strategy report passes through one recursive final projection. Strict HTTP(S) parsing emits only a validated ASCII `scheme://host:port` origin and rejects whitespace, backslashes, malformed percent escapes, invalid hostnames, and invalid ports. Endpoint-context non-string values are redacted; `*_url` and `*_uri` fields propagate endpoint context recursively; embedded URI strings are replaced wholesale even after punctuation; URI-bearing mapping keys are dropped; Windows drive paths are not mistaken for URI schemes. Untrusted runtime JSON uses a separate recursive scrubber that cleans both mapping keys and values and resolves redacted-key collisions deterministically before stdout, events, tails, or artifacts are exposed.
+
+- [x] **Step 5: Test MCP and CLI security envelopes**
 
 CLI retains its JSON/error exit behavior and includes `security_error`. MCP `_error` returns the same structured object. Add assertions that messages name only safe keys/paths and suggest a concrete action.
 
-Exercise every stable security code, plus `visible_runtime_unsupported`, through direct Python, CLI, and MCP envelopes. Lock exit-code precedence: controller security failures use exit code 2, runtime child failures preserve the child's recorded exit code, and timeouts preserve 124 plus a separate safe stop reason.
+Exercise every stable security code, plus `visible_runtime_unsupported`, through direct Python, CLI, and MCP envelopes. All eleven launch-capable CLI commands, including `queue-tick`, recursively inspect aggregate/team/benchmark/queue/workflow results. Explicit timeout evidence preserves 124, any controller security failure uses exit code 2, then an explicitly attributed runtime child failure preserves the child's recorded exit code. A bare child `exit_code=124` is still a child failure and does not outrank a sibling controller security error. Private `_stream-worker` and `_visible-worker` protocol commands continue returning exit 0 with a structured response so the controller can parse rejections.
 
-- [ ] **Step 6: Run tests and commit**
+- [x] **Step 6: Run tests and commit**
 
 Run: `python -m unittest discover -s scripts/cc-orchestrator/tests -v`
 

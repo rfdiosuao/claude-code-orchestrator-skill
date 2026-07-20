@@ -29,6 +29,7 @@ import cc_orchestrator as orchestrator  # noqa: E402
 from secure_payload_store import (  # noqa: E402
     InMemorySecurePayloadStore,
     SecurePayloadStoreError,
+    SecurePayloadStoreUnavailable,
 )
 
 
@@ -58,6 +59,30 @@ CLI_COMMANDS = (
 
 
 class PublicSurfaceContractTests(unittest.TestCase):
+    def test_identity_risk_projection_counts_worker_and_child_states(self) -> None:
+        risky = (
+            {"worker_identity_state": "unverified"},
+            {"child_identity_state": "mismatch"},
+            {"status": "identity_unverified"},
+            {
+                "security_error": {
+                    "code": "process_identity_mismatch"
+                }
+            },
+        )
+        for item in risky:
+            with self.subTest(item=item):
+                self.assertTrue(orchestrator._identity_risk_observed(item))
+        self.assertFalse(
+            orchestrator._identity_risk_observed(
+                {
+                    "worker_identity_state": "match",
+                    "child_identity_state": "exited",
+                    "status": "succeeded",
+                }
+            )
+        )
+
     def test_launch_capable_python_apis_end_with_request_approval(self) -> None:
         for name in PUBLIC_APIS:
             with self.subTest(name=name):
@@ -371,6 +396,622 @@ class PublicSurfaceContractTests(unittest.TestCase):
             mcp_payload["security_error"]["code"], "runtime_not_trusted"
         )
         self.assertEqual(mcp_payload["next_step"], error.suggested_action)
+
+    def test_cli_launch_results_use_security_timeout_and_child_exit_codes(
+        self,
+    ) -> None:
+        commands = (
+            ("run_agent", ["run", "fixture"]),
+            ("run_streaming_agent", ["run-streaming", "fixture"]),
+            ("run_visible_agent", ["run-visible", "fixture"]),
+            (
+                "send_instruction",
+                ["send-instruction", "--run-id", "run-fixture", "fixture"],
+            ),
+            ("spawn_role_team", ["spawn-role-team", "fixture"]),
+            (
+                "cross_review",
+                ["cross-review", "--run-id", "run-fixture"],
+            ),
+            ("benchmark_model", ["benchmark-model", "--execute"]),
+            ("benchmark_suite", ["benchmark-suite", "--execute"]),
+            ("queue_submit", ["queue-submit", "fixture"]),
+            ("queue_tick", ["queue-tick"]),
+            (
+                "workflow_run",
+                [
+                    "workflow-run",
+                    "--file",
+                    "fixture.json",
+                    "--task",
+                    "fixture",
+                ],
+            ),
+        )
+        results = (
+            (
+                {
+                    "ok": False,
+                    "status": "blocked_runtime_security",
+                    "security_error": {"code": "runtime_not_trusted"},
+                },
+                2,
+            ),
+            (
+                {
+                    "ok": False,
+                    "status": "timed_out",
+                    "timed_out": True,
+                    "exit_code": 124,
+                },
+                124,
+            ),
+            (
+                {
+                    "ok": False,
+                    "status": "failed",
+                    "child_pid": 4242,
+                    "exit_code": 7,
+                },
+                7,
+            ),
+            (
+                {
+                    "ok": False,
+                    "status": "failed",
+                    "child_pid": 4242,
+                    "exit_code": 7,
+                    "security_error": {"code": "runtime_identity_changed"},
+                },
+                2,
+            ),
+            (
+                {
+                    "ok": False,
+                    "tasks": [
+                        {
+                            "run_id": "run-timeout-fixture",
+                            "status": "timed_out",
+                            "timed_out": True,
+                            "exit_code": 124,
+                        },
+                        {
+                            "security_error": {
+                                "code": "runtime_not_trusted"
+                            }
+                        },
+                        {
+                            "run_id": "run-child-fixture",
+                            "child_pid": 4242,
+                            "exit_code": 9,
+                        },
+                    ],
+                },
+                124,
+            ),
+        )
+        for target, argv in commands:
+            for result, expected in results:
+                with self.subTest(target=target, expected=expected), patch.object(
+                    sys, "argv", ["cc-orchestrator", *argv]
+                ), patch.object(
+                    orchestrator, target, return_value=result
+                ), patch.object(orchestrator, "print_json"):
+                    self.assertEqual(orchestrator.main(), expected)
+        nested_results = (
+            ({"ok": False, "runs": [{"timed_out": True}]}, 124),
+            (
+                {
+                    "ok": False,
+                    "tasks": [
+                        {"security_error": {"code": "runtime_not_trusted"}}
+                    ],
+                },
+                2,
+            ),
+            (
+                {
+                    "ok": False,
+                    "tasks": [
+                        {"run_id": "run-fixture", "exit_code": 9}
+                    ],
+                },
+                9,
+            ),
+            (
+                {
+                    "ok": False,
+                    "tasks": [
+                        {
+                            "run_id": "run-fixture",
+                            "status": "failed",
+                            "timed_out": False,
+                            "exit_code": 124,
+                        },
+                        {
+                            "security_error": {
+                                "code": "runtime_not_trusted"
+                            }
+                        },
+                    ],
+                },
+                2,
+            ),
+            (
+                {
+                    "ok": False,
+                    "tasks": [
+                        {"timed_out": "false", "status": "failed"},
+                        {
+                            "security_error": {
+                                "code": "runtime_not_trusted"
+                            }
+                        },
+                    ],
+                },
+                2,
+            ),
+        )
+        for result, expected in nested_results:
+            with self.subTest(nested_expected=expected):
+                self.assertEqual(
+                    orchestrator._cli_launch_result_exit_code(result),
+                    expected,
+                )
+        for target, argv in (
+            ("stream_worker", ["_stream-worker", "--run-id", "run-fixture"]),
+            ("visible_worker", ["_visible-worker", "--run-id", "run-fixture"]),
+        ):
+            with self.subTest(target=target), patch.object(
+                sys, "argv", ["cc-orchestrator", *argv]
+            ), patch.object(
+                orchestrator,
+                target,
+                return_value={
+                    "ok": False,
+                    "security_error": {"code": "worker_protocol_invalid"},
+                },
+            ), patch.object(orchestrator, "print_json"):
+                self.assertEqual(orchestrator.main(), 0)
+
+    def test_every_stable_security_code_has_matching_cli_and_mcp_envelopes(
+        self,
+    ) -> None:
+        from runtime_security import (
+            SECURITY_AUDIT_POLICY,
+            RuntimeSecurityError,
+        )
+
+        server = importlib.import_module("server")
+        for code, policy in SECURITY_AUDIT_POLICY.items():
+            with self.subTest(code=code):
+                error = RuntimeSecurityError(
+                    code=code,
+                    message="A guarded runtime security decision was rejected.",
+                    safe_details={"component": "fixture"},
+                    suggested_action=policy["recommended_action"],
+                )
+                with patch.object(
+                    sys, "argv", ["cc-orchestrator", "run", "fixture"]
+                ), patch.object(
+                    orchestrator, "run_agent", side_effect=error
+                ), patch.object(orchestrator, "print_json") as output:
+                    self.assertEqual(orchestrator.main(), 2)
+                cli = output.call_args.args[0]
+                mcp = json.loads(server._error(error))
+                self.assertEqual(cli["security_error"], error.to_dict())
+                self.assertEqual(mcp["security_error"], error.to_dict())
+                self.assertEqual(mcp["next_step"], policy["recommended_action"])
+
+    def test_provider_endpoint_projection_is_shared_by_python_and_mcp(self) -> None:
+        endpoint = (
+            "https://user:pass@Example.Invalid:8443/private/path"
+            "?token=query-secret#fragment-secret"
+        )
+        projected = "https://example.invalid:8443"
+        self.assertEqual(orchestrator.project_public_endpoint(endpoint), projected)
+        nested = orchestrator.project_public_endpoint_values(
+            {
+                "base_url": endpoint,
+                "items": [
+                    endpoint,
+                    "ftp://user:pass@example.invalid/private?token=secret",
+                    "file://user:pass/private?token=secret",
+                    "mailto:user@example.invalid?subject=private",
+                    "ordinary text",
+                ],
+                "callback_url": {
+                    "primary": "file://private/path",
+                },
+                "nested": {"url": "ftp://private/path"},
+            }
+        )
+        self.assertEqual(nested["base_url"], projected)
+        self.assertEqual(
+            nested["items"],
+            [projected, "[REDACTED]", "[REDACTED]", "[REDACTED]", "ordinary text"],
+        )
+        self.assertEqual(nested["callback_url"]["primary"], "[REDACTED]")
+        self.assertEqual(nested["nested"]["url"], "[REDACTED]")
+        for unsafe_endpoint in (
+            "ftp://user:pass@example.invalid/private?token=secret",
+            "file://user:pass/private?token=secret",
+            "user:pass@example.invalid/private?token=secret",
+            "not a valid endpoint",
+        ):
+            with self.subTest(endpoint=unsafe_endpoint):
+                self.assertEqual(
+                    orchestrator.project_public_endpoint(unsafe_endpoint),
+                    "[REDACTED]",
+                )
+                self.assertEqual(
+                    orchestrator.project_public_endpoint_values(
+                        {"proxy_url": unsafe_endpoint}
+                    )["proxy_url"],
+                    "[REDACTED]",
+                )
+                self.assertEqual(
+                    orchestrator.project_public_endpoint_values(
+                        {"endpoint": {"primary": unsafe_endpoint}}
+                    )["endpoint"]["primary"],
+                    "[REDACTED]",
+                )
+
+        for malformed in (
+            "https://example.invalid\\private-secret/path",
+            "https://example.invalid private-secret/path",
+            "https://example.invalid/%ZZ/private-secret",
+            "https://example.invalid:99999/private-secret",
+            "https://example.invalid:0/private-secret",
+            "https://example.invalid:",
+            "https://example.invalid:/private-secret",
+            "https://[::1]garbage/private-secret",
+        ):
+            with self.subTest(malformed=malformed):
+                self.assertEqual(
+                    orchestrator.project_public_endpoint(malformed),
+                    "[REDACTED]",
+                )
+        self.assertEqual(
+            orchestrator.project_public_endpoint_values({"endpoint": 42})[
+                "endpoint"
+            ],
+            "[REDACTED]",
+        )
+        secret_uri = (
+            "https://alice:fixture-pass@example.invalid/private/path"
+            "?token=fixture-query"
+        )
+        projected_envelope = orchestrator.project_public_endpoint_values(
+            {
+                secret_uri: "mapping-key-value",
+                "reason": f"prefix {secret_uri} suffix",
+                "windows_path": r"C:\Users\fixture\project",
+            }
+        )
+        serialized_envelope = json.dumps(projected_envelope)
+        self.assertNotIn("fixture-pass", serialized_envelope)
+        self.assertNotIn("private/path", serialized_envelope)
+        self.assertNotIn("fixture-query", serialized_envelope)
+        self.assertNotIn(secret_uri, projected_envelope)
+        self.assertNotIn("mapping-key-value", serialized_envelope)
+        self.assertEqual(projected_envelope["reason"], "[REDACTED]")
+        self.assertEqual(
+            projected_envelope["windows_path"], r"C:\Users\fixture\project"
+        )
+        self.assertEqual(
+            orchestrator.project_public_endpoint_values(
+                {"windows_path": r"C:relative\project"}
+            )["windows_path"],
+            r"C:relative\project",
+        )
+        single_letter_uri = (
+            "x://alice:fixture-pass@example.invalid/private/path"
+            "?token=fixture-query"
+        )
+        self.assertEqual(
+            orchestrator.project_public_endpoint_values(
+                {"reason": single_letter_uri}
+            )["reason"],
+            "[REDACTED]",
+        )
+        opaque_single_letter_uri = (
+            "x:alice:fixture-pass@example.invalid/private?token=fixture-query"
+        )
+        projected_opaque = orchestrator.project_public_endpoint_values(
+            {
+                "reason": opaque_single_letter_uri,
+                opaque_single_letter_uri: "opaque-mapping-key-value",
+            }
+        )
+        self.assertEqual(projected_opaque, {"reason": "[REDACTED]"})
+
+        server = importlib.import_module("server")
+        provider = orchestrator.Provider(
+            id="endpoint-fixture",
+            name="Endpoint Fixture",
+            app_type="claude",
+            settings={
+                "env": {
+                    "ANTHROPIC_BASE_URL": endpoint,
+                    "ANTHROPIC_MODEL": "fixture-model",
+                }
+            },
+            category=None,
+            provider_type=None,
+            is_current=True,
+            endpoints=[endpoint],
+        )
+        route = {
+            "role": "testing",
+            "task_type": "test",
+            "profile": provider.id,
+            "model_override": None,
+            "permission_mode": "plan",
+            "timeout_seconds": 30,
+            "reason": "fixture",
+            "route": {},
+            "auto_selection": None,
+            "selection_role": "testing",
+        }
+        with patch.object(server, "resolve_route", return_value=route), patch.object(
+            server, "get_provider", return_value=provider
+        ):
+            response = asyncio.run(
+                server.cc_pick_profile(server.PickProfileInput())
+            )
+        payload = response
+        self.assertIn(projected, payload)
+        for forbidden in (
+            "user",
+            "pass",
+            "private/path",
+            "query-secret",
+            "fragment-secret",
+        ):
+            self.assertNotIn(forbidden, payload)
+
+        malicious_provider = orchestrator.Provider(
+            id=secret_uri,
+            name=f"provider {secret_uri}",
+            app_type="claude",
+            settings={
+                "env": {
+                    "ANTHROPIC_BASE_URL": secret_uri,
+                    "ANTHROPIC_MODEL": secret_uri,
+                }
+            },
+            category=None,
+            provider_type=None,
+            is_current=True,
+            endpoints=[secret_uri],
+        )
+        malicious_route = {
+            **route,
+            "profile": secret_uri,
+            "reason": f"selected from {secret_uri}",
+        }
+        with patch.object(
+            server, "resolve_route", return_value=malicious_route
+        ), patch.object(
+            server, "get_provider", return_value=malicious_provider
+        ):
+            for response_format in (
+                server.ResponseFormat.JSON,
+                server.ResponseFormat.MARKDOWN,
+            ):
+                response = asyncio.run(
+                    server.cc_pick_profile(
+                        server.PickProfileInput(
+                            response_format=response_format
+                        )
+                    )
+                )
+                for forbidden in (
+                    "fixture-pass",
+                    "private/path",
+                    "fixture-query",
+                ):
+                    self.assertNotIn(forbidden, response)
+
+        with patch("builtins.print") as output:
+            orchestrator.print_json(
+                {"reason": f"selected from {secret_uri}", secret_uri: "x"}
+            )
+        rendered_cli = output.call_args.args[0]
+        self.assertNotIn("fixture-pass", rendered_cli)
+        self.assertNotIn("private/path", rendered_cli)
+        self.assertNotIn("fixture-query", rendered_cli)
+
+        with patch.object(
+            sys, "argv", ["cc-orchestrator", "pick"]
+        ), patch.object(
+            orchestrator, "resolve_route", return_value=route
+        ), patch.object(
+            orchestrator, "get_provider", return_value=provider
+        ), patch.object(orchestrator, "print_json") as cli_output:
+            self.assertEqual(orchestrator.main(), 0)
+        cli_payload = json.dumps(
+            cli_output.call_args.args[0], ensure_ascii=False
+        )
+        self.assertIn(projected, cli_payload)
+        for forbidden in (
+            "user",
+            "pass",
+            "private/path",
+            "query-secret",
+            "fragment-secret",
+        ):
+            self.assertNotIn(forbidden, cli_payload)
+
+    def test_punctuation_prefixed_https_uri_cannot_bypass_projection(self) -> None:
+        secret_uri = (
+            "https://prefix-user:prefix-pass@example.invalid/private/path"
+            "?token=prefix-token#prefix-fragment"
+        )
+        for prefix in (".", "+"):
+            with self.subTest(prefix=prefix):
+                decorated_uri = f"{prefix}{secret_uri}"
+                projected = orchestrator.project_public_endpoint_values(
+                    {
+                        "reason": decorated_uri,
+                        "callback_url": decorated_uri,
+                        decorated_uri: "mapping-value-must-not-survive",
+                    }
+                )
+                self.assertEqual(projected["reason"], "[REDACTED]")
+                self.assertEqual(projected["callback_url"], "[REDACTED]")
+                self.assertNotIn(decorated_uri, projected)
+                serialized = json.dumps(projected, ensure_ascii=False)
+                for forbidden in (
+                    "prefix-user",
+                    "prefix-pass",
+                    "private/path",
+                    "prefix-token",
+                    "prefix-fragment",
+                    "mapping-value-must-not-survive",
+                ):
+                    self.assertNotIn(forbidden, serialized)
+
+    def test_url_and_uri_contexts_project_nested_and_non_string_values(
+        self,
+    ) -> None:
+        secret_uri = (
+            "https://nested-user:nested-pass@example.invalid/private/path"
+            "?token=nested-query#nested-fragment"
+        )
+        projected = orchestrator.project_public_endpoint_values(
+            {
+                "callback_url": {
+                    "primary": secret_uri,
+                    "credentials": {
+                        "username": "plain-nested-user",
+                        "password": "plain-nested-pass",
+                    },
+                    "candidates": [8443, False, {"token": "plain-token"}, None],
+                },
+                "redirect_uri": 42,
+            }
+        )
+        self.assertEqual(
+            projected,
+            {
+                "callback_url": {
+                    "primary": "https://example.invalid",
+                    "credentials": {
+                        "username": "[REDACTED]",
+                        "password": "[REDACTED]",
+                    },
+                    "candidates": [
+                        "[REDACTED]",
+                        "[REDACTED]",
+                        {"token": "[REDACTED]"},
+                        None,
+                    ],
+                },
+                "redirect_uri": "[REDACTED]",
+            },
+        )
+        serialized = json.dumps(projected, ensure_ascii=False)
+        for forbidden in (
+            "nested-user",
+            "nested-pass",
+            "private/path",
+            "nested-query",
+            "nested-fragment",
+            "plain-token",
+        ):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_model_score_markdown_and_reports_apply_final_uri_projection(
+        self,
+    ) -> None:
+        server = importlib.import_module("server")
+        malicious_uri = (
+            "https://report-user:report-pass@example.invalid/private/model"
+            "?token=report-token#report-fragment"
+        )
+        safe_origin = "https://example.invalid"
+        forbidden_values = (
+            "report-user",
+            "report-pass",
+            "private/model",
+            "report-token",
+            "report-fragment",
+        )
+        scores = {
+            "models": [
+                {
+                    "model": malicious_uri,
+                    "profile_name": malicious_uri,
+                    "overall": 9.5,
+                    "role_scores": {"testing": 9.5},
+                }
+            ]
+        }
+        plan = {
+            "steps": [
+                {
+                    "role": "testing",
+                    "profile": malicious_uri,
+                    "model": malicious_uri,
+                    "permission_mode": "plan",
+                    "selection_score": 9.5,
+                }
+            ]
+        }
+
+        with patch.object(server, "score_models", return_value=scores):
+            markdown = asyncio.run(
+                server.cc_score_models(
+                    server.ListProfilesInput(
+                        response_format=server.ResponseFormat.MARKDOWN
+                    )
+                )
+            )
+        self.assertIn(safe_origin, markdown)
+        for forbidden in forbidden_values:
+            self.assertNotIn(forbidden, markdown)
+
+        with tempfile.TemporaryDirectory(prefix="report-projection-") as temp:
+            report_dir = Path(temp)
+            with patch.object(
+                orchestrator, "score_models", return_value=scores
+            ), patch.object(
+                orchestrator, "run_workflow_plan", return_value=plan
+            ):
+                result = orchestrator.write_reports(output_dir=report_dir)
+
+            persisted_scores = json.loads(
+                (report_dir / "model_scores.json").read_text(encoding="utf-8")
+            )
+            persisted_strategy = (
+                report_dir / "multi_agent_strategy.md"
+            ).read_text(encoding="utf-8")
+
+        self.assertEqual(persisted_scores["models"][0]["model"], safe_origin)
+        self.assertEqual(
+            persisted_scores["models"][0]["profile_name"], safe_origin
+        )
+        self.assertEqual(
+            result["workflow_plan"]["steps"][0]["profile"], safe_origin
+        )
+        self.assertEqual(
+            result["workflow_plan"]["steps"][0]["model"], safe_origin
+        )
+        self.assertIn(safe_origin, persisted_strategy)
+
+        public_outputs = {
+            "persisted_scores": json.dumps(
+                persisted_scores, ensure_ascii=False
+            ),
+            "persisted_strategy": persisted_strategy,
+            "returned_result": json.dumps(result, ensure_ascii=False),
+        }
+        for surface, content in public_outputs.items():
+            for forbidden in forbidden_values:
+                with self.subTest(surface=surface, forbidden=forbidden):
+                    self.assertNotIn(forbidden, content)
 
     def test_mock_runtime_fixture_is_not_a_public_request_field(self) -> None:
         server = importlib.import_module("server")
@@ -1023,7 +1664,18 @@ class PublicSurfaceContractTests(unittest.TestCase):
             "model_override": None,
             "reason": "fixture",
         }
-        prepared = SimpleNamespace()
+        prepared = SimpleNamespace(
+            metadata=lambda: {
+                "artifact_root": "fixture-artifact-root",
+                "profile": {"id": "fixture"},
+            },
+            launch_spec=SimpleNamespace(
+                runtime_id="trusted-default",
+                trust_level="trusted_default",
+                policy_decision_id="fixture-decision",
+            ),
+            sensitive_values=("visible-secret",),
+        )
         with tempfile.TemporaryDirectory(prefix="visible-surface-") as temp:
             root = Path(temp)
             paths = {
@@ -1040,6 +1692,7 @@ class PublicSurfaceContractTests(unittest.TestCase):
                 patch.object(orchestrator, "build_prompt", return_value="visible-secret"),
                 patch.object(orchestrator, "prepare_worker_launch", return_value=prepared) as prepare,
                 patch.object(orchestrator, "start_prepared_worker_launch", return_value={"ok": True}) as start,
+                patch.object(orchestrator, "_append_policy_security_audit") as audit,
             ):
                 result = orchestrator.run_visible_agent(
                     "visible-secret", allow_unsafe_runtime=True, cwd=root
@@ -1052,6 +1705,8 @@ class PublicSurfaceContractTests(unittest.TestCase):
         else:
             start.assert_not_called()
             self.assertEqual(result["status"], "visible_runtime_unsupported")
+            audit.assert_called_once()
+            self.assertIsNone(audit.call_args.kwargs["run_id"])
         source = inspect.getsource(orchestrator.run_visible_agent)
         self.assertNotIn("prompt.txt", source)
         self.assertNotIn("start-visible.ps1", source)
@@ -1319,6 +1974,7 @@ class QueueAuthorizationTests(unittest.TestCase):
             to_public_dict=lambda: {"canonical_path": identity, "sha256": identity},
         )
         launch_spec = SimpleNamespace(
+            runtime_id="fixture-runtime",
             trust_level="local_unsafe" if unsafe else "trusted_default",
             policy_decision_id=policy,
             executable_identity=executable,
@@ -1334,6 +1990,7 @@ class QueueAuthorizationTests(unittest.TestCase):
             result = orchestrator.queue_submit(
                 task,
                 context=context,
+                cwd=self.root,
                 allow_unsafe_runtime=True,
             )
         self.assertTrue(result["ok"])
@@ -1356,6 +2013,38 @@ class QueueAuthorizationTests(unittest.TestCase):
             self.assertNotIn(secret, response)
         self.assertIn(b"payload_reference", serialized)
         self.assertNotIn(b'"allow_unsafe_runtime"', serialized)
+
+    def test_queue_store_rejection_is_audited_without_prompt_text(self) -> None:
+        secret = "queue-store-secret-fixture"
+        with patch.object(
+            self.store,
+            "put",
+            side_effect=SecurePayloadStoreUnavailable(
+                "fixture protected store unavailable"
+            ),
+        ):
+            result = orchestrator.queue_submit(secret, cwd=self.root)
+
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(
+            result["security_error"]["code"],
+            "secure_payload_store_unavailable",
+        )
+        audit_root = (
+            self.root
+            / orchestrator.AGENT_WORKSPACE_DIRNAME
+            / orchestrator.ARTIFACT_NAMESPACE
+        )
+        health = orchestrator.security_audit_health(audit_root)
+        self.assertTrue(health["ok"], health)
+        self.assertEqual(
+            health["counts_by_code"].get("secure_payload_store_unavailable"),
+            1,
+        )
+        audit_bytes = orchestrator._security_audit_paths(audit_root)[
+            "log"
+        ].read_bytes()
+        self.assertNotIn(secret.encode("utf-8"), audit_bytes)
 
     def test_unsafe_grant_is_consumed_once_and_replay_is_blocked(self) -> None:
         _result, prepared = self._submit_unsafe()
@@ -1839,6 +2528,26 @@ class QueueAuthorizationTests(unittest.TestCase):
                 launch.assert_not_called()
                 self.assertEqual(result["jobs"][0]["status"], "failed")
                 self.assertEqual(result["jobs"][0]["unsafe_runtime_grant"]["uses_remaining"], 0)
+                self.assertEqual(len(result["attempts"]), 1, result)
+                self.assertEqual(
+                    result["attempts"][0]["security_error"]["code"],
+                    (
+                        "runtime_policy_drift"
+                        if changed.launch_spec.policy_decision_id == "policy-b"
+                        else "runtime_identity_changed"
+                    ),
+                )
+        audit_root = (
+            self.root
+            / orchestrator.AGENT_WORKSPACE_DIRNAME
+            / orchestrator.ARTIFACT_NAMESPACE
+        )
+        health = orchestrator.security_audit_health(audit_root)
+        self.assertTrue(health["ok"], health)
+        self.assertEqual(health["counts_by_code"].get("runtime_policy_drift"), 1)
+        self.assertEqual(
+            health["counts_by_code"].get("runtime_identity_changed"), 1
+        )
 
     def test_concurrent_ticks_claim_and_start_only_once(self) -> None:
         _result, prepared = self._submit_unsafe()

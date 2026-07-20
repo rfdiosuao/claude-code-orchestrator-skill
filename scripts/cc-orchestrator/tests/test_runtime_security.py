@@ -30,6 +30,14 @@ from runtime_security import (
 ExecutableIdentity = getattr(runtime_security, "ExecutableIdentity", None)
 RuntimeLaunchSpec = getattr(runtime_security, "RuntimeLaunchSpec", None)
 build_runtime_launch_spec = getattr(runtime_security, "build_runtime_launch_spec", None)
+build_safe_security_event = getattr(
+    runtime_security, "build_safe_security_event", None
+)
+chain_security_event = getattr(runtime_security, "chain_security_event", None)
+provider_pseudonym = getattr(runtime_security, "provider_pseudonym", None)
+verify_security_event_chain = getattr(
+    runtime_security, "verify_security_event_chain", None
+)
 
 
 ABSOLUTE_DENY_CASES = [
@@ -1088,6 +1096,155 @@ class RuntimeAuthorizationTests(unittest.TestCase):
                         allow_unsafe_runtime=True,
                     )
                 self.assertEqual(raised.exception.code, "runtime_identity_changed")
+
+
+class SecurityAuditSchemaTests(unittest.TestCase):
+    def setUp(self) -> None:
+        for function in (
+            build_safe_security_event,
+            chain_security_event,
+            provider_pseudonym,
+            verify_security_event_chain,
+        ):
+            self.assertIsNotNone(function)
+        self.key = bytes(range(32))
+
+    def _event(self, **overrides: object) -> dict[str, object]:
+        values: dict[str, object] = {
+            "audit_key": self.key,
+            "timestamp": "2026-07-20T00:00:00+00:00",
+            "code": "runtime_not_trusted",
+            "severity": "high",
+            "run_id": "20260720T000000Z-1234abcd",
+            "runtime_id": "claude-code",
+            "trust_level": "trusted_default",
+            "provider_id": "private-provider-id",
+            "policy_decision_id": "decision-1234",
+            "safe_details": {
+                "canonical_path": "must-not-be-persisted",
+                "environment_key": "ANTHROPIC_API_KEY",
+            },
+            "recommended_action": "Review runtime policy and retry.",
+        }
+        values.update(overrides)
+        return build_safe_security_event(**values)
+
+    def test_schema_is_allowlisted_and_provider_is_hmac_pseudonymized(self) -> None:
+        event = self._event()
+        self.assertEqual(
+            set(event),
+            {
+                "schema_version",
+                "timestamp",
+                "code",
+                "severity",
+                "run_id",
+                "runtime_id",
+                "trust_level",
+                "provider_pseudonym",
+                "policy_decision_id",
+                "dedupe_id",
+                "safe_fields",
+                "recommended_action",
+            },
+        )
+        serialized = json.dumps(event, sort_keys=True)
+        self.assertNotIn("private-provider-id", serialized)
+        self.assertNotIn("must-not-be-persisted", serialized)
+        self.assertNotIn("ANTHROPIC_API_KEY", serialized)
+        self.assertIsNone(event["dedupe_id"])
+        self.assertEqual(
+            event["safe_fields"],
+            ["canonical_path", "environment_key"],
+        )
+        self.assertTrue(str(event["provider_pseudonym"]).startswith("hmac-sha256:v1:"))
+        self.assertEqual(
+            event["provider_pseudonym"],
+            provider_pseudonym(self.key, "private-provider-id"),
+        )
+        self.assertNotEqual(
+            event["provider_pseudonym"],
+            provider_pseudonym(self.key, "another-provider"),
+        )
+
+    def test_runtime_and_provider_ids_allow_bounded_non_slug_text(self) -> None:
+        event = self._event(
+            runtime_id="Local Claude / reviewed",
+            provider_id="provider/team alpha",
+        )
+        serialized = json.dumps(event, sort_keys=True)
+        self.assertEqual(event["runtime_id"], "Local Claude / reviewed")
+        self.assertTrue(
+            str(event["provider_pseudonym"]).startswith("hmac-sha256:v1:")
+        )
+        self.assertNotIn("provider/team alpha", serialized)
+
+    def test_dedupe_id_is_keyed_stable_and_never_serializes_its_input(self) -> None:
+        dedupe_key = "status-identity:private-run:internal_worker:mismatch"
+        first = self._event(dedupe_key=dedupe_key)
+        second = self._event(dedupe_key=dedupe_key)
+        other_event = self._event(dedupe_key=dedupe_key + ":other")
+        other_audit_key = self._event(
+            audit_key=bytes(reversed(range(32))), dedupe_key=dedupe_key
+        )
+
+        self.assertEqual(first["dedupe_id"], second["dedupe_id"])
+        self.assertNotEqual(first["dedupe_id"], other_event["dedupe_id"])
+        self.assertNotEqual(first["dedupe_id"], other_audit_key["dedupe_id"])
+        self.assertTrue(str(first["dedupe_id"]).startswith("hmac-sha256:v1:"))
+        self.assertNotIn(dedupe_key, json.dumps(first, sort_keys=True))
+
+    def test_pre_run_event_allows_null_run_and_provider(self) -> None:
+        event = self._event(run_id=None, provider_id=None)
+        self.assertIsNone(event["run_id"])
+        self.assertIsNone(event["provider_pseudonym"])
+
+    def test_schema_rejects_controls_invalid_identifiers_and_non_key_details(self) -> None:
+        invalid = (
+            {"severity": "low"},
+            {"code": "bad code"},
+            {"run_id": "../escape"},
+            {"recommended_action": "line one\nline two"},
+            {"safe_details": {"bad field": "value"}},
+        )
+        for overrides in invalid:
+            with self.subTest(overrides=overrides), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                self._event(**overrides)
+
+    def test_hash_chain_detects_mutation_deletion_and_reordering(self) -> None:
+        first = chain_security_event(self._event(), previous_hash=None)
+        second = chain_security_event(
+            self._event(
+                code="process_identity_mismatch",
+                severity="critical",
+                timestamp="2026-07-20T00:00:01+00:00",
+                recommended_action=(
+                    "Inspect the recorded process identity and clean up manually."
+                ),
+            ),
+            previous_hash=first["record_hash"],
+        )
+        valid = verify_security_event_chain([first, second])
+        self.assertTrue(valid["ok"], valid)
+        self.assertEqual(valid["count"], 2)
+
+        mutated = [dict(first), dict(second)]
+        mutated[0]["severity"] = "critical"
+        self.assertFalse(verify_security_event_chain(mutated)["ok"])
+        self.assertFalse(verify_security_event_chain([second])["ok"])
+        self.assertFalse(
+            verify_security_event_chain([second, first])["ok"]
+        )
+
+    def test_chain_serializer_rejects_nan_and_oversized_events(self) -> None:
+        event = self._event()
+        event["unexpected"] = float("nan")
+        with self.assertRaises((TypeError, ValueError)):
+            chain_security_event(event, previous_hash=None)
+        with self.assertRaises((TypeError, ValueError)):
+            self._event(recommended_action="x" * (16 * 1024))
 
 
 class RuntimeSecurityErrorTests(unittest.TestCase):

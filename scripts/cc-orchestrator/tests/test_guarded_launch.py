@@ -6,6 +6,7 @@ import ctypes
 import hashlib
 import io
 import json
+import multiprocessing
 import os
 import shutil
 import socket
@@ -42,6 +43,163 @@ from runtime_security import (  # noqa: E402
 
 FAKE_PROVIDER_SECRET = "fixture-provider-secret-7d1f"
 REAL_ENFORCE_COST_GUARD = orchestrator.enforce_cost_guard
+
+
+def _spawn_security_audit_append(
+    artifact_root: str,
+    index: int,
+    ready: object,
+    start: object,
+    results: object,
+) -> None:
+    try:
+        ready.put(index)
+        if not start.wait(15):
+            raise RuntimeError("spawned audit start gate timed out")
+        path = orchestrator.append_security_event(
+            artifact_root=Path(artifact_root),
+            code="runtime_not_trusted",
+            severity="high",
+            run_id=None,
+            runtime_id="claude-code",
+            trust_level=None,
+            provider_id=f"provider-{index}",
+            policy_decision_id=None,
+            safe_details={"environment_key": f"never-persist-{index}"},
+            recommended_action="Review runtime policy and retry.",
+            known_secrets=(f"never-persist-{index}",),
+        )
+        results.put((index, "ok", str(path)))
+    except BaseException as exc:
+        results.put((index, "error", f"{type(exc).__name__}: {exc}"))
+
+
+def _spawn_security_audit_failure(
+    artifact_root: str, results: object
+) -> None:
+    try:
+        with patch.object(
+            orchestrator,
+            "_append_security_event_inner",
+            side_effect=OSError("fixture cross-process audit failure"),
+        ):
+            try:
+                orchestrator.append_security_event(
+                    artifact_root=Path(artifact_root),
+                    code="runtime_not_trusted",
+                    severity="high",
+                    run_id=None,
+                    runtime_id="claude-code",
+                    trust_level=None,
+                    provider_id="provider-failure-fixture",
+                    policy_decision_id=None,
+                    safe_details={"component": "fixture"},
+                    recommended_action="Review runtime policy and retry.",
+                )
+            except OSError:
+                pass
+        results.put(("ok",))
+    except BaseException as exc:
+        results.put(("error", f"{type(exc).__name__}: {exc}"))
+
+
+def _spawn_security_audit_failure_then_wait(
+    artifact_root: str,
+    ready: object,
+    resume: object,
+    results: object,
+) -> None:
+    try:
+        with patch.object(
+            orchestrator,
+            "_append_security_event_inner",
+            side_effect=OSError("fixture long-lived audit failure"),
+        ):
+            try:
+                orchestrator.append_security_event(
+                    artifact_root=Path(artifact_root),
+                    code="runtime_not_trusted",
+                    severity="high",
+                    run_id=None,
+                    runtime_id="claude-code",
+                    trust_level=None,
+                    provider_id="provider-long-lived-failure-fixture",
+                    policy_decision_id=None,
+                    safe_details={"component": "fixture"},
+                    recommended_action="Review runtime policy and retry.",
+                )
+            except OSError:
+                pass
+        ready.set()
+        if not resume.wait(30):
+            raise RuntimeError("audit recovery gate timed out")
+        results.put(("ok", orchestrator.security_audit_health(artifact_root)))
+    except BaseException as exc:
+        results.put(("error", f"{type(exc).__name__}: {exc}"))
+
+
+def _spawn_security_audit_initialization_failure(
+    artifact_root: str, results: object
+) -> None:
+    try:
+        with patch.object(
+            orchestrator,
+            "_ensure_strict_private_directory",
+            side_effect=OSError("fixture first audit directory failure"),
+        ):
+            try:
+                orchestrator.append_security_event(
+                    artifact_root=Path(artifact_root),
+                    code="runtime_not_trusted",
+                    severity="high",
+                    run_id=None,
+                    runtime_id="claude-code",
+                    trust_level=None,
+                    provider_id="provider-bootstrap-failure-fixture",
+                    policy_decision_id=None,
+                    safe_details={"component": "fixture"},
+                    recommended_action="Review runtime policy and retry.",
+                )
+            except OSError:
+                pass
+        results.put(("ok",))
+    except BaseException as exc:
+        results.put(("error", f"{type(exc).__name__}: {exc}"))
+
+
+def _spawn_security_audit_health(
+    artifact_root: str, results: object
+) -> None:
+    try:
+        results.put(("ok", orchestrator.security_audit_health(artifact_root)))
+    except BaseException as exc:
+        results.put(("error", f"{type(exc).__name__}: {exc}"))
+
+
+def _spawn_identity_status_poll(
+    workspace: str,
+    artifact_root: str,
+    runs_dir: str,
+    run_id: str,
+    index: int,
+    ready: object,
+    start: object,
+    results: object,
+) -> None:
+    try:
+        orchestrator.WORKSPACE_ROOT = Path(workspace)
+        orchestrator.ARTIFACT_ROOT = Path(artifact_root)
+        orchestrator.RUNS_DIR = Path(runs_dir)
+        orchestrator.RUN_INDEX_DIR = Path(runs_dir) / "index"
+        ready.put(index)
+        if not start.wait(15):
+            raise RuntimeError("spawned status start gate timed out")
+        status = orchestrator.single_run_status(
+            run_id, include_output_tail=False
+        )
+        results.put((index, "ok", status["worker_identity_state"]))
+    except BaseException as exc:
+        results.put((index, "error", f"{type(exc).__name__}: {exc}"))
 
 
 def _native_unprivileged_ubuntu_or_macos() -> bool:
@@ -1038,12 +1196,13 @@ class ReviewFixArtifactTests(GuardedLaunchFixture):
             )
             self.assertEqual(granted.returncode, 0, granted.stderr)
             orchestrator._enforce_windows_private_acl(
-                path, is_dir=path.is_dir()
+                path, is_dir=path.is_dir(), set_owner=True
             )
             acl = orchestrator._inspect_windows_private_acl(
                 path, is_dir=path.is_dir()
             )
             self.assertTrue(acl["protected"])
+            self.assertEqual(acl["owner_sid"], acl["current_user_sid"])
             self.assertEqual(acl["ace_sids"], [acl["current_user_sid"]])
             self.assertFalse(acl["has_inherited_aces"])
             self.assertTrue(acl["exact"])
@@ -1214,6 +1373,76 @@ class ReviewFixScrubbingTests(GuardedLaunchFixture):
             self.assertNotIn(value, json.dumps(streaming, ensure_ascii=False))
         self.assertIn("[REDACTED]", (one_dir / "stdout.txt").read_text(encoding="utf-8"))
         self.assertIn("[REDACTED]", (stream_dir / "events.ndjson").read_text(encoding="utf-8"))
+
+    def test_runtime_json_mapping_keys_are_scrubbed_on_every_surface(self) -> None:
+        self.fake_runtime.write_text(
+            "\n".join(
+                [
+                    "import json, os, sys",
+                    "prompt = sys.stdin.buffer.read().decode('utf-8')",
+                    "secret = os.environ['ANTHROPIC_API_KEY']",
+                    "payload = {prompt: 'prompt-key', secret: 'secret-key', '[REDACTED]': 'literal-key', 'nested': {prompt: 'nested-prompt-key'}}",
+                    "print(json.dumps(payload), flush=True)",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        task = "mapping-key-prompt-fixture-4a91"
+        context = "mapping-key-context-fixture-8b27"
+        prompt = orchestrator.build_prompt(
+            "implementation",
+            task,
+            context,
+            artifact_root=self.artifact_root,
+        )
+
+        one_shot = orchestrator.run_agent(
+            task, context=context, cwd=self.workspace
+        )
+        streaming = orchestrator.run_streaming_agent(
+            task, context=context, cwd=self.workspace
+        )
+        stream_dir = self.runs_dir / str(streaming["run_id"])
+        terminal = self._wait_for_terminal_metadata(stream_dir)
+        if isinstance(terminal.get("worker_pid"), int):
+            self._wait_for_pid_exit(int(terminal["worker_pid"]))
+
+        runs = (
+            (one_shot, self.runs_dir / str(one_shot["run_id"])),
+            (streaming, stream_dir),
+        )
+        forbidden = (prompt, task, context, FAKE_PROVIDER_SECRET)
+        for response, run_dir in runs:
+            with self.subTest(run_id=run_dir.name):
+                status = orchestrator.single_run_status(
+                    run_dir.name, include_output_tail=True
+                )
+                stdout = (run_dir / "stdout.txt").read_text(encoding="utf-8")
+                events = (run_dir / "events.ndjson").read_text(encoding="utf-8")
+                public_surfaces = (
+                    stdout,
+                    events,
+                    json.dumps(status, ensure_ascii=False),
+                    json.dumps(response, ensure_ascii=False),
+                )
+                artifacts = self._scan_run(run_dir)
+                for value in forbidden:
+                    escaped = json.dumps(value, ensure_ascii=False)[1:-1]
+                    for surface in public_surfaces:
+                        self.assertNotIn(value, surface)
+                        self.assertNotIn(escaped, surface)
+                    self.assertNotIn(value.encode("utf-8"), artifacts)
+                    self.assertNotIn(escaped.encode("utf-8"), artifacts)
+
+                output = json.loads(stdout)
+                self.assertEqual(output["[REDACTED]"], "prompt-key")
+                self.assertEqual(output["[REDACTED]#2"], "secret-key")
+                self.assertEqual(output["[REDACTED]#3"], "literal-key")
+                self.assertEqual(
+                    output["nested"]["[REDACTED]"],
+                    "nested-prompt-key",
+                )
 
 
 class ReviewFixGateAndOwnershipTests(GuardedLaunchFixture):
@@ -1802,7 +2031,8 @@ class SecondReviewTransportTests(GuardedLaunchFixture):
         )
         self.assertEqual(metadata["status"], "timed_out", metadata)
         self.assertLess(time.monotonic() - started, 6.0)
-        self._wait_for_pid_exit(int(metadata["child_pid"]))
+        if metadata.get("child_pid") is not None:
+            self._wait_for_pid_exit(int(metadata["child_pid"]))
         self._wait_for_pid_exit(int(metadata["worker_pid"]))
 
 
@@ -1949,6 +2179,919 @@ class SecondReviewScrubAndScannerTests(GuardedLaunchFixture):
             orchestrator.classify_secret_line(
                 "prefix sk-abcdefghijklmnopqrstuvwxyz", "fixture", 1
             )
+        )
+
+
+class SecurityAuditWriterTests(GuardedLaunchFixture):
+    def _append(self, **overrides: object) -> Path:
+        values: dict[str, object] = {
+            "artifact_root": self.artifact_root,
+            "code": "runtime_not_trusted",
+            "severity": "high",
+            "run_id": None,
+            "runtime_id": "claude-code",
+            "trust_level": None,
+            "provider_id": "provider-fixture",
+            "policy_decision_id": None,
+            "safe_details": {"environment_key": "not-persisted"},
+            "recommended_action": "Review runtime policy and retry.",
+            "known_secrets": (),
+        }
+        values.update(overrides)
+        return orchestrator.append_security_event(**values)
+
+    def test_spawned_first_use_creates_one_key_and_one_valid_record_per_process(
+        self,
+    ) -> None:
+        context = multiprocessing.get_context("spawn")
+        ready = context.Queue()
+        start = context.Event()
+        results = context.Queue()
+        processes = [
+            context.Process(
+                target=_spawn_security_audit_append,
+                args=(str(self.artifact_root), index, ready, start, results),
+            )
+            for index in range(8)
+        ]
+        for process in processes:
+            process.start()
+        for _process in processes:
+            ready.get(timeout=20)
+        start.set()
+        observed = [results.get(timeout=30) for _process in processes]
+        for process in processes:
+            process.join(30)
+            self.assertEqual(process.exitcode, 0)
+        self.assertEqual(
+            [item for item in observed if item[1] != "ok"], [], observed
+        )
+        key = self.artifact_root / "config" / "runtime_security.audit.key"
+        self.assertEqual(len(key.read_bytes()), 32)
+        health = orchestrator.security_audit_health(self.artifact_root)
+        self.assertTrue(health["ok"], health)
+        self.assertEqual(health["event_count"], len(processes))
+        lines = (
+            self.artifact_root / "logs" / "security-events.ndjson"
+        ).read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), len(processes))
+        self.assertTrue(all(isinstance(json.loads(line), dict) for line in lines))
+
+    def test_values_short_secrets_and_url_credentials_never_reach_the_log(self) -> None:
+        short_secret = "x7Q"
+        endpoint = "https://user:pass@example.test/private?token=query#fragment"
+        path = self._append(
+            safe_details={
+                "short_secret": short_secret,
+                "provider_endpoint": endpoint,
+            },
+            known_secrets=(short_secret, "user", "pass", "query"),
+        )
+        payload = path.read_text(encoding="utf-8")
+        for forbidden in (short_secret, endpoint, "user", "pass", "query"):
+            self.assertNotIn(forbidden, payload)
+        self.assertIn("provider_endpoint", payload)
+        self.assertIn("short_secret", payload)
+
+    def test_dedupe_key_makes_retried_append_idempotent(self) -> None:
+        dedupe_key = "status-identity:private-run:internal_worker:mismatch"
+        path = self._append(dedupe_key=dedupe_key)
+        self._append(dedupe_key=dedupe_key)
+        self.assertEqual(len(path.read_text(encoding="utf-8").splitlines()), 1)
+        self._append(dedupe_key=dedupe_key + ":other")
+        self.assertEqual(len(path.read_text(encoding="utf-8").splitlines()), 2)
+
+    def test_fixed_audit_words_do_not_collide_with_known_secret_values(self) -> None:
+        path = self._append(
+            known_secrets=("high", "Review runtime policy and retry.")
+        )
+        health = orchestrator.security_audit_health(self.artifact_root)
+        self.assertTrue(health["ok"], health)
+        self.assertEqual(health["event_count"], 1)
+        self.assertIn('"severity":"high"', path.read_text(encoding="utf-8"))
+
+    def test_link_targets_and_tail_truncation_fail_closed(self) -> None:
+        paths = orchestrator._security_audit_paths(self.artifact_root)
+        orchestrator._prepare_security_audit_directories(paths)
+        outside = self.workspace / "outside-audit"
+        outside.mkdir()
+        logs = self.artifact_root / "logs"
+        try:
+            os.symlink(outside, logs, target_is_directory=True)
+        except OSError:
+            logs = None
+        if logs is not None:
+            with self.assertRaises(orchestrator.OrchestratorError):
+                self._append()
+            logs.unlink()
+
+        path = self._append()
+        self._append(provider_id="provider-second")
+        original = path.read_bytes()
+        path.write_bytes(original.splitlines(keepends=True)[0])
+        health = orchestrator.security_audit_health(self.artifact_root)
+        self.assertFalse(health["ok"], health)
+        self.assertIsNotNone(health["recommended_action"])
+        with self.assertRaises(orchestrator.OrchestratorError):
+            self._append(provider_id="provider-third")
+
+    def test_existing_key_rejects_empty_log_without_zero_checkpoint(self) -> None:
+        self._append()
+        paths = orchestrator._security_audit_paths(self.artifact_root)
+        paths["log"].write_bytes(b"")
+        paths["checkpoint"].unlink()
+        health = orchestrator.security_audit_health(self.artifact_root)
+        self.assertFalse(health["ok"], health)
+        with self.assertRaises(orchestrator.OrchestratorError):
+            self._append(provider_id="provider-reset-attempt")
+
+    def test_real_audit_lock_backend_failure_has_a_hard_timeout(self) -> None:
+        self._append()
+        if os.name == "nt":
+            import msvcrt
+
+            backend_patch = patch.object(
+                msvcrt,
+                "locking",
+                side_effect=OSError(
+                    orchestrator.errno.EACCES, "fixture lock failure"
+                ),
+            )
+        else:
+            import fcntl
+
+            backend_patch = patch.object(
+                fcntl,
+                "flock",
+                side_effect=OSError(
+                    orchestrator.errno.EACCES, "fixture lock failure"
+                ),
+            )
+        started = time.monotonic()
+        with patch.object(
+            orchestrator, "SECURITY_AUDIT_LOCK_TIMEOUT_SECONDS", 0.05
+        ), backend_patch, self.assertRaises(TimeoutError):
+            self._append(provider_id="provider-lock-timeout")
+        self.assertLess(time.monotonic() - started, 0.75)
+
+    def test_initialized_workspace_is_ready_for_strict_audit_and_launch_dirs(
+        self,
+    ) -> None:
+        initialized = orchestrator.init_workspace(
+            self.workspace, write_claude=False
+        )
+        self.assertTrue(initialized["ok"], initialized)
+        paths = orchestrator.workspace_paths(self.workspace)
+        audit_paths = orchestrator._security_audit_paths(
+            paths["artifact_root"]
+        )
+        orchestrator._prepare_security_audit_directories(audit_paths)
+        orchestrator._verify_private_path(paths["artifact_root"], is_dir=True)
+        orchestrator._verify_private_path(paths["runs"], is_dir=True)
+        event_log = self._append(artifact_root=paths["artifact_root"])
+        self.assertTrue(event_log.exists())
+
+    def test_existing_uninitialized_artifact_root_migrates_without_owner_takeover(
+        self,
+    ) -> None:
+        self.artifact_root.mkdir(parents=True)
+        owner_before = None
+        if os.name == "nt":
+            owner_before = orchestrator._inspect_windows_private_acl(
+                self.artifact_root, is_dir=True
+            )["owner_sid"]
+        uninitialized = orchestrator.security_audit_health(
+            self.artifact_root
+        )
+        self.assertTrue(uninitialized["ok"], uninitialized)
+        self.assertFalse(uninitialized["initialized"], uninitialized)
+
+        self._append()
+        initialized = orchestrator.security_audit_health(self.artifact_root)
+        self.assertTrue(initialized["ok"], initialized)
+        self.assertTrue(initialized["initialized"], initialized)
+        if os.name == "nt":
+            root_acl = orchestrator._inspect_windows_private_acl(
+                self.artifact_root, is_dir=True
+            )
+            self.assertTrue(root_acl["dacl_exact"], root_acl)
+            self.assertEqual(root_acl["owner_sid"], owner_before)
+            for directory in (
+                self.artifact_root / "config",
+                self.artifact_root / "logs",
+            ):
+                self.assertTrue(
+                    orchestrator._inspect_windows_private_acl(
+                        directory, is_dir=True
+                    )["exact"]
+                )
+
+    def test_checkpoint_failure_is_reported_as_degraded(self) -> None:
+        real_write = orchestrator._atomic_write_bytes
+
+        def fail_checkpoint(path: Path, payload: bytes, **kwargs: object) -> None:
+            if Path(path).name == "security-events.checkpoint.json":
+                raise OSError("fixture checkpoint failure")
+            real_write(path, payload, **kwargs)
+
+        with patch.object(
+            orchestrator, "_atomic_write_bytes", side_effect=fail_checkpoint
+        ), self.assertRaises(OSError):
+            self._append()
+        health = orchestrator.security_audit_health(self.artifact_root)
+        self.assertFalse(health["ok"], health)
+        self.assertEqual(health["event_count"], 0)
+
+    def test_first_initialization_failure_uses_cross_process_bootstrap_marker(
+        self,
+    ) -> None:
+        context = multiprocessing.get_context("spawn")
+        results = context.Queue()
+        failure_process = context.Process(
+            target=_spawn_security_audit_initialization_failure,
+            args=(str(self.artifact_root), results),
+        )
+        failure_process.start()
+        failure_observed = results.get(timeout=30)
+        failure_process.join(30)
+        self.assertEqual(failure_process.exitcode, 0)
+        self.assertEqual(failure_observed, ("ok",))
+
+        paths = orchestrator._security_audit_paths(self.artifact_root)
+        self.assertFalse(paths["failures"].exists())
+        bootstrap_markers = list(paths["bootstrap_failures"].iterdir())
+        self.assertEqual(len(bootstrap_markers), 1, bootstrap_markers)
+
+        health_process = context.Process(
+            target=_spawn_security_audit_health,
+            args=(str(self.artifact_root), results),
+        )
+        health_process.start()
+        health_observed = results.get(timeout=30)
+        health_process.join(30)
+        self.assertEqual(health_process.exitcode, 0)
+        self.assertEqual(health_observed[0], "ok", health_observed)
+        degraded = health_observed[1]
+        self.assertFalse(degraded["ok"], degraded)
+        self.assertEqual(degraded["failure_count"], 1, degraded)
+
+        self._append(provider_id="provider-bootstrap-recovery-fixture")
+        recovered = orchestrator.security_audit_health(self.artifact_root)
+        self.assertTrue(recovered["ok"], recovered)
+        self.assertTrue(recovered["initialized"], recovered)
+        self.assertEqual(recovered["failure_count"], 0, recovered)
+        self.assertEqual(list(paths["bootstrap_failures"].iterdir()), [])
+        self.assertEqual(list(paths["failures"].iterdir()), [])
+
+    def test_health_schema_keeps_zero_failure_count_when_clean(self) -> None:
+        expected_schema = {
+            "ok",
+            "initialized",
+            "tamper_evident_local_only",
+            "event_count",
+            "counts_by_code",
+            "counts_by_severity",
+            "failure_count",
+            "recommended_action",
+            "log_bytes",
+            "max_log_bytes",
+            "remaining_log_bytes",
+            "capacity_ratio",
+        }
+        uninitialized = orchestrator.security_audit_health(self.artifact_root)
+        self.assertEqual(set(uninitialized), expected_schema, uninitialized)
+        self.assertTrue(uninitialized["ok"], uninitialized)
+        self.assertFalse(uninitialized["initialized"], uninitialized)
+        self.assertEqual(uninitialized["failure_count"], 0, uninitialized)
+
+        self._append(provider_id="provider-healthy-schema-fixture")
+        healthy = orchestrator.security_audit_health(self.artifact_root)
+        self.assertEqual(set(healthy), expected_schema, healthy)
+        self.assertTrue(healthy["ok"], healthy)
+        self.assertTrue(healthy["initialized"], healthy)
+        self.assertEqual(healthy["failure_count"], 0, healthy)
+
+    def test_initialized_failure_marker_requires_both_persistence_trees(
+        self,
+    ) -> None:
+        for failed_tree in ("bootstrap_failures", "failures"):
+            with self.subTest(failed_tree=failed_tree):
+                root = self.workspace / f"audit-marker-{failed_tree}"
+                self._append(artifact_root=root)
+                paths = orchestrator._security_audit_paths(root)
+                real_create = orchestrator._create_private_file_once
+
+                def fail_one_tree(path: Path, payload: bytes) -> bool:
+                    if Path(path).parent == paths[failed_tree]:
+                        raise OSError(f"fixture {failed_tree} marker failure")
+                    return real_create(path, payload)
+
+                with patch.object(
+                    orchestrator,
+                    "_create_private_file_once",
+                    side_effect=fail_one_tree,
+                ), self.assertRaises(orchestrator.OrchestratorError):
+                    orchestrator._mark_security_audit_failure(
+                        root, OSError("fixture append failure")
+                    )
+
+                degraded = orchestrator.security_audit_health(root)
+                self.assertFalse(degraded["ok"], degraded)
+                self.assertEqual(degraded["failure_count"], 1, degraded)
+                self._append(
+                    artifact_root=root,
+                    provider_id=f"provider-recover-{failed_tree}",
+                )
+                recovered = orchestrator.security_audit_health(root)
+                self.assertTrue(recovered["ok"], recovered)
+                self.assertEqual(recovered["failure_count"], 0, recovered)
+
+    def test_audit_failure_marker_survives_process_exit_until_success(self) -> None:
+        self._append()
+        context = multiprocessing.get_context("spawn")
+        results = context.Queue()
+        process = context.Process(
+            target=_spawn_security_audit_failure,
+            args=(str(self.artifact_root), results),
+        )
+        process.start()
+        observed = results.get(timeout=30)
+        process.join(30)
+        self.assertEqual(process.exitcode, 0)
+        self.assertEqual(observed, ("ok",))
+
+        degraded = orchestrator.security_audit_health(self.artifact_root)
+        self.assertFalse(degraded["ok"], degraded)
+        self.assertIn("last_failure", degraded)
+        failure_dir = orchestrator._security_audit_paths(
+            self.artifact_root
+        )["failures"]
+        self.assertEqual(len(list(failure_dir.iterdir())), 1)
+
+        self._append(provider_id="provider-recovery-fixture")
+        recovered = orchestrator.security_audit_health(self.artifact_root)
+        self.assertTrue(recovered["ok"], recovered)
+        self.assertEqual(list(failure_dir.iterdir()), [])
+
+    def test_older_success_cannot_clear_a_newer_failure_generation(self) -> None:
+        self._append()
+        orchestrator._mark_security_audit_failure(
+            self.artifact_root, OSError("fixture older failure")
+        )
+        real_clear = orchestrator._clear_security_audit_failures
+        injected = False
+
+        def inject_new_failure(markers: tuple[Path, ...]) -> None:
+            nonlocal injected
+            if not injected:
+                injected = True
+                orchestrator._mark_security_audit_failure(
+                    self.artifact_root,
+                    OSError("fixture newer concurrent failure"),
+                )
+            real_clear(markers)
+
+        with patch.object(
+            orchestrator,
+            "_clear_security_audit_failures",
+            side_effect=inject_new_failure,
+        ):
+            self._append(provider_id="provider-racing-success")
+
+        degraded = orchestrator.security_audit_health(self.artifact_root)
+        self.assertFalse(degraded["ok"], degraded)
+        self.assertEqual(degraded["failure_count"], 1, degraded)
+        self._append(provider_id="provider-after-newer-failure")
+        recovered = orchestrator.security_audit_health(self.artifact_root)
+        self.assertTrue(recovered["ok"], recovered)
+
+    def test_other_process_success_clears_stale_in_memory_failure(self) -> None:
+        self._append()
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        resume = context.Event()
+        results = context.Queue()
+        process = context.Process(
+            target=_spawn_security_audit_failure_then_wait,
+            args=(str(self.artifact_root), ready, resume, results),
+        )
+        process.start()
+        self.assertTrue(ready.wait(30))
+        degraded = orchestrator.security_audit_health(self.artifact_root)
+        self.assertFalse(degraded["ok"], degraded)
+
+        self._append(provider_id="provider-cross-process-recovery")
+        resume.set()
+        observed = results.get(timeout=30)
+        process.join(30)
+        self.assertEqual(process.exitcode, 0)
+        self.assertEqual(observed[0], "ok", observed)
+        self.assertTrue(observed[1]["ok"], observed)
+
+    def test_private_directory_creation_retains_parent_without_delete_sharing(
+        self,
+    ) -> None:
+        opened: list[dict[str, object]] = []
+
+        @contextlib.contextmanager
+        def fake_open(path: Path, **kwargs: object) -> object:
+            opened.append(dict(kwargs))
+            yield object(), {}
+
+        with patch.object(
+            orchestrator,
+            "_open_windows_managed_directory",
+            side_effect=fake_open,
+        ), patch.object(
+            orchestrator,
+            "_create_windows_private_directory_handle",
+            return_value=object(),
+        ), patch.object(
+            orchestrator,
+            "_windows_relative_handle_details",
+            return_value={"attributes": 0x10},
+        ), patch.object(
+            orchestrator,
+            "_inspect_windows_private_acl_handle",
+            return_value={"exact": True, "dacl_exact": True},
+        ), patch.object(orchestrator, "_close_windows_handle"):
+            orchestrator._secure_windows_private_directory(
+                self.artifact_root / "private-fixture", strict_owner=True
+            )
+
+        self.assertEqual(len(opened), 1)
+        self.assertIs(opened[0].get("share_delete"), False)
+
+    def test_existing_private_directory_opens_without_delete_sharing(self) -> None:
+        parent_handle = object()
+        child_handle = object()
+        parent_opens: list[dict[str, object]] = []
+
+        @contextlib.contextmanager
+        def fake_parent_open(path: Path, **kwargs: object) -> object:
+            del path
+            parent_opens.append(dict(kwargs))
+            yield parent_handle, {}
+
+        with patch.object(
+            orchestrator,
+            "_open_windows_managed_directory",
+            side_effect=fake_parent_open,
+        ), patch.object(
+            orchestrator,
+            "_create_windows_private_directory_handle",
+            side_effect=FileExistsError("fixture existing directory"),
+        ), patch.object(
+            orchestrator,
+            "_open_windows_relative_native_handle",
+            return_value=child_handle,
+        ) as open_child, patch.object(
+            orchestrator,
+            "_windows_relative_handle_details",
+            return_value={"attributes": 0x10},
+        ), patch.object(
+            orchestrator,
+            "_inspect_windows_private_acl_handle",
+            return_value={"exact": True, "dacl_exact": True},
+        ), patch.object(orchestrator, "_close_windows_handle"):
+            path = self.artifact_root / "existing-private-fixture"
+            orchestrator._secure_windows_private_directory(
+                path, strict_owner=True
+            )
+
+        self.assertEqual(parent_opens, [{"verify_private": False, "share_delete": False}])
+        open_child.assert_called_once_with(
+            parent_handle,
+            "existing-private-fixture",
+            writable=True,
+            is_dir=True,
+            delete_access=False,
+            share_delete=False,
+        )
+
+    def test_health_reports_exhausted_audit_capacity(self) -> None:
+        path = self._append()
+        log_bytes = path.stat().st_size
+        artificial_limit = (
+            log_bytes + orchestrator.MAX_SECURITY_AUDIT_EVENT_BYTES - 1
+        )
+        with patch.object(
+            orchestrator,
+            "MAX_MANAGED_ARTIFACT_BYTES",
+            artificial_limit,
+        ):
+            health = orchestrator.security_audit_health(self.artifact_root)
+        self.assertFalse(health["ok"], health)
+        self.assertTrue(health["capacity_exhausted"], health)
+        self.assertEqual(health["log_bytes"], log_bytes)
+        self.assertEqual(
+            health["remaining_log_bytes"],
+            orchestrator.MAX_SECURITY_AUDIT_EVENT_BYTES - 1,
+        )
+
+    def test_writer_fault_injection_covers_key_lock_open_append_flush_and_permissions(
+        self,
+    ) -> None:
+        def append_to(root: Path) -> Path:
+            return self._append(artifact_root=root)
+
+        real_create = orchestrator._create_private_file_once
+
+        def fail_key(path: Path, payload: bytes) -> bool:
+            if Path(path).name == "runtime_security.audit.key":
+                raise OSError("fixture key creation failure")
+            return real_create(path, payload)
+
+        early_faults = {
+            "key": patch.object(
+                orchestrator,
+                "_create_private_file_once",
+                side_effect=fail_key,
+            ),
+            "lock": patch.object(
+                orchestrator,
+                "_static_private_file_lock",
+                side_effect=OSError("fixture lock failure"),
+            ),
+            "permission": patch.object(
+                orchestrator,
+                "_ensure_strict_private_directory",
+                side_effect=OSError("fixture permission failure"),
+            ),
+        }
+        for name, fault in early_faults.items():
+            root = self.workspace / f"audit-fault-{name}"
+            with self.subTest(stage=name), fault, self.assertRaises(OSError):
+                append_to(root)
+            health = orchestrator.security_audit_health(root)
+            self.assertFalse(health["ok"], health)
+            self.assertIn("last_failure", health)
+
+        real_open = orchestrator._open_strict_private_file
+
+        class FaultHandle:
+            def __init__(self, handle: object, operation: str) -> None:
+                self.handle = handle
+                self.operation = operation
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self.handle, name)
+
+            def write(self, payload: bytes) -> int:
+                if self.operation == "append":
+                    raise OSError("fixture append failure")
+                return self.handle.write(payload)
+
+            def flush(self) -> None:
+                if self.operation == "flush":
+                    raise OSError("fixture flush failure")
+                self.handle.flush()
+
+        for operation in ("open", "append", "flush"):
+            root = self.workspace / f"audit-fault-{operation}"
+            append_to(root)
+
+            @contextlib.contextmanager
+            def fault_open(
+                path: Path, *, writable: bool = False
+            ) -> object:
+                if (
+                    Path(path).name == "security-events.ndjson"
+                    and writable
+                    and operation == "open"
+                ):
+                    raise OSError("fixture open failure")
+                with real_open(path, writable=writable) as (handle, details):
+                    if Path(path).name == "security-events.ndjson" and writable:
+                        yield FaultHandle(handle, operation), details
+                    else:
+                        yield handle, details
+
+            with self.subTest(stage=operation), patch.object(
+                orchestrator,
+                "_open_strict_private_file",
+                side_effect=fault_open,
+            ), self.assertRaises(OSError):
+                append_to(root)
+            self.assertFalse(
+                orchestrator.security_audit_health(root)["ok"]
+            )
+
+        fsync_root = self.workspace / "audit-fault-fsync"
+        append_to(fsync_root)
+        with patch.object(
+            orchestrator.os,
+            "fsync",
+            side_effect=OSError("fixture fsync failure"),
+        ), self.assertRaises((OSError, orchestrator.OrchestratorError)):
+            append_to(fsync_root)
+        self.assertFalse(
+            orchestrator.security_audit_health(fsync_root)["ok"]
+        )
+
+    def test_pre_run_provider_rejection_is_audited_without_secret_values(self) -> None:
+        secret = "fixture-pre-run-secret-9f2c"
+        with self.assertRaises(RuntimeSecurityError) as raised:
+            orchestrator.prepare_worker_launch(
+                mode="one_shot",
+                prompt="fixture prompt that must not persist",
+                provider_env={"PATH": secret},
+                model_override=None,
+                cwd=self.workspace,
+                workspace_root=self.workspace,
+                artifact_root=self.artifact_root,
+                permission_mode="plan",
+                timeout_seconds=10,
+                arguments=(
+                    "-p",
+                    "--output-format",
+                    "json",
+                    "--permission-mode",
+                    "plan",
+                    "--no-session-persistence",
+                ),
+                safe_route_metadata={
+                    "profile": {"id": "provider-pre-run"}
+                },
+            )
+        self.assertEqual(raised.exception.code, "provider_env_forbidden")
+        log = self.artifact_root / "logs" / "security-events.ndjson"
+        payload = log.read_text(encoding="utf-8")
+        self.assertIn('"run_id":null', payload)
+        self.assertIn('"code":"provider_env_forbidden"', payload)
+        self.assertNotIn(secret, payload)
+        self.assertNotIn("fixture prompt that must not persist", payload)
+
+    def test_audit_failure_blocks_unsafe_but_degrades_trusted_launch(self) -> None:
+        observed = ExecutableIdentity.capture(self.fake_runtime)
+        unsafe_policy = RuntimeSecurityPolicy(
+            runtime_executable=str(self.fake_runtime.resolve()),
+            unsafe_runtimes=(
+                ApprovedUnsafeRuntime(
+                    runtime_id="fixture-unsafe-audit-failure",
+                    identity=_pinned_identity(observed),
+                ),
+            ),
+        )
+        unsafe_candidate = RuntimeExecutableCandidate(
+            canonical_path=str(self.fake_runtime.resolve()),
+            source="runtime_security.override.json",
+            trust_class="local_configured",
+        )
+        with patch.object(
+            orchestrator,
+            "load_runtime_security_policy",
+            return_value=unsafe_policy,
+        ), patch.object(
+            orchestrator,
+            "resolve_runtime_candidate",
+            return_value=unsafe_candidate,
+        ), patch.object(
+            orchestrator,
+            "append_security_event",
+            side_effect=OSError("fixture audit unavailable"),
+        ), patch.object(
+            orchestrator, "_start_one_shot_launch"
+        ) as unsafe_start:
+            unsafe = orchestrator.run_agent(
+                "unsafe audit failure",
+                cwd=self.workspace,
+                allow_unsafe_runtime=True,
+            )
+        unsafe_start.assert_not_called()
+        self.assertEqual(
+            unsafe["security_error"]["code"], "security_audit_unavailable"
+        )
+        self.assertTrue(unsafe["audit_degraded"])
+
+        def trusted_result(
+            _prepared: object, _run_dir: Path, metadata: dict[str, object]
+        ) -> dict[str, object]:
+            return {**metadata, "ok": True, "status": "fixture_started"}
+
+        with patch.object(
+            orchestrator,
+            "append_security_event",
+            side_effect=OSError("fixture audit unavailable"),
+        ), patch.object(
+            orchestrator,
+            "_start_one_shot_launch",
+            side_effect=trusted_result,
+        ) as trusted_start:
+            trusted = orchestrator.run_agent(
+                "trusted audit failure", cwd=self.workspace
+            )
+        trusted_start.assert_called_once()
+        self.assertTrue(trusted["ok"])
+        self.assertTrue(trusted["audit_degraded"])
+        persisted_status = orchestrator.single_run_status(
+            str(trusted["run_id"])
+        )
+        self.assertTrue(persisted_status["audit_degraded"])
+
+    def test_task_named_like_audit_fields_is_not_treated_as_audit_secret(self) -> None:
+        def trusted_result(
+            _prepared: object, _run_dir: Path, metadata: dict[str, object]
+        ) -> dict[str, object]:
+            return {**metadata, "ok": True, "status": "fixture_started"}
+
+        with patch.object(
+            orchestrator,
+            "_start_one_shot_launch",
+            side_effect=trusted_result,
+        ):
+            result = orchestrator.run_agent("info", cwd=self.workspace)
+
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result.get("audit_degraded", False), result)
+        health = orchestrator.security_audit_health(self.artifact_root)
+        self.assertEqual(health["event_count"], 1, health)
+        self.assertEqual(
+            health["counts_by_code"], {"trusted_runtime_authorized": 1}
+        )
+
+    def test_healthcheck_reports_security_components_without_executing_local_unsafe(
+        self,
+    ) -> None:
+        local_candidate = RuntimeExecutableCandidate(
+            canonical_path=str(self.fake_runtime.resolve()),
+            source="runtime_security.override.json",
+            trust_class="local_configured",
+        )
+        default_candidate = RuntimeExecutableCandidate(
+            canonical_path=str(self.fake_runtime.resolve()),
+            source="fixture-default",
+            trust_class="trusted_default",
+        )
+
+        class HealthyStore:
+            def health(self) -> dict[str, object]:
+                return {"ok": True, "backend": "fixture"}
+
+        with patch.object(
+            orchestrator, "ARTIFACT_ROOT", self.artifact_root
+        ), patch.object(
+            orchestrator, "_existing_claude_candidates", return_value=[]
+        ), patch.object(
+            orchestrator,
+            "discover_claude_candidate",
+            return_value=default_candidate,
+        ), patch.object(
+            orchestrator,
+            "resolve_runtime_candidate",
+            return_value=local_candidate,
+        ), patch.object(
+            orchestrator, "list_profiles", return_value=[]
+        ), patch.object(
+            orchestrator, "get_secure_payload_store", return_value=HealthyStore()
+        ), patch.object(
+            orchestrator,
+            "process_identity_support",
+            return_value={"supported": True, "mechanism": "fixture"},
+        ), patch.object(
+            orchestrator,
+            "runtime_tree_containment_support",
+            return_value={"supported": True, "mechanism": "fixture"},
+        ), patch.object(orchestrator.subprocess, "run") as execute:
+            result = orchestrator.healthcheck()
+        execute.assert_not_called()
+        security = result["runtime_security"]
+        self.assertTrue(security["ok"], security)
+        self.assertEqual(
+            security["trust_decision"],
+            "local_unsafe_requires_policy_and_request_approval",
+        )
+        self.assertFalse(security["version_execution_allowed"])
+        self.assertTrue(result["claude_version_skipped"])
+        self.assertIn("audit", security)
+        self.assertIn("protected_payload_store", security)
+        self.assertIn("process_identity", security)
+        self.assertIn("process_tree_containment", security)
+
+    def test_healthcheck_never_executes_a_trusted_runtime_after_identity_change(
+        self,
+    ) -> None:
+        class HealthyStore:
+            def health(self) -> dict[str, object]:
+                return {"ok": True, "backend": "fixture"}
+
+        with patch.object(
+            orchestrator, "ARTIFACT_ROOT", self.artifact_root
+        ), patch.object(
+            orchestrator, "_existing_claude_candidates", return_value=[]
+        ), patch.object(
+            orchestrator, "list_profiles", return_value=[]
+        ), patch.object(
+            orchestrator, "get_secure_payload_store", return_value=HealthyStore()
+        ), patch.object(
+            orchestrator,
+            "process_identity_support",
+            return_value={"supported": True, "mechanism": "fixture"},
+        ), patch.object(
+            orchestrator,
+            "runtime_tree_containment_support",
+            return_value={"supported": True, "mechanism": "fixture"},
+        ), patch.object(
+            ExecutableIdentity, "matches_current_file", return_value=False
+        ), patch.object(
+            orchestrator, "_guarded_runtime_version"
+        ) as execute:
+            result = orchestrator.healthcheck()
+        execute.assert_not_called()
+        security = result["runtime_security"]
+        self.assertFalse(security["ok"], security)
+        self.assertFalse(security["version_execution_allowed"])
+        self.assertEqual(
+            security["runtime_error"], "runtime_identity_changed"
+        )
+
+    def test_guarded_version_holds_files_and_validates_started_process(self) -> None:
+        identity = ExecutableIdentity.capture(self.fake_runtime)
+        calls: list[str] = []
+
+        class FakeProcess:
+            pid = 424242
+            args = [str(self.fake_runtime), "--version"]
+            returncode = 0
+
+            def communicate(self, timeout: float) -> tuple[str, str]:
+                self.returncode = 0
+                calls.append("communicate")
+                return "fixture-version", ""
+
+            def poll(self) -> int:
+                return self.returncode
+
+        process = FakeProcess()
+
+        @contextlib.contextmanager
+        def hold_files(_identity: ExecutableIdentity) -> object:
+            calls.append("hold-enter")
+            try:
+                yield
+            finally:
+                calls.append("hold-exit")
+
+        def capture_started(pid: int, *, launch_nonce: str) -> ProcessIdentity:
+            calls.append("capture-started")
+            return ProcessIdentity(
+                pid=pid,
+                creation_token="fixture-version-start",
+                executable_path=orchestrator._expected_process_image(identity),
+                parent_pid=os.getpid(),
+                process_group_id=None,
+                session_id=None,
+                launch_nonce=launch_nonce,
+                supported=True,
+            )
+
+        def start_owned(
+            _command: list[str], **kwargs: object
+        ) -> FakeProcess:
+            calls.append("start-owned")
+            validator = kwargs.get("started_validator")
+            self.assertTrue(callable(validator))
+            validator(process)
+            calls.append("validated-started")
+            return process
+
+        def release_owned(
+            _process: FakeProcess, **_kwargs: object
+        ) -> bool:
+            calls.append("release")
+            return True
+
+        with patch.object(
+            orchestrator,
+            "_hold_verified_runtime_files",
+            side_effect=hold_files,
+        ), patch.object(
+            orchestrator,
+            "capture_process_identity",
+            side_effect=capture_started,
+        ), patch.object(
+            orchestrator,
+            "_owned_process_popen",
+            side_effect=start_owned,
+        ), patch.object(
+            orchestrator,
+            "_release_owned_containment",
+            side_effect=release_owned,
+        ):
+            completed = orchestrator._guarded_runtime_version(identity)
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(
+            calls,
+            [
+                "hold-enter",
+                "start-owned",
+                "capture-started",
+                "validated-started",
+                "communicate",
+                "release",
+                "hold-exit",
+            ],
         )
 
 
@@ -3764,7 +4907,9 @@ class FifthReviewTeamTransactionTests(GuardedLaunchFixture):
 
     def test_partial_gate_failure_never_allows_a_team_child_popen(self) -> None:
         real_manifest = orchestrator.write_team_manifest
+        real_reclaim = orchestrator._reclaim_artifact_lock_for_dead_processes
         authorization_calls = 0
+        reclaim_snapshots: list[set[int]] = []
 
         def fail_authorization(
             team_id: str, data: dict[str, object]
@@ -3776,6 +4921,18 @@ class FifthReviewTeamTransactionTests(GuardedLaunchFixture):
                 raise OSError("fixture authorization failure")
             return real_manifest(team_id, data)
 
+        def verify_team_quiescence(
+            run_dir: Path,
+            process_pids: set[int],
+            *,
+            deadline: float | None = None,
+        ) -> bool:
+            snapshot = set(process_pids)
+            reclaim_snapshots.append(snapshot)
+            self.assertEqual(len(snapshot), 2)
+            self.assertTrue(all(not orchestrator.pid_alive(pid) for pid in snapshot))
+            return real_reclaim(run_dir, snapshot, deadline=deadline)
+
         with patch.object(
             orchestrator, "TEAMS_DIR", self.artifact_root / "teams"
         ), patch.object(
@@ -3784,6 +4941,10 @@ class FifthReviewTeamTransactionTests(GuardedLaunchFixture):
             orchestrator, "run_status", return_value={"active_count": 0}
         ), patch.object(
             orchestrator, "write_team_manifest", side_effect=fail_authorization
+        ), patch.object(
+            orchestrator,
+            "_reclaim_artifact_lock_for_dead_processes",
+            side_effect=verify_team_quiescence,
         ):
             team = orchestrator.spawn_role_team(
                 "partial gate failure",
@@ -3793,6 +4954,7 @@ class FifthReviewTeamTransactionTests(GuardedLaunchFixture):
             )
         self.assertFalse(team["ok"], team)
         self.assertEqual(authorization_calls, 1, team)
+        self.assertEqual(len(reclaim_snapshots), 2, team)
         for item in team["runs"]:
             lock_dir = self.runs_dir / f".{item['run_id']}.artifact.lock"
             self.assertFalse(lock_dir.exists(), team)
@@ -5792,11 +6954,22 @@ class SeventhReviewWindowsCapabilityTests(GuardedLaunchFixture):
 
         @contextlib.contextmanager
         def swap_parent(
-            path: Path, *, writable: bool = False, verify_private: bool = True
+            path: Path,
+            *,
+            writable: bool = False,
+            verify_private: bool = True,
+            set_owner: bool = False,
+            verify_owner: bool = False,
+            share_delete: bool = True,
         ) -> object:
             nonlocal attack_fired
             with real_open(
-                path, writable=writable, verify_private=verify_private
+                path,
+                writable=writable,
+                verify_private=verify_private,
+                set_owner=set_owner,
+                verify_owner=verify_owner,
+                share_delete=share_delete,
             ) as opened:
                 if Path(path) == run_dir and not attack_fired:
                     run_dir.replace(backup)
@@ -5849,11 +7022,22 @@ class SeventhReviewWindowsCapabilityTests(GuardedLaunchFixture):
 
         @contextlib.contextmanager
         def swap_parent(
-            path: Path, *, writable: bool = False, verify_private: bool = True
+            path: Path,
+            *,
+            writable: bool = False,
+            verify_private: bool = True,
+            set_owner: bool = False,
+            verify_owner: bool = False,
+            share_delete: bool = True,
         ) -> object:
             nonlocal attack_fired
             with real_open(
-                path, writable=writable, verify_private=verify_private
+                path,
+                writable=writable,
+                verify_private=verify_private,
+                set_owner=set_owner,
+                verify_owner=verify_owner,
+                share_delete=share_delete,
             ) as opened:
                 if Path(path) == run_dir and not attack_fired:
                     run_dir.replace(backup)
@@ -5906,7 +7090,13 @@ class SeventhReviewWindowsCapabilityTests(GuardedLaunchFixture):
 
         @contextlib.contextmanager
         def swap_after_validation(
-            path: Path, *, writable: bool = False, verify_private: bool = True
+            path: Path,
+            *,
+            writable: bool = False,
+            verify_private: bool = True,
+            set_owner: bool = False,
+            verify_owner: bool = False,
+            share_delete: bool = True,
         ) -> object:
             nonlocal directory_calls, attack_fired
             if Path(path) == run_dir:
@@ -5915,7 +7105,12 @@ class SeventhReviewWindowsCapabilityTests(GuardedLaunchFixture):
             else:
                 call = 0
             with real_open_directory(
-                path, writable=writable, verify_private=verify_private
+                path,
+                writable=writable,
+                verify_private=verify_private,
+                set_owner=set_owner,
+                verify_owner=verify_owner,
+                share_delete=share_delete,
             ) as opened:
                 yield opened
             if call == 2 and not attack_fired:
@@ -5925,13 +7120,20 @@ class SeventhReviewWindowsCapabilityTests(GuardedLaunchFixture):
 
         @contextlib.contextmanager
         def observe_file(
-            path: Path, *, writable: bool = False, verify_private: bool = True
+            path: Path,
+            *,
+            writable: bool = False,
+            verify_private: bool = True,
+            verify_owner: bool = False,
         ) -> object:
             nonlocal outside_read
             if Path(path).name == outside_file.name:
                 outside_read = True
             with real_open_file(
-                path, writable=writable, verify_private=verify_private
+                path,
+                writable=writable,
+                verify_private=verify_private,
+                verify_owner=verify_owner,
             ) as opened:
                 yield opened
 
@@ -8014,6 +9216,7 @@ class EleventhReviewCleanupOwnershipTests(TenthReviewFixture):
             self.assertEqual(
                 persisted.get("owned_process_pid"), process.pid, details
             )
+            self.assertEqual(persisted.get("child_pid"), process.pid, details)
             self.assertTrue((run_dir / "pid.txt").is_file(), details)
             self.assertIs(orchestrator._owned_process_record(process), record)
         finally:
@@ -8746,7 +9949,7 @@ class TwelfthReviewLifecycleRegressionTests(TenthReviewFixture):
             result = orchestrator.run_agent(
                 "twelfth timeout finalization",
                 cwd=self.workspace,
-                timeout_seconds=1,
+                timeout_seconds=3,
             )
 
         self.assertEqual(result["status"], "timed_out", result)
@@ -8822,14 +10025,14 @@ class TwelfthReviewLifecycleRegressionTests(TenthReviewFixture):
             launch = orchestrator.run_streaming_agent(
                 "twelfth detached success",
                 cwd=self.workspace,
-                timeout_seconds=3,
+                timeout_seconds=8,
             )
 
         self.assertEqual(launch["status"], "starting", launch)
         self.assertEqual(len(workers), 1, workers)
         self.assertIsNone(orchestrator._owned_process_record(workers[0]))
         terminal = self._wait_for_terminal_metadata(
-            self.runs_dir / str(launch["run_id"]), timeout=8
+            self.runs_dir / str(launch["run_id"]), timeout=12
         )
         self.assertEqual(terminal["status"], "succeeded", terminal)
 
@@ -9887,7 +11090,7 @@ class TenthReviewTeamDecisionTests(TenthReviewFixture):
                 orchestrator, "_validate_team_authorization_manifest", return_value=None
             ), patch.object(
                 orchestrator,
-                "_reclaim_artifact_lock_for_dead_process",
+                "_reclaim_artifact_lock_for_dead_processes",
                 return_value=True,
             ), patch.object(
                 orchestrator,
@@ -9910,6 +11113,143 @@ class TenthReviewTeamDecisionTests(TenthReviewFixture):
                 result.get("status"),
                 {"rolled_back_partial_launch", "rollback_incomplete"},
             )
+        finally:
+            self._remove_fake_workers(workers)
+
+    def test_readiness_timeout_uses_independent_team_cleanup_deadline(self) -> None:
+        run_ids = [orchestrator.new_run_id(), orchestrator.new_run_id()]
+        workers = self._install_fake_workers(run_ids, 510431)
+        launch_member, _ready_members = self._synthetic_team_patches(workers)
+        cleanup_remaining: list[float] = []
+        termination_barrier = threading.Barrier(len(workers))
+
+        def terminate(
+            worker: TenthReviewFixture.FakeProcess,
+            *,
+            deadline: float,
+        ) -> bool:
+            cleanup_remaining.append(deadline - time.monotonic())
+            termination_barrier.wait(timeout=1)
+            worker.force_exit()
+            return True
+
+        def reclaim(
+            _run_dir: Path,
+            process_pids: set[int],
+            *,
+            deadline: float,
+        ) -> bool:
+            self.assertEqual(process_pids, {worker.pid for worker in workers.values()})
+            cleanup_remaining.append(deadline - time.monotonic())
+            return True
+
+        def expire_readiness(
+            _team_id: str,
+            _runs: list[dict[str, object]],
+            *,
+            deadline: float,
+        ) -> list[dict[str, object]]:
+            self.assertGreater(deadline, time.monotonic())
+            orchestrator._OPERATION_DEADLINE.set(time.monotonic() - 1)
+            raise TimeoutError("fixture readiness timeout")
+
+        try:
+            with patch.object(
+                orchestrator, "TEAMS_DIR", self.artifact_root / "teams"
+            ), patch.object(
+                orchestrator, "max_concurrent_limit", return_value=4
+            ), patch.object(
+                orchestrator, "run_status", return_value={"active_count": 0}
+            ), patch.object(
+                orchestrator, "run_streaming_agent", side_effect=launch_member
+            ), patch.object(
+                orchestrator,
+                "_wait_for_team_members_ready",
+                side_effect=expire_readiness,
+            ), patch.object(
+                orchestrator, "_terminate_owned_process", side_effect=terminate
+            ), patch.object(
+                orchestrator,
+                "_reclaim_artifact_lock_for_dead_processes",
+                side_effect=reclaim,
+            ):
+                result = orchestrator.spawn_role_team(
+                    "tenth readiness timeout",
+                    roles=["testing", "review"],
+                    cwd=self.workspace,
+                    timeout_seconds=1,
+                )
+            self.assertEqual(result["status"], "timed_out", result)
+            self.assertIs(result["timed_out"], True)
+            self.assertEqual(result["exit_code"], 124)
+            self.assertEqual(result["stop_reason"], "timeout")
+            self.assertEqual(
+                result["security_error"]["code"],
+                "launch_deadline_exceeded",
+            )
+            self.assertTrue(result["rollback"]["attempted"], result)
+            self.assertEqual(result["rollback"]["failed_stop_count"], 0)
+            self.assertEqual(len(cleanup_remaining), 4)
+            self.assertTrue(all(remaining > 0 for remaining in cleanup_remaining))
+        finally:
+            self._remove_fake_workers(workers)
+
+    def test_root_exit_with_incomplete_tree_cleanup_blocks_lock_reclaim(
+        self,
+    ) -> None:
+        run_ids = [orchestrator.new_run_id(), orchestrator.new_run_id()]
+        workers = self._install_fake_workers(run_ids, 510436)
+        launch_member, _ready_members = self._synthetic_team_patches(workers)
+
+        def incomplete_cleanup(
+            worker: TenthReviewFixture.FakeProcess,
+            *,
+            deadline: float,
+        ) -> bool:
+            self.assertGreater(deadline, time.monotonic())
+            worker.force_exit()
+            return False
+
+        try:
+            with patch.object(
+                orchestrator, "TEAMS_DIR", self.artifact_root / "teams"
+            ), patch.object(
+                orchestrator, "max_concurrent_limit", return_value=4
+            ), patch.object(
+                orchestrator, "run_status", return_value={"active_count": 0}
+            ), patch.object(
+                orchestrator, "run_streaming_agent", side_effect=launch_member
+            ), patch.object(
+                orchestrator,
+                "_wait_for_team_members_ready",
+                side_effect=TimeoutError("fixture readiness timeout"),
+            ), patch.object(
+                orchestrator,
+                "_terminate_owned_process",
+                side_effect=incomplete_cleanup,
+            ), patch.object(
+                orchestrator,
+                "_reclaim_artifact_lock_for_dead_processes",
+            ) as reclaim:
+                result = orchestrator.spawn_role_team(
+                    "tenth incomplete tree cleanup",
+                    roles=["testing", "review"],
+                    cwd=self.workspace,
+                    timeout_seconds=1,
+                )
+            self.assertEqual(result["status"], "timed_out", result)
+            self.assertEqual(result["exit_code"], 124)
+            self.assertEqual(result["rollback"]["failed_stop_count"], 2)
+            self.assertTrue(
+                all(
+                    item.get("error") == "worker tree cleanup incomplete"
+                    and item.get("lock_reclaimed") is False
+                    and item.get("ok") is False
+                    for item in result["rollback"]["stops"]
+                ),
+                result,
+            )
+            reclaim.assert_not_called()
         finally:
             self._remove_fake_workers(workers)
 
@@ -9938,6 +11278,7 @@ class TenthReviewTeamDecisionTests(TenthReviewFixture):
                 precommit is not None and path.parent == team_dir
             ):
                 decision_visible.set()
+                orchestrator._OPERATION_DEADLINE.set(time.monotonic() - 1)
                 raise OSError("tenth directory fsync failed after visibility")
 
         try:
@@ -9955,7 +11296,7 @@ class TenthReviewTeamDecisionTests(TenthReviewFixture):
                 orchestrator, "_validate_team_authorization_manifest", return_value=None
             ), patch.object(
                 orchestrator,
-                "_reclaim_artifact_lock_for_dead_process",
+                "_reclaim_artifact_lock_for_dead_processes",
                 return_value=True,
             ), patch.object(
                 orchestrator,
@@ -10007,6 +11348,15 @@ class TenthReviewTeamDecisionTests(TenthReviewFixture):
             self.assertNotIn(
                 result.get("status"),
                 {"rolled_back_partial_launch", "rollback_incomplete"},
+            )
+            self.assertEqual(
+                result.get("rollback"),
+                {"attempted": False, "force": False, "stops": []},
+                result,
+            )
+            self.assertTrue(
+                all(worker.poll() is None for worker in workers.values()),
+                result,
             )
         finally:
             self._remove_fake_workers(workers)
@@ -10202,6 +11552,36 @@ class ThirteenthReviewTerminalAndScrubTests(GuardedLaunchFixture):
         self.assertEqual(result["exit_code"], 124, result)
         self.assertFalse(result["persisted"], result)
 
+    def test_expired_blocked_launch_uses_terminal_scope_to_persist(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        metadata = {
+            "run_id": run_dir.name,
+            "status": "starting",
+            "terminal_state_count": 0,
+        }
+        orchestrator.write_metadata(run_dir, metadata)
+        token = orchestrator._OPERATION_DEADLINE.set(time.monotonic() - 1.0)
+        try:
+            with patch.object(
+                orchestrator, "_audit_run_security_error", return_value=False
+            ):
+                result = orchestrator._record_blocked_launch(
+                    run_dir,
+                    metadata,
+                    status="blocked_runtime_launch",
+                    error=orchestrator._launch_failure_error(
+                        "fixture_timeout", "Fixture timeout."
+                    ),
+                )
+        finally:
+            orchestrator._OPERATION_DEADLINE.reset(token)
+
+        persisted = orchestrator.read_metadata(run_dir)
+        self.assertTrue(result["persisted"], result)
+        self.assertEqual(persisted["status"], "timed_out", persisted)
+        self.assertEqual(persisted["exit_code"], 124, persisted)
+
     def test_terminal_scope_is_not_called_after_timeout(self) -> None:
         with patch.object(
             orchestrator,
@@ -10327,6 +11707,162 @@ class ThirteenthReviewTerminalAndScrubTests(GuardedLaunchFixture):
         ):
             with self.assertRaises(TimeoutError):
                 orchestrator._write_scope_policy_drift(pinned)
+
+    def test_owned_process_expired_deadline_never_calls_popen(self) -> None:
+        deadline = time.monotonic() - 0.01
+        token = orchestrator._OPERATION_DEADLINE.set(deadline)
+        try:
+            with contextlib.ExitStack() as stack:
+                popen = stack.enter_context(
+                    patch.object(orchestrator.subprocess, "Popen")
+                )
+                if os.name == "nt":
+                    stack.enter_context(
+                        patch.object(
+                            orchestrator,
+                            "_create_windows_kill_job",
+                            return_value=912301,
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(orchestrator, "_close_windows_handle")
+                    )
+                elif sys.platform.startswith("linux"):
+                    stack.enter_context(
+                        patch.object(orchestrator, "_LINUX_PRCTL", object())
+                    )
+                with self.assertRaises(TimeoutError):
+                    orchestrator._owned_process_popen(
+                        [str(Path(sys.executable).resolve()), "-c", "pass"],
+                        ownership_deadline=deadline,
+                    )
+                popen.assert_not_called()
+        finally:
+            orchestrator._OPERATION_DEADLINE.reset(token)
+
+    def test_detached_worker_expired_deadline_never_calls_popen(self) -> None:
+        deadline = time.monotonic() - 0.01
+        with patch.object(orchestrator.subprocess, "Popen") as popen:
+            with self.assertRaises(TimeoutError):
+                orchestrator._spawn_detached_internal_worker(
+                    [str(Path(sys.executable).resolve()), "-c", "pass"],
+                    ownership_deadline=deadline,
+                )
+        popen.assert_not_called()
+
+    def test_owned_process_crossing_deadline_cleans_created_child(self) -> None:
+        process = TenthReviewFixture.FakeProcess(912302)
+        deadline = time.monotonic() + 5
+        checks: list[float | None] = []
+
+        def cross_after_popen(
+            observed: float | None = None, message: str = ""
+        ) -> None:
+            del message
+            checks.append(observed)
+            if len(checks) == 2:
+                raise TimeoutError("fixture owned process crossed deadline")
+
+        def cleanup_child(
+            child: object, *, deadline: float | None = None
+        ) -> bool:
+            del deadline
+            self.assertIs(child, process)
+            process.terminate()
+            return True
+
+        token = orchestrator._OPERATION_DEADLINE.set(deadline)
+        try:
+            with contextlib.ExitStack() as stack:
+                popen = stack.enter_context(
+                    patch.object(
+                        orchestrator.subprocess,
+                        "Popen",
+                        return_value=process,
+                    )
+                )
+                cleanup = stack.enter_context(
+                    patch.object(
+                        orchestrator,
+                        "_bounded_process_cleanup",
+                        side_effect=cleanup_child,
+                    )
+                )
+                stack.enter_context(
+                    patch.object(orchestrator, "_check_deadline", side_effect=cross_after_popen)
+                )
+                stack.enter_context(
+                    patch.object(orchestrator, "_publish_owned_process_record")
+                )
+                if os.name == "nt":
+                    stack.enter_context(
+                        patch.object(
+                            orchestrator,
+                            "_create_windows_kill_job",
+                            return_value=912303,
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(orchestrator, "_assign_windows_job")
+                    )
+                    stack.enter_context(
+                        patch.object(orchestrator, "_verify_windows_job_assignment")
+                    )
+                    stack.enter_context(
+                        patch.object(orchestrator, "_resume_windows_process")
+                    )
+                    stack.enter_context(
+                        patch.object(orchestrator, "_close_windows_handle")
+                    )
+                elif sys.platform.startswith("linux"):
+                    stack.enter_context(
+                        patch.object(orchestrator, "_LINUX_PRCTL", object())
+                    )
+                with self.assertRaises(TimeoutError):
+                    orchestrator._owned_process_popen(
+                        [str(Path(sys.executable).resolve()), "-c", "pass"],
+                        ownership_deadline=deadline,
+                    )
+                popen.assert_called_once()
+                cleanup.assert_called_once()
+        finally:
+            orchestrator._OPERATION_DEADLINE.reset(token)
+        self.assertEqual(checks, [deadline, deadline])
+        self.assertEqual(process.terminate_calls, 1)
+
+    def test_detached_worker_crossing_deadline_cleans_created_child(self) -> None:
+        process = TenthReviewFixture.FakeProcess(912304)
+        deadline = time.monotonic() + 5
+        checks: list[float | None] = []
+
+        def cross_after_popen(
+            observed: float | None = None, message: str = ""
+        ) -> None:
+            del message
+            checks.append(observed)
+            if len(checks) == 2:
+                raise TimeoutError("fixture detached worker crossed deadline")
+
+        with patch.object(
+            orchestrator.subprocess,
+            "Popen",
+            return_value=process,
+        ) as popen, patch.object(
+            orchestrator, "_ensure_owned_process_record"
+        ), patch.object(
+            orchestrator, "_check_deadline", side_effect=cross_after_popen
+        ):
+            with self.assertRaises(TimeoutError):
+                orchestrator._spawn_detached_internal_worker(
+                    [str(Path(sys.executable).resolve()), "-c", "pass"],
+                    ownership_deadline=deadline,
+                )
+
+        popen.assert_called_once()
+        self.assertEqual(checks, [deadline, deadline])
+        self.assertEqual(process.terminate_calls, 1)
+        self.assertEqual(process.kill_calls, 0)
+        self.assertEqual(len(process.wait_timeouts), 1)
 
     def test_controller_pipe_timeout_reaches_cleanup_pending_evidence(
         self,
@@ -11921,6 +13457,10 @@ class TaskSevenStopIdentityTests(GuardedLaunchFixture):
                 sleeper.wait(timeout=5)
 
     def test_status_separates_match_mismatch_and_unverified_identity(self) -> None:
+        orchestrator._prepare_security_audit_directories(
+            orchestrator._security_audit_paths(self.artifact_root)
+        )
+        orchestrator._set_private_directory(self.runs_dir)
         sleeper = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(30)"],
             stdin=subprocess.DEVNULL,
@@ -11946,16 +13486,370 @@ class TaskSevenStopIdentityTests(GuardedLaunchFixture):
             self.assertEqual(mismatched["worker_identity_state"], "mismatch")
             self.assertFalse(mismatched["worker_owned"])
             self.assertTrue(mismatched["active"])
+            mismatch_health = orchestrator.security_audit_health(
+                self.artifact_root
+            )
+            self.assertEqual(mismatch_health["event_count"], 1)
+            self.assertEqual(
+                mismatch_health["counts_by_code"],
+                {"process_identity_mismatch": 1},
+            )
 
             orchestrator.update_metadata(run_dir, worker_process_identity=None)
             unverified = orchestrator.single_run_status(run_dir.name)
             self.assertEqual(unverified["worker_identity_state"], "unverified")
             self.assertFalse(unverified["worker_owned"])
             self.assertTrue(unverified["active"])
+            second_unverified = orchestrator.single_run_status(run_dir.name)
+            self.assertEqual(second_unverified["worker_identity_state"], "unverified")
+            final_health = orchestrator.security_audit_health(
+                self.artifact_root
+            )
+            self.assertEqual(final_health["event_count"], 2)
+            self.assertEqual(
+                final_health["counts_by_code"],
+                {
+                    "process_identity_mismatch": 1,
+                    "process_identity_unverified": 1,
+                },
+            )
         finally:
             if sleeper.poll() is None:
                 sleeper.terminate()
                 sleeper.wait(timeout=5)
+
+    def test_concurrent_status_polls_emit_one_identity_event(self) -> None:
+        orchestrator._prepare_security_audit_directories(
+            orchestrator._security_audit_paths(self.artifact_root)
+        )
+        orchestrator._set_private_directory(self.runs_dir)
+        sleeper = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        nonce = "concurrent-status-identity-fixture"
+        processes: list[multiprocessing.Process] = []
+        try:
+            captured = capture_process_identity(
+                sleeper.pid, launch_nonce=nonce
+            )
+            if not captured.supported:
+                self.skipTest("live process identity capture is unsupported")
+            run_dir = self._write_active_worker(captured)
+            metadata = orchestrator.read_metadata(run_dir)
+            forged = dict(metadata["worker_process_identity"])
+            forged["creation_token"] = (
+                str(forged["creation_token"]) + "-forged"
+            )
+            orchestrator.update_metadata(
+                run_dir, worker_process_identity=forged
+            )
+
+            context = multiprocessing.get_context("spawn")
+            ready = context.Queue()
+            start = context.Event()
+            results = context.Queue()
+            processes = [
+                context.Process(
+                    target=_spawn_identity_status_poll,
+                    args=(
+                        str(self.workspace),
+                        str(self.artifact_root),
+                        str(self.runs_dir),
+                        run_dir.name,
+                        index,
+                        ready,
+                        start,
+                        results,
+                    ),
+                )
+                for index in range(6)
+            ]
+            for process in processes:
+                process.start()
+            for _process in processes:
+                ready.get(timeout=20)
+            start.set()
+            observed = [
+                results.get(timeout=30) for _process in processes
+            ]
+            for process in processes:
+                process.join(30)
+                self.assertEqual(process.exitcode, 0)
+            self.assertEqual(
+                [item for item in observed if item[1:] != ("ok", "mismatch")],
+                [],
+                observed,
+            )
+            health = orchestrator.security_audit_health(
+                self.artifact_root
+            )
+            self.assertEqual(health["event_count"], 1, health)
+            self.assertEqual(
+                health["counts_by_code"],
+                {"process_identity_mismatch": 1},
+            )
+            persisted = orchestrator.read_metadata(run_dir)
+            self.assertEqual(
+                persisted["identity_audit_markers"],
+                ["internal_worker:mismatch"],
+            )
+            self.assertEqual(persisted["identity_audit_pending"], [])
+        finally:
+            for process in processes:
+                if process.is_alive():
+                    process.kill()
+                process.join(timeout=5)
+            if sleeper.poll() is None:
+                sleeper.terminate()
+                sleeper.wait(timeout=5)
+
+    def test_interrupted_pending_identity_audit_retries_exactly_once(self) -> None:
+        orchestrator._prepare_security_audit_directories(
+            orchestrator._security_audit_paths(self.artifact_root)
+        )
+        orchestrator._set_private_directory(self.runs_dir)
+        sleeper = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        nonce = "interrupted-status-identity-fixture"
+        try:
+            captured = capture_process_identity(sleeper.pid, launch_nonce=nonce)
+            if not captured.supported:
+                self.skipTest("live process identity capture is unsupported")
+            run_dir = self._write_active_worker(captured)
+            metadata = orchestrator.read_metadata(run_dir)
+            forged = dict(metadata["worker_process_identity"])
+            forged["creation_token"] = str(forged["creation_token"]) + "-forged"
+            orchestrator.update_metadata(
+                run_dir, worker_process_identity=forged
+            )
+
+            with patch.object(
+                orchestrator,
+                "_audit_run_security_error",
+                side_effect=KeyboardInterrupt("fixture interruption"),
+            ), self.assertRaises(KeyboardInterrupt):
+                orchestrator.single_run_status(run_dir.name)
+
+            interrupted = orchestrator.read_metadata(run_dir)
+            self.assertEqual(
+                interrupted["identity_audit_pending"],
+                ["internal_worker:mismatch"],
+            )
+            self.assertEqual(interrupted.get("identity_audit_markers", []), [])
+
+            recovered = orchestrator.single_run_status(run_dir.name)
+            self.assertEqual(recovered["worker_identity_state"], "mismatch")
+            recovered_metadata = orchestrator.read_metadata(run_dir)
+            self.assertEqual(
+                recovered_metadata["identity_audit_markers"],
+                ["internal_worker:mismatch"],
+            )
+            self.assertEqual(recovered["identity_audit_pending"], [])
+            repeated = orchestrator.single_run_status(run_dir.name)
+            self.assertEqual(repeated["worker_identity_state"], "mismatch")
+            health = orchestrator.security_audit_health(self.artifact_root)
+            self.assertEqual(health["event_count"], 1, health)
+            self.assertEqual(
+                health["counts_by_code"],
+                {"process_identity_mismatch": 1},
+            )
+        finally:
+            if sleeper.poll() is None:
+                sleeper.terminate()
+                sleeper.wait(timeout=5)
+
+    def test_failed_identity_audit_stays_pending_until_retry_succeeds(self) -> None:
+        orchestrator._prepare_security_audit_directories(
+            orchestrator._security_audit_paths(self.artifact_root)
+        )
+        orchestrator._set_private_directory(self.runs_dir)
+        sleeper = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        nonce = "failed-status-identity-fixture"
+        try:
+            captured = capture_process_identity(sleeper.pid, launch_nonce=nonce)
+            if not captured.supported:
+                self.skipTest("live process identity capture is unsupported")
+            run_dir = self._write_active_worker(captured)
+            metadata = orchestrator.read_metadata(run_dir)
+            forged = dict(metadata["worker_process_identity"])
+            forged["creation_token"] = str(forged["creation_token"]) + "-forged"
+            orchestrator.update_metadata(
+                run_dir, worker_process_identity=forged
+            )
+
+            with patch.object(
+                orchestrator,
+                "_audit_run_security_error",
+                return_value=True,
+            ):
+                degraded = orchestrator.single_run_status(run_dir.name)
+            self.assertTrue(degraded["audit_degraded"], degraded)
+            failed_metadata = orchestrator.read_metadata(run_dir)
+            self.assertEqual(
+                failed_metadata["identity_audit_pending"],
+                ["internal_worker:mismatch"],
+            )
+            self.assertEqual(
+                failed_metadata.get("identity_audit_markers", []), []
+            )
+
+            recovered = orchestrator.single_run_status(run_dir.name)
+            self.assertEqual(recovered["identity_audit_pending"], [])
+            recovered_metadata = orchestrator.read_metadata(run_dir)
+            self.assertEqual(
+                recovered_metadata["identity_audit_markers"],
+                ["internal_worker:mismatch"],
+            )
+            repeated = orchestrator.single_run_status(run_dir.name)
+            self.assertEqual(repeated["worker_identity_state"], "mismatch")
+            health = orchestrator.security_audit_health(self.artifact_root)
+            self.assertEqual(health["event_count"], 1, health)
+        finally:
+            if sleeper.poll() is None:
+                sleeper.terminate()
+                sleeper.wait(timeout=5)
+
+    def test_pending_identity_audit_replays_after_observed_process_exits(self) -> None:
+        orchestrator._prepare_security_audit_directories(
+            orchestrator._security_audit_paths(self.artifact_root)
+        )
+        orchestrator._set_private_directory(self.runs_dir)
+        sleeper = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        nonce = "exited-pending-status-identity-fixture"
+        try:
+            captured = capture_process_identity(sleeper.pid, launch_nonce=nonce)
+            if not captured.supported:
+                self.skipTest("live process identity capture is unsupported")
+            run_dir = self._write_active_worker(captured)
+            metadata = orchestrator.read_metadata(run_dir)
+            forged = dict(metadata["worker_process_identity"])
+            forged["creation_token"] = str(forged["creation_token"]) + "-forged"
+            orchestrator.update_metadata(
+                run_dir, worker_process_identity=forged
+            )
+
+            with patch.object(
+                orchestrator,
+                "_audit_run_security_error",
+                side_effect=KeyboardInterrupt("fixture interruption"),
+            ), self.assertRaises(KeyboardInterrupt):
+                orchestrator.single_run_status(run_dir.name)
+            sleeper.terminate()
+            sleeper.wait(timeout=5)
+
+            recovered = orchestrator.single_run_status(run_dir.name)
+            self.assertEqual(recovered["worker_identity_state"], "exited")
+            self.assertEqual(recovered["identity_audit_pending"], [])
+            recovered_metadata = orchestrator.read_metadata(run_dir)
+            self.assertEqual(
+                recovered_metadata["identity_audit_markers"],
+                ["internal_worker:mismatch"],
+            )
+            health = orchestrator.security_audit_health(self.artifact_root)
+            self.assertEqual(health["event_count"], 1, health)
+            self.assertEqual(
+                health["counts_by_code"],
+                {"process_identity_mismatch": 1},
+            )
+        finally:
+            if sleeper.poll() is None:
+                sleeper.terminate()
+                sleeper.wait(timeout=5)
+
+    def test_post_append_interruption_retries_without_duplicate_event(self) -> None:
+        orchestrator._prepare_security_audit_directories(
+            orchestrator._security_audit_paths(self.artifact_root)
+        )
+        orchestrator._set_private_directory(self.runs_dir)
+        sleeper = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        nonce = "post-append-status-identity-fixture"
+        real_audit = orchestrator._audit_run_security_error
+        try:
+            captured = capture_process_identity(sleeper.pid, launch_nonce=nonce)
+            if not captured.supported:
+                self.skipTest("live process identity capture is unsupported")
+            run_dir = self._write_active_worker(captured)
+            metadata = orchestrator.read_metadata(run_dir)
+            forged = dict(metadata["worker_process_identity"])
+            forged["creation_token"] = str(forged["creation_token"]) + "-forged"
+            orchestrator.update_metadata(
+                run_dir, worker_process_identity=forged
+            )
+
+            def append_then_interrupt(*args: object, **kwargs: object) -> bool:
+                self.assertFalse(real_audit(*args, **kwargs))
+                raise KeyboardInterrupt("fixture post-append interruption")
+
+            with patch.object(
+                orchestrator,
+                "_audit_run_security_error",
+                side_effect=append_then_interrupt,
+            ), self.assertRaises(KeyboardInterrupt):
+                orchestrator.single_run_status(run_dir.name)
+            first_health = orchestrator.security_audit_health(
+                self.artifact_root
+            )
+            self.assertEqual(first_health["event_count"], 1, first_health)
+            self.assertEqual(
+                orchestrator.read_metadata(run_dir)[
+                    "identity_audit_pending"
+                ],
+                ["internal_worker:mismatch"],
+            )
+
+            recovered = orchestrator.single_run_status(run_dir.name)
+            self.assertEqual(recovered["identity_audit_pending"], [])
+            final_health = orchestrator.security_audit_health(
+                self.artifact_root
+            )
+            self.assertEqual(final_health["event_count"], 1, final_health)
+        finally:
+            if sleeper.poll() is None:
+                sleeper.terminate()
+                sleeper.wait(timeout=5)
+
+    def test_completed_identity_marker_dominates_stale_pending_claim(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        orchestrator.write_metadata(
+            run_dir,
+            {
+                "run_id": run_dir.name,
+                "status": "failed",
+                "identity_audit_markers": ["internal_worker:mismatch"],
+                "identity_audit_pending": ["internal_worker:mismatch"],
+            },
+        )
+        status = orchestrator.single_run_status(run_dir.name)
+        self.assertEqual(status["identity_audit_pending"], [])
+        persisted = orchestrator.read_metadata(run_dir)
+        self.assertEqual(persisted["identity_audit_pending"], [])
+        self.assertEqual(
+            persisted["identity_audit_markers"],
+            ["internal_worker:mismatch"],
+        )
 
     def test_real_exact_match_emergency_stop_uses_stable_capability(self) -> None:
         sleeper = subprocess.Popen(
