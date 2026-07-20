@@ -3339,6 +3339,7 @@ def _open_windows_managed_file(
             native_handle, ctypes.byref(information)
         ):
             raise ctypes.WinError(ctypes.get_last_error())
+        file_id = _windows_file_id_info(native_handle)
         attributes = int(information.dwFileAttributes)
         size = (int(information.nFileSizeHigh) << 32) | int(
             information.nFileSizeLow
@@ -3392,11 +3393,7 @@ def _open_windows_managed_file(
             "size": size,
             "attributes": attributes,
             "final_path": final_path,
-            "file_id": (
-                int(information.dwVolumeSerialNumber),
-                (int(information.nFileIndexHigh) << 32)
-                | int(information.nFileIndexLow),
-            ),
+            "file_id": file_id,
             "number_of_links": int(information.nNumberOfLinks),
         }
     finally:
@@ -3548,11 +3545,7 @@ def _open_windows_managed_directory(
         yield native_handle, {
             "attributes": attributes,
             "final_path": final_path,
-            "file_id": (
-                int(information.dwVolumeSerialNumber),
-                (int(information.nFileIndexHigh) << 32)
-                | int(information.nFileIndexLow),
-            ),
+            "file_id": _windows_file_id_info(native_handle),
         }
     finally:
         kernel32.CloseHandle(native_handle)
@@ -4035,12 +4028,54 @@ def _windows_relative_handle_details(native_handle: Any, name: str) -> dict[str,
         "size": (int(information.nFileSizeHigh) << 32)
         | int(information.nFileSizeLow),
         "number_of_links": int(information.nNumberOfLinks),
-        "file_id": (
-            int(information.dwVolumeSerialNumber),
-            (int(information.nFileIndexHigh) << 32)
-            | int(information.nFileIndexLow),
-        ),
+        "file_id": _windows_file_id_info(native_handle),
     }
+
+
+def _windows_file_id_from_parts(
+    volume_serial_number: int, identifier: bytes
+) -> tuple[int, int]:
+    if len(identifier) != 16:
+        raise OrchestratorError("Windows file identity has an invalid width.")
+    return (
+        int(volume_serial_number),
+        int.from_bytes(identifier, byteorder="little", signed=False),
+    )
+
+
+def _windows_file_id_info(native_handle: Any) -> tuple[int, int]:
+    import ctypes
+    from ctypes import wintypes
+
+    class FileId128(ctypes.Structure):
+        _fields_ = (("Identifier", wintypes.BYTE * 16),)
+
+    class FileIdInfo(ctypes.Structure):
+        _fields_ = (
+            ("VolumeSerialNumber", ctypes.c_ulonglong),
+            ("FileId", FileId128),
+        )
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetFileInformationByHandleEx.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
+    kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    information = FileIdInfo()
+    if not kernel32.GetFileInformationByHandleEx(
+        native_handle,
+        18,
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return _windows_file_id_from_parts(
+        int(information.VolumeSerialNumber),
+        bytes(information.FileId.Identifier),
+    )
 
 
 def _windows_file_handle_identity(handle: Any, name: str) -> tuple[int, int]:
@@ -4523,6 +4558,12 @@ def _windows_replace_relative(
     precommit = _ATOMIC_PRECOMMIT.get()
     if precommit is not None:
         precommit()
+    os.fstat(retained_handle.fileno())
+    if (
+        _windows_file_handle_identity(retained_handle, temporary_path.name)
+        != anchor[6]
+    ):
+        raise OrchestratorError("Atomic artifact source identity changed.")
     status = ntdll.NtSetInformationFile(
         native_handle,
         ctypes.byref(io_status),
@@ -8588,10 +8629,18 @@ def _scrub_output_text(text: str, sensitive_values: tuple[str, ...]) -> str:
 
 def _scrub_guarded_value(value: Any, sensitive_values: tuple[str, ...]) -> Any:
     if isinstance(value, Mapping):
-        return {
-            _json_safe_text(str(key)): _scrub_guarded_value(item, sensitive_values)
-            for key, item in value.items()
-        }
+        scrubbed: dict[str, Any] = {}
+        for key, item in value.items():
+            base_key = _json_safe_text(str(key))
+            safe_key = base_key
+            suffix = 2
+            while safe_key in scrubbed:
+                safe_key = f"{base_key}#{suffix}"
+                suffix += 1
+            scrubbed[safe_key] = _scrub_guarded_value(
+                item, sensitive_values
+            )
+        return scrubbed
     if isinstance(value, (list, tuple)):
         return [_scrub_guarded_value(item, sensitive_values) for item in value]
     if isinstance(value, str):
@@ -8599,8 +8648,25 @@ def _scrub_guarded_value(value: Any, sensitive_values: tuple[str, ...]) -> Any:
     return value
 
 
+_JSON_ESCAPED_TEXT_PREFIX = "~cc-json-escaped~"
+
+
 def _json_safe_text(value: str) -> str:
-    return value.encode("utf-8", errors="backslashreplace").decode("utf-8")
+    has_surrogate = any(0xD800 <= ord(char) <= 0xDFFF for char in value)
+    if not has_surrogate:
+        if value.startswith(_JSON_ESCAPED_TEXT_PREFIX):
+            return f"{_JSON_ESCAPED_TEXT_PREFIX}literal:{value}"
+        return value
+    escaped: list[str] = []
+    for char in value:
+        codepoint = ord(char)
+        if char == "\\":
+            escaped.append("\\\\")
+        elif 0xD800 <= codepoint <= 0xDFFF:
+            escaped.append(f"\\u{codepoint:04x}")
+        else:
+            escaped.append(char)
+    return f"{_JSON_ESCAPED_TEXT_PREFIX}surrogate:{''.join(escaped)}"
 
 
 def _scrub_untrusted_runtime_value(
@@ -8635,12 +8701,20 @@ def _scrub_data_keyed_mapping(
     value: Mapping[str, Any], sensitive_values: tuple[str, ...]
 ) -> dict[str, Any]:
     """Scrub mappings whose keys are user data, such as Git path indexes."""
-    return {
-        _json_safe_text(
+    scrubbed: dict[str, Any] = {}
+    for key, item in value.items():
+        base_key = _json_safe_text(
             _scrub_exact_text(str(key), sensitive_values)
-        ): _scrub_guarded_value(item, sensitive_values)
-        for key, item in value.items()
-    }
+        )
+        safe_key = base_key
+        suffix = 2
+        while safe_key in scrubbed:
+            safe_key = f"{base_key}#{suffix}"
+            suffix += 1
+        scrubbed[safe_key] = _scrub_guarded_value(
+            item, sensitive_values
+        )
+    return scrubbed
 
 
 @dataclass
@@ -9132,7 +9206,9 @@ def _audit_run_security_error(
 ) -> bool:
     runtime_launch = metadata.get("runtime_launch")
     launch = runtime_launch if isinstance(runtime_launch, Mapping) else {}
-    audit_deadline = time.monotonic() + 0.2
+    audit_deadline = (
+        time.monotonic() + SECURITY_AUDIT_LOCK_TIMEOUT_SECONDS
+    )
     effective = _effective_deadline()
     if effective is not None:
         audit_deadline = min(audit_deadline, effective)
@@ -20592,40 +20668,69 @@ def write_fake_claude_launcher(directory: Path) -> Path:
     return launcher
 
 
+def _mock_stream_parent() -> Path:
+    mock_base = (
+        Path(os.environ.get("PROGRAMDATA") or tempfile.gettempdir())
+        if os.name == "nt"
+        else Path(tempfile.gettempdir())
+    )
+    return mock_base.resolve() / "cc-orchestrator-mock"
+
+
+def _mock_stream_cleanup_enabled() -> bool:
+    return os.environ.get("CC_ORCHESTRATOR_CLEAN_MOCK_DIR") != "0"
+
+
+def _remove_mock_stream_directory(path: Path) -> None:
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
 def mock_stream_test(timeout_seconds: int = 60) -> dict[str, Any]:
     gates: dict[str, bool] = {}
     details: dict[str, Any] = {}
-    mock_parent = Path(os.environ.get("PROGRAMDATA") or "C:/ProgramData") / "cc-orchestrator-mock"
+    mock_parent = _mock_stream_parent()
     mock_dir = mock_parent / uuid.uuid4().hex[:12]
-    mock_dir.mkdir(parents=True, exist_ok=False)
-    launcher = write_fake_claude_launcher(mock_dir)
-
-    def configure_fake_runtime(
-        *, steps: int, delay: float, payload_bytes: int = 0
-    ) -> None:
-        _atomic_write_text(
-            mock_dir / "fake-config.json",
-            json.dumps(
-                {
-                    "steps": steps,
-                    "delay": delay,
-                    "payload_bytes": payload_bytes,
-                },
-                ensure_ascii=True,
-                separators=(",", ":"),
-            ),
-        )
-
-    configure_fake_runtime(steps=4, delay=0.05)
-    fixture_token = _TEST_ONLY_RUNTIME_CANDIDATE.set(
-        RuntimeExecutableCandidate(
-            canonical_path=str(launcher.resolve()),
-            source="explicit_mock_stream_test_fixture",
-            trust_class="trusted_default",
-        )
-    )
-    cleanup_mock_dir = os.environ.get("CC_ORCHESTRATOR_CLEAN_MOCK_DIR") == "1"
+    cleanup_mock_dir = _mock_stream_cleanup_enabled()
+    fixture_token: contextvars.Token[RuntimeExecutableCandidate | None] | None = None
     try:
+        _set_private_directory(mock_dir)
+        launcher = write_fake_claude_launcher(mock_dir)
+
+        def configure_fake_runtime(
+            *, steps: int, delay: float, payload_bytes: int = 0
+        ) -> None:
+            _atomic_write_text(
+                mock_dir / "fake-config.json",
+                json.dumps(
+                    {
+                        "steps": steps,
+                        "delay": delay,
+                        "payload_bytes": payload_bytes,
+                    },
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                ),
+            )
+
+        configure_fake_runtime(steps=4, delay=0.05)
+        fixture_token = _TEST_ONLY_RUNTIME_CANDIDATE.set(
+            RuntimeExecutableCandidate(
+                canonical_path=str(launcher.resolve()),
+                source="explicit_mock_stream_test_fixture",
+                trust_class="trusted_default",
+            )
+        )
+        try:
             configure_fake_runtime(steps=4, delay=0.05)
             finish_run = run_streaming_agent("mock finish test", role="testing", timeout_seconds=timeout_seconds)
             deadline = time.time() + timeout_seconds
@@ -20762,10 +20867,12 @@ def mock_stream_test(timeout_seconds: int = 60) -> dict[str, Any]:
                 "cwd_run_dir": str(cwd_run_dir),
                 "cwd_expected_runs": str(cwd_paths["runs"]),
             }
+        finally:
+            if fixture_token is not None:
+                _TEST_ONLY_RUNTIME_CANDIDATE.reset(fixture_token)
     finally:
-        _TEST_ONLY_RUNTIME_CANDIDATE.reset(fixture_token)
         if cleanup_mock_dir:
-            shutil.rmtree(mock_dir, ignore_errors=True)
+            _remove_mock_stream_directory(mock_dir)
         else:
             details["mock_dir"] = str(mock_dir)
     return {"ok": all(gates.values()), "gates": gates, "details": details}
@@ -22112,6 +22219,7 @@ def write_claude_md(
 
 def selftest() -> dict[str, Any]:
     env = force_utf8_env({})
+    process_tree_containment = runtime_tree_containment_support()
     decoded = subprocess_text("中文✅".encode("utf-8"))
     claude_md = build_claude_md("review", "selftest")
     sample_github_token = "ghp_" + ("1" * 36)
@@ -22463,6 +22571,10 @@ nodes:
         "runtime_provider_deny_primitives": len(provider_env_denials)
         == len(forbidden_provider_keys)
         and set(provider_env_denials.values()) == {"provider_env_forbidden"},
+        "runtime_process_tree_containment": bool(
+            process_tree_containment.get("supported")
+        )
+        and not bool(process_tree_containment.get("test_only")),
         "runtime_public_metadata_immutable": runtime_environment_immutable
         and isinstance(runtime_spec.arguments, tuple)
         and "MUTATED" not in fresh_public_metadata["environment_keys"]
@@ -22551,6 +22663,9 @@ nodes:
     return {
         "ok": all(checks.values()),
         "checks": checks,
+        "runtime_security": {
+            "process_tree_containment": process_tree_containment,
+        },
         "decoded_sample": decoded,
     }
 

@@ -10,7 +10,7 @@
 - 即时 prompt 改走受控 stdin；队列正文进入受保护存储，unsafe grant 只能消费一次。
 - 新增字段白名单、hash chain、认证 checkpoint、失败标记和容量上限的安全审计。
 - v0.8.0 的生产级 guarded worker 执行目前仅支持 Windows；macOS 和 Linux 在具备内核强制的整棵进程树 containment 后端之前会 fail closed。
-- CI 在 Ubuntu、Windows、macOS 的 Python 3.10/3.12 上运行完整契约测试集；POSIX mock 只使用明确的测试专用 containment，不代表生产启动支持。
+- Windows CI 在 Python 3.10/3.12 上运行完整测试集；Ubuntu 和 macOS 运行专门的 POSIX 发布契约，验证进程身份、runtime 策略、受保护存储、安装行为和生产 fail-closed 边界，Linux 还检查非 UTF-8 Git 路径的字节级精确性。
 
 ## v0.7.1 - 手动 retry 会取消 workflow 成功状态
 

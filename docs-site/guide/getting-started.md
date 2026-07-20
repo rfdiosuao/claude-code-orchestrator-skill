@@ -16,7 +16,7 @@ Windows PowerShell:
 
 ```powershell
 $tmp = Join-Path $env:TEMP "claude-code-orchestrator-skill.zip"; `
-iwr -UseBasicParsing "https://github.com/chu459/claude-code-orchestrator-skill/archive/refs/heads/main.zip" -OutFile $tmp; `
+iwr -UseBasicParsing "https://github.com/rfdiosuao/claude-code-orchestrator-skill/archive/refs/tags/v0.8.0.zip" -OutFile $tmp; `
 $dir = Join-Path $env:TEMP "claude-code-orchestrator-skill"; `
 if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }; `
 Expand-Archive $tmp -DestinationPath $dir -Force; `
@@ -27,10 +27,12 @@ macOS or Linux:
 
 ```bash
 tmp="$(mktemp -d)" && \
-curl -L "https://github.com/chu459/claude-code-orchestrator-skill/archive/refs/heads/main.zip" -o "$tmp/skill.zip" && \
+curl -L "https://github.com/rfdiosuao/claude-code-orchestrator-skill/archive/refs/tags/v0.8.0.zip" -o "$tmp/skill.zip" && \
 unzip -q "$tmp/skill.zip" -d "$tmp" && \
-bash "$tmp"/claude-code-orchestrator-skill-main/install/install.sh
+bash "$tmp"/claude-code-orchestrator-skill-0.8.0/install/install.sh
 ```
+
+Production installation starts only after the immutable `v0.8.0` tag is published. Record the downloaded archive SHA-256 in the deployment log and compare it during rollback; never substitute a branch archive.
 
 The default install target is:
 
@@ -67,7 +69,7 @@ python "$CC_ORCHESTRATOR_HOME/cc_orchestrator.py" workspace-status --cwd .
 
 Expected result:
 
-- `selftest` returns `ok: true`.
+- On Windows, `selftest` returns `ok: true`. On macOS/Linux it intentionally exits nonzero and reports `runtime_security.process_tree_containment.supported: false`.
 - `healthcheck` can find Python config, Claude Code, and CCSwitch files.
 - `list-profiles` shows Claude-compatible CCSwitch profiles.
 - `score-models` returns local heuristic scores.

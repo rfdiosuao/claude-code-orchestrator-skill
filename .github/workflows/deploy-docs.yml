@@ -44,12 +44,32 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Python smoke checks
+      - name: Compile Python entrypoints
         env:
           PYTHONPYCACHEPREFIX: ${{ runner.temp }}/pycache
+        run: python -m py_compile scripts/cc-orchestrator/cc_orchestrator.py scripts/cc-orchestrator/server.py
+
+      - name: Verify production selftest fails closed
+        shell: python
         run: |
-          python -m py_compile scripts/cc-orchestrator/cc_orchestrator.py scripts/cc-orchestrator/server.py
-          python scripts/cc-orchestrator/cc_orchestrator.py selftest
+          import json
+          import subprocess
+          import sys
+
+          completed = subprocess.run(
+              [sys.executable, "scripts/cc-orchestrator/cc_orchestrator.py", "selftest"],
+              capture_output=True,
+              text=True,
+              encoding="utf-8",
+              errors="replace",
+              check=False,
+          )
+          assert completed.returncode != 0, completed.stdout
+          payload = json.loads(completed.stdout)
+          containment = payload["runtime_security"]["process_tree_containment"]
+          assert containment["supported"] is False, containment
+          assert containment["mechanism"] is None, containment
+          assert containment["test_only"] is False, containment
 
       - name: Secret scan
         shell: python

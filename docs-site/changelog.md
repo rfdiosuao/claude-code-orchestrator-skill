@@ -10,7 +10,7 @@ This page tracks the public docs-facing history of Claude Code Orchestrator Skil
 - Moved immediate prompts to guarded stdin and queued payloads to protected storage with single-use unsafe grants.
 - Added allowlisted hash-chained security events, authenticated checkpoints, failure markers, and bounded audit capacity.
 - Production guarded worker execution is currently Windows-only in v0.8.0; macOS and Linux fail closed until a kernel-enforced whole-tree containment backend is available.
-- Expanded CI to the complete contract suite on Ubuntu, Windows, and macOS with Python 3.10 and 3.12. POSIX mock runs use an explicit test-only containment fixture and do not claim production launch support.
+- Windows CI runs the complete test suite on Python 3.10 and 3.12. Ubuntu and macOS run a dedicated POSIX release contract that verifies process identity, runtime policy, protected storage, installer behavior, and the production fail-closed boundary; Linux also checks byte-exact non-UTF-8 Git paths.
 
 ## v0.7.1 - Manual retry invalidates workflow success
 

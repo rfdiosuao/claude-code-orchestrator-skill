@@ -94,7 +94,7 @@ This is a miniature cost-management operating system for multi-agent coding.
 - Launch contracts are immutable and secret-free, prompts use guarded stdin, queued payloads use the protected store, and unsafe grants are single-use.
 - Background, team, workflow, queue, and visible launches use identity-aware containment and refuse PID-only legacy stops.
 - Security events use a strict allowlist, a local hash chain, authenticated checkpoints, private failure markers, and bounded capacity.
-- Runtime CI executes the complete contract suite on Ubuntu, Windows, and macOS with Python 3.10 and 3.12. Windows exercises production Job Object containment; POSIX cells verify the explicit fail-closed boundary and use test-only containment only inside `mock-stream-test`.
+- Runtime CI executes the complete test suite on Windows with Python 3.10 and 3.12. Ubuntu and macOS run a dedicated POSIX contract suite for process identity, runtime policy, protected storage, installer/release behavior, and the explicit production fail-closed boundary; Linux also verifies byte-exact non-UTF-8 Git paths.
 
 </details>
 
@@ -350,7 +350,7 @@ Windows PowerShell:
 
 ```powershell
 $tmp = Join-Path $env:TEMP "claude-code-orchestrator-skill.zip"; `
-iwr -UseBasicParsing "https://github.com/chu459/claude-code-orchestrator-skill/archive/refs/heads/main.zip" -OutFile $tmp; `
+iwr -UseBasicParsing "https://github.com/rfdiosuao/claude-code-orchestrator-skill/archive/refs/tags/v0.8.0.zip" -OutFile $tmp; `
 $dir = Join-Path $env:TEMP "claude-code-orchestrator-skill"; `
 if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }; `
 Expand-Archive $tmp -DestinationPath $dir -Force; `
@@ -361,10 +361,12 @@ macOS / Linux:
 
 ```bash
 tmp="$(mktemp -d)" && \
-curl -L "https://github.com/chu459/claude-code-orchestrator-skill/archive/refs/heads/main.zip" -o "$tmp/skill.zip" && \
+curl -L "https://github.com/rfdiosuao/claude-code-orchestrator-skill/archive/refs/tags/v0.8.0.zip" -o "$tmp/skill.zip" && \
 unzip -q "$tmp/skill.zip" -d "$tmp" && \
-bash "$tmp"/claude-code-orchestrator-skill-main/install/install.sh
+bash "$tmp"/claude-code-orchestrator-skill-0.8.0/install/install.sh
 ```
+
+Production installation starts only after the immutable `v0.8.0` tag is published. Record the archive SHA-256 in the deployment log and never substitute `main.zip`.
 
 <h2 align="center">MCP Setup</h2>
 

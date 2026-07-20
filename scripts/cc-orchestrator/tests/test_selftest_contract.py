@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -14,6 +16,78 @@ import cc_orchestrator as orchestrator  # noqa: E402
 
 
 class SelftestCliContractTests(unittest.TestCase):
+    def test_selftest_fails_when_production_containment_is_unavailable(self) -> None:
+        containment = {
+            "supported": False,
+            "mechanism": None,
+            "reason": "fixture unavailable",
+            "test_only": False,
+        }
+        with patch.object(
+            orchestrator,
+            "runtime_tree_containment_support",
+            return_value=containment,
+        ):
+            result = orchestrator.selftest()
+
+        self.assertFalse(result["ok"], result)
+        self.assertFalse(
+            result["checks"]["runtime_process_tree_containment"]
+        )
+        self.assertEqual(
+            result["runtime_security"]["process_tree_containment"],
+            containment,
+        )
+
+    def test_mock_stream_artifacts_use_absolute_private_temp_and_clean_by_default(
+        self,
+    ) -> None:
+        parent = orchestrator._mock_stream_parent()
+        self.assertTrue(parent.is_absolute(), parent)
+        if os.name != "nt":
+            self.assertEqual(
+                parent.parent,
+                Path(tempfile.gettempdir()).resolve(),
+            )
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CC_ORCHESTRATOR_CLEAN_MOCK_DIR", None)
+            self.assertTrue(orchestrator._mock_stream_cleanup_enabled())
+        with patch.dict(
+            os.environ, {"CC_ORCHESTRATOR_CLEAN_MOCK_DIR": "0"}
+        ):
+            self.assertFalse(orchestrator._mock_stream_cleanup_enabled())
+
+    def test_mock_stream_initialization_failure_removes_private_directory(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="mock-init-cleanup-") as temp:
+            parent = Path(temp).resolve()
+            with (
+                patch.object(
+                    orchestrator, "_mock_stream_parent", return_value=parent
+                ),
+                patch.object(
+                    orchestrator,
+                    "write_fake_claude_launcher",
+                    side_effect=OSError("fixture launcher failure"),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    OSError, "fixture launcher failure"
+                ):
+                    orchestrator.mock_stream_test(timeout_seconds=1)
+            self.assertEqual(list(parent.iterdir()), [])
+
+    def test_mock_stream_cleanup_retries_transient_directory_use(self) -> None:
+        path = Path(tempfile.gettempdir()) / "mock-cleanup-retry-fixture"
+        with patch.object(
+            orchestrator.shutil,
+            "rmtree",
+            side_effect=[PermissionError("fixture busy"), None],
+        ) as remove:
+            orchestrator._remove_mock_stream_directory(path)
+        self.assertEqual(remove.call_count, 2)
+
     def test_cli_returns_nonzero_when_any_selftest_gate_fails(self) -> None:
         result = {"ok": False, "checks": {"fixture_gate": False}}
         with (

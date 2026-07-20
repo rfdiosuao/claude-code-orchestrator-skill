@@ -72,7 +72,7 @@ docs/mcp.codex.example.toml
 | `cc_queue_cancel` | Cancels a queue job |
 | `cc_queue_policy` | Reads or writes queue concurrency, retry, and timeout policy |
 | `cc_upgrade_check` | Preserves local preferences across upgrades |
-| `cc_mock_stream_test` | Tests streaming without spending model quota |
+| `cc_mock_stream_test` | Optional local diagnostic; disabled unless explicitly enabled |
 | `cc_init_workspace` | Initializes `.agent-workspace`, templates, policies, rollback/log dirs, and optional `CLAUDE.md` |
 | `cc_workspace_status` | Shows where Codex and Claude Code artifacts will be written |
 | `cc_migrate_data` | Previews or migrates old `runs`, `reports`, and `dashboard` |
@@ -114,6 +114,10 @@ By default, worker runs use plan mode.
 Pass `allow_write=true` only after Codex has decided that file edits are needed and the write scope is clear.
 
 Secrets are redacted from tool output and persisted logs, but prompts should still avoid asking for raw secrets.
+
+The supported MCP deployment is local, same-user `stdio` only. `cc_mock_stream_test` is a diagnostic surface backed by an internal fake runtime; never expose it through SSE/HTTP or a proxy, and exclude it from any remotely reachable tool allowlist.
+
+The MCP server does not register `cc_mock_stream_test` by default. For a temporary local diagnostic session only, set `CC_ORCHESTRATOR_ENABLE_LOCAL_DIAGNOSTICS=1` in that server process and restart it; remove the variable after the test.
 
 ## Smoke test
 

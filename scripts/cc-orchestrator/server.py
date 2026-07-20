@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -91,6 +92,7 @@ from runtime_security import RuntimeSecurityError
 
 
 mcp = FastMCP("claude_code_mcp")
+LOCAL_DIAGNOSTICS_ENV = "CC_ORCHESTRATOR_ENABLE_LOCAL_DIAGNOSTICS"
 ROLE_DESCRIPTION = "Agent role. Supported: " + ", ".join(ROLE_ORDER) + ". Codex remains the controller."
 TASK_TYPE_DESCRIPTION = (
     "Optional task route key. Supported: simple, normal, complex_code, development, "
@@ -1167,13 +1169,25 @@ async def cc_upgrade_check(params: UpgradeCheckInput) -> str:
         return _error(exc)
 
 
-@mcp.tool(name="cc_mock_stream_test", annotations={"title": "Mock Streaming E2E Test", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False})
 async def cc_mock_stream_test(params: MockStreamTestInput) -> str:
     """Run a fake Claude stream to test events.ndjson, poll, status, and stop without spending model quota."""
     try:
         return _json(mock_stream_test(timeout_seconds=params.timeout_seconds))
     except Exception as exc:
         return _error(exc)
+
+
+if os.environ.get(LOCAL_DIAGNOSTICS_ENV) == "1":
+    mcp.tool(
+        name="cc_mock_stream_test",
+        annotations={
+            "title": "Mock Streaming E2E Test",
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": False,
+            "openWorldHint": False,
+        },
+    )(cc_mock_stream_test)
 
 
 @mcp.tool(name="cc_init_workspace", annotations={"title": "Initialize Agent Workspace", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False})

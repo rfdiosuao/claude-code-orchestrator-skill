@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import re
+import subprocess
+import sys
 import unittest
 
 
@@ -92,6 +95,9 @@ class ReleaseContractTests(unittest.TestCase):
         workflow = read_text(".github/workflows/runtime-checks.yml")
         required_commands = (
             "python -m unittest discover -s scripts/cc-orchestrator/tests -v",
+            "python -m unittest -v\n          test_process_identity",
+            "test_guarded_launch.TenthReviewPosixPathEncodingTests",
+            "Verify production selftest fails closed",
             "python scripts/cc-orchestrator/cc_orchestrator.py mock-stream-test --timeout-seconds 60",
             "npm run docs:build",
             "npm audit --audit-level=moderate",
@@ -99,6 +105,9 @@ class ReleaseContractTests(unittest.TestCase):
         for command in required_commands:
             with self.subTest(command=command):
                 self.assertIn(command, workflow)
+        self.assertIn("runs-on: windows-latest", workflow)
+        self.assertIn("runtime-posix:", workflow)
+        self.assertIn("if: runner.os == 'Linux'", workflow)
 
         required_paths = {
             "install/**",
@@ -166,6 +175,16 @@ class ReleaseContractTests(unittest.TestCase):
             ),
             2,
         )
+        for contract in (
+            "Verify production selftest fails closed",
+            "assert completed.returncode != 0",
+            'payload["runtime_security"]["process_tree_containment"]',
+            'assert containment["supported"] is False',
+            'assert containment["mechanism"] is None',
+            'assert containment["test_only"] is False',
+        ):
+            with self.subTest(posix_selftest_contract=contract):
+                self.assertIn(contract, workflow)
 
     def test_public_docs_state_the_guarded_execution_platform_boundary(self) -> None:
         expectations = {
@@ -177,6 +196,70 @@ class ReleaseContractTests(unittest.TestCase):
         for relative, notice in expectations.items():
             with self.subTest(document=relative):
                 self.assertIn(notice, read_text(relative))
+
+    def test_public_docs_limit_mock_mcp_to_local_stdio(self) -> None:
+        expectations = {
+            "SKILL.md": "local same-user `stdio` diagnostics only",
+            "scripts/cc-orchestrator/README.md": "local, same-user `stdio` process",
+            "docs-site/guide/mcp.md": "local, same-user `stdio` only",
+            "docs-site/zh/guide/mcp.md": "仅限本机、同一用户的 `stdio`",
+        }
+        for relative, notice in expectations.items():
+            with self.subTest(document=relative):
+                document = read_text(relative)
+                self.assertIn(notice, document)
+                self.assertIn("cc_mock_stream_test", document)
+
+    def test_mock_mcp_tool_requires_explicit_local_diagnostics_opt_in(self) -> None:
+        runtime_root = REPO_ROOT / "scripts" / "cc-orchestrator"
+        probe = (
+            "import server; "
+            "print(int('cc_mock_stream_test' in "
+            "server.mcp._tool_manager._tools))"
+        )
+
+        def registered(value: str | None) -> bool:
+            environment = os.environ.copy()
+            environment.pop(
+                "CC_ORCHESTRATOR_ENABLE_LOCAL_DIAGNOSTICS", None
+            )
+            if value is not None:
+                environment[
+                    "CC_ORCHESTRATOR_ENABLE_LOCAL_DIAGNOSTICS"
+                ] = value
+            completed = subprocess.run(
+                [sys.executable, "-c", probe],
+                cwd=runtime_root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=True,
+            )
+            return completed.stdout.strip() == "1"
+
+        self.assertFalse(registered(None))
+        self.assertFalse(registered("0"))
+        self.assertTrue(registered("1"))
+
+    def test_public_install_commands_use_immutable_fork_release_tag(self) -> None:
+        documents = (
+            "README.md",
+            "README.zh-CN.md",
+            "docs-site/guide/getting-started.md",
+            "docs-site/zh/guide/getting-started.md",
+        )
+        release_archive = (
+            "https://github.com/rfdiosuao/"
+            "claude-code-orchestrator-skill/archive/refs/tags/v0.8.0.zip"
+        )
+        for relative in documents:
+            with self.subTest(document=relative):
+                document = read_text(relative)
+                self.assertIn(release_archive, document)
+                self.assertIn("SHA-256", document)
+                self.assertNotIn("archive/refs/heads/main.zip", document)
 
 
 if __name__ == "__main__":

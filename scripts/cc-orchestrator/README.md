@@ -151,6 +151,8 @@ To add a stronger model later, add or update the provider in CCSwitch, then reru
 
 Production guarded worker execution is currently Windows-only in v0.8.0 because Windows Job Objects provide the required kernel-enforced whole-process-tree containment. macOS and Linux remain supported for installation, configuration, reports, and contract checks, but every production worker launch fails closed with `runtime_containment_unavailable`. The process-group mechanism used by `mock-stream-test` is an explicit test fixture and must never be treated as production containment.
 
+The MCP server is supported only as a local, same-user `stdio` process. `cc_mock_stream_test` must not be exposed through SSE/HTTP or a proxy; exclude it from any remotely reachable tool allowlist. It is not registered by default and requires `CC_ORCHESTRATOR_ENABLE_LOCAL_DIAGNOSTICS=1` in a temporary local MCP server process.
+
 Recognized Claude Code installations use the `trusted_default` path and need no new configuration. Ambient `CLAUDE_CODE_BIN` and inherited `PATH` values are not runtime approvals. A custom executable must be an absolute path in `config/runtime_security.override.json`, have a complete recursive identity pin, and receive a separate approval on every request.
 
 Generate a policy candidate locally, review it, and then place the reviewed JSON at `config/runtime_security.override.json`:

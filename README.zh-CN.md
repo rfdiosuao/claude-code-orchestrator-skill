@@ -114,7 +114,7 @@ Skill = Codex 的操作说明书
 - 启动合约不可变且不含密钥，prompt 走受控 stdin，队列正文进入受保护存储，unsafe grant 只能消费一次。
 - 后台、团队、workflow、队列和可视启动都使用身份感知 containment；旧版 PID-only run 不允许强停。
 - 安全事件使用严格字段白名单、本地 hash chain、认证 checkpoint、私有失败标记和硬容量上限。
-- Runtime CI 在 Ubuntu、Windows、macOS 的 Python 3.10/3.12 上运行完整契约测试集。Windows 验证生产 Job Object containment；POSIX 环境验证明确的 fail-closed 边界，仅在 `mock-stream-test` 内使用测试专用 containment。
+- Runtime CI 在 Windows 的 Python 3.10/3.12 上运行完整测试集。Ubuntu 和 macOS 运行专门的 POSIX 契约套件，覆盖进程身份、runtime 策略、受保护存储、安装/发布行为和生产 fail-closed 边界；Linux 还验证非 UTF-8 Git 路径的字节级精确性。
 
 </details>
 
@@ -391,7 +391,7 @@ Windows PowerShell：
 
 ```powershell
 $tmp = Join-Path $env:TEMP "claude-code-orchestrator-skill.zip"; `
-iwr -UseBasicParsing "https://github.com/chu459/claude-code-orchestrator-skill/archive/refs/heads/main.zip" -OutFile $tmp; `
+iwr -UseBasicParsing "https://github.com/rfdiosuao/claude-code-orchestrator-skill/archive/refs/tags/v0.8.0.zip" -OutFile $tmp; `
 $dir = Join-Path $env:TEMP "claude-code-orchestrator-skill"; `
 if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }; `
 Expand-Archive $tmp -DestinationPath $dir -Force; `
@@ -402,10 +402,12 @@ macOS / Linux：
 
 ```bash
 tmp="$(mktemp -d)" && \
-curl -L "https://github.com/chu459/claude-code-orchestrator-skill/archive/refs/heads/main.zip" -o "$tmp/skill.zip" && \
+curl -L "https://github.com/rfdiosuao/claude-code-orchestrator-skill/archive/refs/tags/v0.8.0.zip" -o "$tmp/skill.zip" && \
 unzip -q "$tmp/skill.zip" -d "$tmp" && \
-bash "$tmp"/claude-code-orchestrator-skill-main/install/install.sh
+bash "$tmp"/claude-code-orchestrator-skill-0.8.0/install/install.sh
 ```
+
+只有在不可变的 `v0.8.0` tag 发布后才能用于生产安装。请把归档 SHA-256 记入部署日志，禁止替换成 `main.zip`。
 
 <h2 align="center">手动安装</h2>
 

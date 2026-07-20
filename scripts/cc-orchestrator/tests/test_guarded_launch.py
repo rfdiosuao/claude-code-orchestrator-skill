@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import ctypes
+import errno
 import hashlib
 import io
 import json
@@ -202,6 +203,49 @@ def _spawn_identity_status_poll(
         results.put((index, "error", f"{type(exc).__name__}: {exc}"))
 
 
+def _spawn_posix_containment_launch(
+    workspace: str,
+    artifact_root: str,
+    runs_dir: str,
+    prepared_payload: dict[str, object],
+    results: object,
+) -> None:
+    try:
+        orchestrator.WORKSPACE_ROOT = Path(workspace)
+        orchestrator.ARTIFACT_ROOT = Path(artifact_root)
+        orchestrator.RUNS_DIR = Path(runs_dir)
+        orchestrator.RUN_INDEX_DIR = Path(runs_dir) / "index"
+        prepared = orchestrator.PreparedWorkerLaunch(
+            **prepared_payload,
+            transaction_deadline_monotonic=time.monotonic() + 30,
+        )
+        fixture_token = orchestrator._TEST_ONLY_RUNTIME_CANDIDATE.set(None)
+        try:
+            with (
+                patch.object(orchestrator.sys, "platform", "linux"),
+                patch.object(
+                    orchestrator, "_start_one_shot_launch"
+                ) as one_shot,
+                patch.object(
+                    orchestrator, "_start_streaming_controller"
+                ) as streaming,
+            ):
+                result = orchestrator.start_prepared_worker_launch(prepared)
+        finally:
+            orchestrator._TEST_ONLY_RUNTIME_CANDIDATE.reset(fixture_token)
+        results.put(
+            (
+                "ok",
+                result.get("status"),
+                (result.get("security_error") or {}).get("code"),
+                one_shot.called,
+                streaming.called,
+            )
+        )
+    except BaseException as exc:
+        results.put(("error", f"{type(exc).__name__}: {exc}"))
+
+
 def _native_unprivileged_ubuntu_or_macos() -> bool:
     if os.name != "posix" or not hasattr(os, "geteuid") or os.geteuid() == 0:
         return False
@@ -251,7 +295,7 @@ def _unsupported_identity(pid: int, nonce: str) -> ProcessIdentity:
 class GuardedLaunchFixture(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="guarded-launch-")
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(self._cleanup_temp_workspace)
         self.addCleanup(self._cleanup_owned_workers)
         self.workspace = Path(self.temp.name).resolve()
         self.artifact_root = (
@@ -331,6 +375,25 @@ class GuardedLaunchFixture(unittest.TestCase):
         for item in self.patches:
             item.start()
             self.addCleanup(item.stop)
+
+    def _cleanup_temp_workspace(self) -> None:
+        try:
+            self.temp.cleanup()
+            return
+        except OSError:
+            pass
+        deadline = time.monotonic() + 5.0
+        path = Path(self.temp.name)
+        while True:
+            try:
+                shutil.rmtree(path)
+                return
+            except FileNotFoundError:
+                return
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
 
     def _cleanup_owned_workers(self) -> None:
         with orchestrator._ACTIVE_WORKER_HANDLES_LOCK:
@@ -10276,8 +10339,59 @@ class TwelfthReviewLifecycleRegressionTests(TenthReviewFixture):
                 self.assertFalse((run_dir / "pid.txt").exists(), persisted)
 
 
+class TenthReviewPortableIdentityEncodingTests(unittest.TestCase):
+    def test_windows_file_id_preserves_volume_and_high_64_bits(self) -> None:
+        low = orchestrator._windows_file_id_from_parts(
+            0x1234, b"\x01" + (b"\x00" * 15)
+        )
+        high = orchestrator._windows_file_id_from_parts(
+            0x1_0000_1234, (b"\x00" * 8) + b"\x01" + (b"\x00" * 7)
+        )
+
+        self.assertEqual(low, (0x1234, 1))
+        self.assertEqual(high, (0x1_0000_1234, 1 << 64))
+        self.assertNotEqual(low, high)
+
+    def test_json_safe_text_is_injective_for_surrogate_and_literal_escape(self) -> None:
+        surrogate_name = "invalid-\udcff.txt"
+        literal_name = r"invalid-\udcff.txt"
+        crossed_left = "\udcff" + r"\udcfe"
+        crossed_right = r"\udcff" + "\udcfe"
+        values = (
+            surrogate_name,
+            literal_name,
+            crossed_left,
+            crossed_right,
+        )
+        encoded = [orchestrator._json_safe_text(value) for value in values]
+
+        self.assertEqual(len(set(encoded)), len(values), encoded)
+        serialized = json.dumps(encoded, ensure_ascii=False)
+        self.assertNotIn("\ufffd", serialized)
+        self.assertIn("~cc-json-escaped~surrogate:", serialized)
+
+
 @unittest.skipUnless(os.name == "nt", "Windows tenth-cycle publication regression")
 class TenthReviewWindowsPublicationTests(TenthReviewFixture):
+    def test_managed_file_paths_use_full_width_file_id_info(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        target = run_dir / "full-width-file-id.json"
+        orchestrator._atomic_write_text(target, '{"state":"ready"}')
+        real_file_id_info = orchestrator._windows_file_id_info
+
+        with patch.object(
+            orchestrator,
+            "_windows_file_id_info",
+            wraps=real_file_id_info,
+        ) as file_id_info:
+            with orchestrator._open_windows_managed_file(
+                target, verify_private=False
+            ) as (_handle, details):
+                self.assertEqual(len(details["file_id"]), 2)
+
+        self.assertGreaterEqual(file_id_info.call_count, 3)
+
     def test_atomic_write_compares_only_native_windows_identity(self) -> None:
         run_dir = self.runs_dir / orchestrator.new_run_id()
         orchestrator._set_private_directory(run_dir)
@@ -10326,6 +10440,76 @@ class TenthReviewWindowsPublicationTests(TenthReviewFixture):
         self.assertTrue(drifted)
         self.assertEqual(target.read_text(encoding="utf-8"), '{"state":"before"}')
 
+    def test_final_replace_recheck_blocks_native_identity_drift(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        target = run_dir / "final-native-drift.json"
+        orchestrator._atomic_write_text(target, '{"state":"before"}')
+        candidate = orchestrator._prepare_private_atomic_write(
+            target, b'{"state":"after"}'
+        )
+        real_identity = orchestrator._windows_file_handle_identity
+        identity_calls = 0
+
+        def drift_on_final_check(
+            handle: object, name: str
+        ) -> tuple[int, int]:
+            nonlocal identity_calls
+            identity_calls += 1
+            identity = real_identity(handle, name)
+            if identity_calls >= 2:
+                return identity[0], identity[1] ^ (1 << 96)
+            return identity
+
+        try:
+            with patch.object(
+                orchestrator,
+                "_windows_file_handle_identity",
+                side_effect=drift_on_final_check,
+            ):
+                with self.assertRaisesRegex(
+                    orchestrator.OrchestratorError,
+                    "Atomic artifact source identity changed",
+                ):
+                    orchestrator._replace_prepared_atomic_write(
+                        candidate, target, precommit=lambda: None
+                    )
+            self.assertGreaterEqual(identity_calls, 2)
+            self.assertEqual(
+                target.read_text(encoding="utf-8"), '{"state":"before"}'
+            )
+        finally:
+            orchestrator._discard_prepared_atomic_write(candidate)
+
+    def test_discard_identity_drift_never_deletes_named_successor(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        target = run_dir / "discard-native-drift.json"
+        candidate = orchestrator._prepare_private_atomic_write(
+            target, b"approved"
+        )
+        retained = candidate.with_name(candidate.name + ".retained")
+        candidate.replace(retained)
+        candidate.write_text("successor", encoding="utf-8")
+        real_identity = orchestrator._windows_file_handle_identity
+
+        def drift(handle: object, name: str) -> tuple[int, int]:
+            identity = real_identity(handle, name)
+            return identity[0], identity[1] ^ (1 << 96)
+
+        try:
+            with patch.object(
+                orchestrator,
+                "_windows_file_handle_identity",
+                side_effect=drift,
+            ):
+                orchestrator._discard_prepared_atomic_write(candidate)
+            self.assertEqual(candidate.read_text(encoding="utf-8"), "successor")
+            self.assertEqual(retained.read_bytes(), b"approved")
+        finally:
+            candidate.unlink(missing_ok=True)
+            retained.unlink(missing_ok=True)
+
     def test_artifact_lock_candidate_rejects_native_identity_drift(self) -> None:
         run_dir = self.runs_dir / orchestrator.new_run_id()
         orchestrator._set_private_directory(run_dir)
@@ -10370,9 +10554,13 @@ class TenthReviewWindowsPublicationTests(TenthReviewFixture):
         buffer = ctypes.create_unicode_buffer(32768)
         length = kernel32.GetShortPathNameW(str(run_dir), buffer, len(buffer))
         if not length or length >= len(buffer):
+            if os.environ.get("CI"):
+                self.fail("Windows CI must provide an 8.3 short-path alias")
             self.skipTest("Windows short-path aliases are unavailable")
         short_path = Path(buffer.value)
         if os.path.normcase(str(short_path)) == os.path.normcase(str(run_dir)):
+            if os.environ.get("CI"):
+                self.fail("Windows CI short-path alias matched the long path")
             self.skipTest("Windows short-path alias is identical to the long path")
 
         with orchestrator._open_windows_managed_directory(
@@ -11541,6 +11729,63 @@ class TenthReviewGitMultiplicityTests(TenthReviewGitFixture):
 
 @unittest.skipUnless(os.name == "posix", "POSIX surrogate-escape path regression")
 class TenthReviewPosixPathEncodingTests(TenthReviewGitFixture):
+    def test_surrogateescaped_and_literal_keys_remain_distinct(self) -> None:
+        surrogate_name = os.fsdecode(b"invalid-\xff.txt")
+        literal_name = r"invalid-\udcff.txt"
+        crossed_left = os.fsdecode(b"\xff") + r"\udcfe"
+        crossed_right = r"\udcff" + os.fsdecode(b"\xfe")
+        scrubbed = orchestrator._scrub_data_keyed_mapping(
+            {
+                surrogate_name: {"kind": "surrogate"},
+                literal_name: {"kind": "literal"},
+                crossed_left: {"kind": "crossed-left"},
+                crossed_right: {"kind": "crossed-right"},
+            },
+            (),
+        )
+
+        self.assertEqual(len(scrubbed), 4, scrubbed)
+        self.assertEqual(
+            {item["kind"] for item in scrubbed.values()},
+            {"surrogate", "literal", "crossed-left", "crossed-right"},
+        )
+        serialized = json.dumps(scrubbed, ensure_ascii=False)
+        self.assertNotIn("\ufffd", serialized)
+        self.assertIn("~cc-json-escaped~surrogate:", serialized)
+        self.assertIn(literal_name.replace("\\", "\\\\"), serialized)
+
+    def test_git_subprocess_requests_surrogateescape_decoding(self) -> None:
+        stdout = os.fsdecode(b"invalid-\xff.txt\x00")
+
+        class FakeGitProcess:
+            pid = os.getpid()
+            returncode = 0
+
+            def communicate(self, timeout: float) -> tuple[str, str]:
+                self.timeout = timeout
+                return stdout, ""
+
+            def kill(self) -> None:
+                self.returncode = -9
+
+        with (
+            patch.object(
+                orchestrator, "_DISCOVERED_GIT_COMMAND", sys.executable
+            ),
+            patch.object(
+                orchestrator,
+                "_PINNED_SUBPROCESS_POPEN",
+                return_value=FakeGitProcess(),
+            ) as popen,
+        ):
+            completed = orchestrator.run_git_command(
+                self.workspace, ["status", "--porcelain=v2", "-z"]
+            )
+
+        self.assertEqual(completed.stdout, stdout)
+        self.assertEqual(popen.call_args.kwargs["encoding"], "utf-8")
+        self.assertEqual(popen.call_args.kwargs["errors"], "surrogateescape")
+
     def test_non_utf8_unicode_and_backslash_names_recover_distinct_exact_bytes(self) -> None:
         if shutil.which("git") is None:
             self.skipTest("git is unavailable")
@@ -11555,11 +11800,18 @@ class TenthReviewPosixPathEncodingTests(TenthReviewGitFixture):
         ]
         root_bytes = os.fsencode(str(self.workspace))
         for raw_name in raw_names:
-            fd = os.open(
-                os.path.join(root_bytes, raw_name),
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o600,
-            )
+            try:
+                fd = os.open(
+                    os.path.join(root_bytes, raw_name),
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+            except OSError as exc:
+                if exc.errno == errno.EILSEQ:
+                    self.skipTest(
+                        "filesystem rejects non-UTF-8 byte path components"
+                    )
+                raise
             try:
                 os.write(fd, b"base\n")
             finally:
@@ -13277,6 +13529,81 @@ class TaskSevenStopIdentityTests(GuardedLaunchFixture):
                     result["security_error"]["code"],
                     "runtime_containment_unavailable",
                 )
+
+    def test_production_posix_fails_closed_in_fresh_thread(self) -> None:
+        prepared = self._prepare("one_shot")
+        observed: list[dict[str, object]] = []
+
+        def launch() -> None:
+            observed.append(
+                orchestrator.start_prepared_worker_launch(prepared)
+            )
+
+        with (
+            patch.object(orchestrator.sys, "platform", "linux"),
+            patch.object(
+                orchestrator, "_start_one_shot_launch"
+            ) as one_shot,
+            patch.object(
+                orchestrator, "_start_streaming_controller"
+            ) as streaming,
+        ):
+            thread = threading.Thread(target=launch)
+            thread.start()
+            thread.join(timeout=30)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(observed), 1, observed)
+        self.assertEqual(observed[0]["status"], "blocked_runtime_launch")
+        self.assertEqual(
+            observed[0]["security_error"]["code"],
+            "runtime_containment_unavailable",
+        )
+        one_shot.assert_not_called()
+        streaming.assert_not_called()
+
+    def test_production_posix_fails_closed_in_fresh_spawn(self) -> None:
+        prepared = self._prepare("one_shot")
+        payload = {
+            "mode": prepared.mode,
+            "launch_spec": prepared.launch_spec,
+            "prompt_bytes": prepared.prompt_bytes,
+            "safe_route_metadata": orchestrator._thaw_route_value(
+                prepared.safe_route_metadata
+            ),
+            "expected_child_launches": prepared.expected_child_launches,
+            "selected_model": prepared.selected_model,
+            "skip_cost_guard": prepared.skip_cost_guard,
+            "sensitive_values": prepared.sensitive_values,
+            "audit_secret_values": prepared.audit_secret_values,
+        }
+        context = multiprocessing.get_context("spawn")
+        results = context.Queue()
+        process = context.Process(
+            target=_spawn_posix_containment_launch,
+            args=(
+                str(self.workspace),
+                str(self.artifact_root),
+                str(self.runs_dir),
+                payload,
+                results,
+            ),
+        )
+        process.start()
+        observed = results.get(timeout=40)
+        process.join(timeout=40)
+
+        self.assertEqual(process.exitcode, 0, observed)
+        self.assertEqual(
+            observed,
+            (
+                "ok",
+                "blocked_runtime_launch",
+                "runtime_containment_unavailable",
+                False,
+                False,
+            ),
+        )
 
     def test_runtime_tree_support_names_only_kernel_enforced_mechanism(self) -> None:
         fixture_token = orchestrator._TEST_ONLY_RUNTIME_CANDIDATE.set(None)

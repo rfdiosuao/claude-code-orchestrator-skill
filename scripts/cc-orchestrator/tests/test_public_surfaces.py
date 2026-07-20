@@ -113,7 +113,13 @@ class PublicSurfaceContractTests(unittest.TestCase):
         self.assertIs(launch.call_args.kwargs["allow_unsafe_runtime"], True)
 
     def test_benchmark_suite_forwards_exact_approval_to_every_item(self) -> None:
-        with patch.object(orchestrator, "benchmark_model", return_value={"ok": True}) as benchmark:
+        with (
+            patch.object(
+                orchestrator, "benchmark_model", return_value={"ok": True}
+            ) as benchmark,
+            patch.object(orchestrator, "append_model_benchmark_history"),
+            patch.object(orchestrator, "build_model_registry"),
+        ):
             orchestrator.benchmark_suite(execute=True, allow_unsafe_runtime=True)
         self.assertEqual(benchmark.call_count, len(orchestrator.BENCHMARK_SUITE_TASKS))
         self.assertTrue(all(call.kwargs["allow_unsafe_runtime"] is True for call in benchmark.call_args_list))

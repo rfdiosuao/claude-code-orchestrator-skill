@@ -1043,32 +1043,14 @@ Add deterministic selftest gates for provider deny families, immutable public me
 
 - [x] **Step 2: Expand CI to the required matrix**
 
-Change the OS matrix to:
+Use Python 3.10 and 3.12 on Windows, Ubuntu, and macOS, with jobs that match the declared production boundary:
 
-```yaml
-os:
-  - ubuntu-latest
-  - windows-latest
-  - macos-latest
-python-version:
-  - "3.10"
-  - "3.12"
-```
+- Windows runs the complete discovered suite, successful production `selftest`, and `mock-stream-test`; it is the production launch platform because Job Objects provide kernel-enforced whole-tree containment.
+- Ubuntu and macOS run the portable process-identity, runtime-policy, protected-storage, installer, release, and selftest contracts plus direct, fresh-thread, and fresh-spawn production fail-closed tests.
+- Linux additionally creates byte-exact non-UTF-8 Git paths; macOS runs decoder and collision contracts because APFS rejects those byte names.
+- POSIX production `selftest` must exit nonzero and report unsupported containment with no test-only mechanism.
 
-Add steps:
-
-```yaml
-- name: Compile Python entrypoints and security modules
-  run: python -m py_compile scripts/cc-orchestrator/cc_orchestrator.py scripts/cc-orchestrator/server.py scripts/cc-orchestrator/runtime_security.py scripts/cc-orchestrator/process_identity.py scripts/cc-orchestrator/secure_payload_store.py
-
-- name: Run guarded runtime unit and integration tests
-  run: python -m unittest discover -s scripts/cc-orchestrator/tests -v
-
-- name: Run orchestrator selftest
-  run: python scripts/cc-orchestrator/cc_orchestrator.py selftest
-```
-
-Keep action SHAs pinned and add `docs/superpowers/**` and `SKILL.md` to path filters.
+Keep action SHAs pinned and add `docs/superpowers/**` and `SKILL.md` to path filters. Do not claim full production launch support or force Windows-only whole-tree tests to pass through POSIX test fixtures.
 
 - [x] **Step 3: Document the operator workflow**
 
@@ -1113,13 +1095,13 @@ Expected:
 
 - compilation succeeds;
 - all new unit/integration tests pass;
-- selftest returns `"ok": true`;
+- Windows selftest returns `"ok": true`; POSIX CI separately proves that production selftest fails closed on the containment gate;
 - mock stream reports all exercised streaming, polling, stop, output-budget, final-only, usage, and cwd-artifact gates; platform-specific process capabilities remain covered by native unit tests and healthcheck;
 - version assertion succeeds;
 - VitePress build succeeds;
 - `git diff --check` is silent.
 
-Local result: 480 tests passed with 15 platform skips and no failures; all 18 mock-stream gates passed; dependency audit reported 0 vulnerabilities.
+Current Windows local result: 502 tests passed in 397.184 seconds with 17 platform skips and no failures. Windows selftest passed 59/59 checks, mock streaming passed 18/18 gates, and the complete hosted Windows 3.10/3.12 suites plus dedicated Ubuntu/macOS contracts remain mandatory before merge.
 
 - [x] **Step 7: Run repository-wide secret and unfinished-marker scans**
 

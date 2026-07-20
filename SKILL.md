@@ -311,7 +311,7 @@ Use the same role names through MCP:
 - `cc_usage_summary` estimates daily tokens, duration, failures, and per-model usage from logs.
 - `cc_queue_submit`, `cc_queue_tick`, `cc_queue_status`, and `cc_queue_cancel` provide priority queue scheduling with `queued`, `running`, `done`, `failed`, `timed_out`, and `cancelled` states.
 - `cc_upgrade_check` records version state while preserving local calibration/cost files.
-- `cc_mock_stream_test` uses a fake Claude stream to validate `events.ndjson`, polling, status, and stop without spending model quota.
+- `cc_mock_stream_test` uses a fake Claude stream to validate `events.ndjson`, polling, status, and stop without spending model quota. It is local same-user `stdio` diagnostics only, is not registered by default, and requires `CC_ORCHESTRATOR_ENABLE_LOCAL_DIAGNOSTICS=1` in a temporary local server process. Never expose it through SSE/HTTP or a proxy, and exclude it from remotely reachable tool allowlists.
 - `cc_init_workspace` initializes `.agent-workspace`, run/report/dashboard/archive/rollback/log/tmp/template/policy dirs, and optionally `CLAUDE.md`.
 - `cc_workspace_status` shows the exact paths where Codex and Claude Code artifacts will be written.
 - `cc_migrate_data` previews or moves legacy `runs`, `reports`, and `dashboard` into the managed workspace.

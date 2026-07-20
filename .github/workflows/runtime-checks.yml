@@ -41,16 +41,12 @@ permissions:
   contents: read
 
 jobs:
-  runtime:
-    runs-on: ${{ matrix.os }}
+  runtime-windows:
+    runs-on: windows-latest
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
-          - macos-latest
         python-version:
           - "3.10"
           - "3.12"
@@ -79,6 +75,84 @@ jobs:
 
       - name: Run mock streaming integration test
         run: python scripts/cc-orchestrator/cc_orchestrator.py mock-stream-test --timeout-seconds 60
+
+  runtime-posix:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+        python-version:
+          - "3.10"
+          - "3.12"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install runtime test dependencies
+        run: python -m pip install --disable-pip-version-check -r scripts/cc-orchestrator/requirements-runtime.txt
+
+      - name: Compile Python entrypoints
+        run: python -m py_compile scripts/cc-orchestrator/cc_orchestrator.py scripts/cc-orchestrator/runtime_security.py scripts/cc-orchestrator/process_identity.py scripts/cc-orchestrator/secure_payload_store.py scripts/cc-orchestrator/server.py
+
+      - name: Run POSIX release contract suite
+        working-directory: scripts/cc-orchestrator/tests
+        run: >-
+          python -m unittest -v
+          test_process_identity
+          test_runtime_security
+          test_secure_payload_store
+          test_release_contract
+          test_selftest_contract
+          test_install_preservation.InstallerPreservationTests.test_both_installers_preserve_only_the_installed_runtime_override
+          test_install_preservation.InstallerPreservationTests.test_native_installer_preserves_override_and_ignores_workspace_audit_key
+          test_install_preservation.InstallerPreservationTests.test_release_manifests_agree_and_declare_runtime_override
+          test_guarded_launch.TenthReviewPortableIdentityEncodingTests
+          test_guarded_launch.TenthReviewPosixPathEncodingTests.test_surrogateescaped_and_literal_keys_remain_distinct
+          test_guarded_launch.TenthReviewPosixPathEncodingTests.test_git_subprocess_requests_surrogateescape_decoding
+          test_guarded_launch.TaskSevenStopIdentityTests.test_production_posix_launch_fails_before_any_runtime_process
+          test_guarded_launch.TaskSevenStopIdentityTests.test_production_posix_fails_closed_in_fresh_thread
+          test_guarded_launch.TaskSevenStopIdentityTests.test_production_posix_fails_closed_in_fresh_spawn
+          test_guarded_launch.TaskSevenStopIdentityTests.test_runtime_tree_support_names_only_kernel_enforced_mechanism
+
+      - name: Run Linux byte-path and launch-boundary contracts
+        if: runner.os == 'Linux'
+        working-directory: scripts/cc-orchestrator/tests
+        run: >-
+          python -m unittest -v
+          test_guarded_launch.TenthReviewPosixPathEncodingTests.test_non_utf8_unicode_and_backslash_names_recover_distinct_exact_bytes
+
+      - name: Verify production selftest fails closed
+        shell: python
+        run: |
+          import json
+          import subprocess
+          import sys
+
+          completed = subprocess.run(
+              [sys.executable, "scripts/cc-orchestrator/cc_orchestrator.py", "selftest"],
+              capture_output=True,
+              text=True,
+              encoding="utf-8",
+              errors="replace",
+              check=False,
+          )
+          assert completed.returncode != 0, completed.stdout
+          payload = json.loads(completed.stdout)
+          containment = payload["runtime_security"]["process_tree_containment"]
+          assert containment["supported"] is False, containment
+          assert containment["mechanism"] is None, containment
+          assert containment["test_only"] is False, containment
 
   release:
     runs-on: ubuntu-latest
