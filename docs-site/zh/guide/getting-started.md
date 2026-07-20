@@ -38,6 +38,8 @@ bash "$tmp"/claude-code-orchestrator-skill-main/install/install.sh
 ~/.codex/skills/claude-code-orchestrator
 ```
 
+> **平台边界：** v0.8.0 的生产级 guarded worker 执行仅支持 Windows。macOS 和 Linux 可以安装并运行管理检查，但在实现整棵进程树 containment 之前，启动命令会 fail closed。
+
 ## 设置工具路径
 
 Windows PowerShell：

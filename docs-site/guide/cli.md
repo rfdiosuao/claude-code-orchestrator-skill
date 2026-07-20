@@ -130,10 +130,11 @@ Runs are stored under:
 ```text
 .agent-workspace/claude-code-orchestrator/runs/<run_id>/
   metadata.json
-  prompt.txt
   stdout.txt
   stderr.txt
 ```
+
+Immediate prompt/context text is sent over guarded stdin and is not persisted in the run directory.
 
 On Windows, tail stdout:
 

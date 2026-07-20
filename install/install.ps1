@@ -21,7 +21,7 @@ if (Test-Path -LiteralPath $target) {
 }
 
 New-Item -ItemType Directory -Force -Path $target | Out-Null
-robocopy $repoRoot $target /E /XD .git runs reports dashboard .agent-workspace node_modules __pycache__ /XF *.pyc model_calibration.json model_registry.json model_benchmark_history.json local_policy.override.json worker_quality_history.json cost_guard.json queue_policy.json version_state.json queue.json | Out-Null
+robocopy $repoRoot $target /E /XD .git runs reports dashboard .agent-workspace node_modules __pycache__ /XF *.pyc model_calibration.json model_registry.json model_benchmark_history.json local_policy.override.json runtime_security.override.json runtime_security.audit.key worker_quality_history.json cost_guard.json queue_policy.json version_state.json queue.json | Out-Null
 if ($LASTEXITCODE -gt 7) {
     throw "robocopy failed with exit code $LASTEXITCODE"
 }
@@ -32,6 +32,7 @@ $preserveRelative = @(
     "scripts\cc-orchestrator\config\model_registry.json",
     "scripts\cc-orchestrator\config\model_benchmark_history.json",
     "scripts\cc-orchestrator\config\local_policy.override.json",
+    "scripts\cc-orchestrator\config\runtime_security.override.json",
     "scripts\cc-orchestrator\config\worker_quality_history.json",
     "scripts\cc-orchestrator\config\cost_guard.json",
     "scripts\cc-orchestrator\config\queue_policy.json",
@@ -43,8 +44,13 @@ if (Test-Path -LiteralPath $backup) {
         $source = Join-Path $backup $relative
         $destination = Join-Path $target $relative
         if (Test-Path -LiteralPath $source) {
+            $expectedHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
             New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
             Copy-Item -LiteralPath $source -Destination $destination -Force
+            $actualHash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash
+            if ($actualHash -ne $expectedHash) {
+                throw "Preserved local config failed verification: $relative"
+            }
             Write-Host "Preserved local config: $relative"
         }
     }

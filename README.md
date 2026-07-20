@@ -15,7 +15,7 @@
 <p align="center">
   <a href="README.zh-CN.md"><img alt="README: 中文" src="https://img.shields.io/badge/README-中文-red"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-brightgreen"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-v0.7.1-black">
+  <img alt="Version" src="https://img.shields.io/badge/version-v0.8.0-black">
   <img alt="Codex Skill" src="https://img.shields.io/badge/Codex-Skill-0A0A0A">
   <img alt="MCP Included" src="https://img.shields.io/badge/MCP-Included-blue">
   <img alt="CCSwitch" src="https://img.shields.io/badge/CCSwitch-Model_Router-purple">
@@ -60,11 +60,12 @@ This is a miniature cost-management operating system for multi-agent coding.
 <h2 align="center">Latest Updates</h2>
 
 <p align="center">
-  <b>Current version: v0.7.1</b>
+  <b>Current version: v0.8.0</b>
 </p>
 
 | Version | What changed | Why it matters |
 | --- | --- | --- |
+| `v0.8.0` | Adds guarded runtime launch: isolated provider environments, immutable launch contracts, explicit policy-plus-request approval for custom runtimes, identity-safe process control, protected prompt/queue transport, and authenticated bounded security audits. | Codex can supervise external Claude Code workers without trusting ambient executable overrides, leaking prompt/API material into process metadata, or terminating a reused PID. |
 | `v0.7.1` | Fixes #24: manual `workflow-retry-node` now changes the workflow status from `succeeded` to `needs_rerun`, records invalidated nodes, and marks old node handoff/gate/token evidence as stale. | Codex and dashboards no longer accept a workflow that was manually invalidated. Pending nodes must run again before the workflow can be treated as done. |
 | `v0.7.0` | Adds the first workflow DAG controller layer for GitHub issues #20, #21, and #22: YAML/JSON workflow validation, dry-run topological batches, mock workflow execution, structured handoff templates and validation, node gates, retry decisions, loop guard, workflow status, reports, and MCP tools. | Codex can now test long-running multi-agent pipelines as small verifiable nodes instead of one vague conversation. The first version is intentionally mock-safe, controller-owned, and data-backed before spending model quota. |
 | `v0.6.4` | Fixed GitHub issues #16, #17, and #18: final-only output now budgets persisted final text instead of raw stream noise, `--cwd` runs use the cwd-scoped artifact root with a run index for polling, and actual token aggregates are computed from raw `modelUsage` before redaction. | Codex now has measurable evidence for low-noise worker supervision: short final-only tasks no longer die from thinking/system stream noise, project artifacts stay inside the target workspace, and usage dashboards do not report fake zero-token runs. |
@@ -80,7 +81,22 @@ This is a miniature cost-management operating system for multi-agent coding.
 | `v0.2.0` | Added live streaming control: `run-streaming`, `poll-run`, `stop-run`, `run-status`, team spawning, cross review, dashboard, reports, and cost guard. | Codex can watch and manage Claude Code workers in real time instead of waiting blindly. |
 | `v0.1.0` | Built the first Skill + MCP + CLI foundation with CCSwitch profile discovery, model scoring, role routing, `CLAUDE.md` generation, visible Claude Code windows, logs, and safe defaults. | Proved the core idea: Codex is the brain, Claude Code is the worker layer, CCSwitch is the local model router. |
 
+> [!IMPORTANT]
+> Production guarded worker execution is currently Windows-only in v0.8.0. macOS and Linux support installation, configuration, inspection, and fail-closed validation, but real worker launch is blocked until a kernel-enforced whole-process-tree containment backend is available.
+
 <h3 align="center">Detailed Version Notes</h3>
+
+<details open>
+<summary><b>v0.8.0 - Guarded Runtime Launch</b></summary>
+
+- Provider settings are reduced to an explicit allowlist; loader, shell, path, Git-config, and orchestrator-control variables are denied.
+- Custom runtimes require a complete recursive executable identity pin plus explicit approval on each CLI/MCP request.
+- Launch contracts are immutable and secret-free, prompts use guarded stdin, queued payloads use the protected store, and unsafe grants are single-use.
+- Background, team, workflow, queue, and visible launches use identity-aware containment and refuse PID-only legacy stops.
+- Security events use a strict allowlist, a local hash chain, authenticated checkpoints, private failure markers, and bounded capacity.
+- Runtime CI executes the complete contract suite on Ubuntu, Windows, and macOS with Python 3.10 and 3.12. Windows exercises production Job Object containment; POSIX cells verify the explicit fail-closed boundary and use test-only containment only inside `mock-stream-test`.
+
+</details>
 
 <details open>
 <summary><b>v0.7.1 - Manual Retry Invalidates Workflow Success</b></summary>

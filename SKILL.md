@@ -16,7 +16,7 @@ Codex owns planning, write-scope decisions, final review, and final response. Cl
 Default routing:
 
 - Discover CCSwitch from `$env:CCSWITCH_HOME`, `$env:USERPROFILE\.cc-switch`, or the current user home.
-- Discover Claude Code from `$env:CLAUDE_CODE_BIN`, `where claude`, and common Claude Code install paths.
+- Discover Claude Code only from recognized guarded installation layouts. Ambient `CLAUDE_CODE_BIN` and inherited `PATH` are not approvals; custom runtimes must be pinned in `runtime_security.override.json`.
 - Score every Claude model found in CCSwitch, then choose the best local model for each agent role.
 
 The orchestrator reads CCSwitch profiles in read-only mode and injects provider env vars only into the launched Claude Code process. It should not rewrite CCSwitch global state.
@@ -235,6 +235,12 @@ python "$env:CC_ORCHESTRATOR_HOME\cc_orchestrator.py" diff --cwd "PROJECT_PATH"
 ## Safety Rules
 
 - Default to read-only/plan mode.
+- Never add `--allow-unsafe-runtime` or MCP `allow_unsafe_runtime=true` on the user's behalf. A custom runtime requires both a matching local recursive identity pin and explicit approval for that one request.
+- Treat `runtime_identity_changed`, `process_identity_mismatch`, and `process_identity_unverified` as controller stop conditions. Surface the structured error to the user; do not downgrade to PID-only signaling, and do not claim that `--force` bypasses identity verification.
+- Immediate prompts travel through the guarded stdin channel and must not be reconstructed in argv, `prompt.txt`, metadata, logs, or audit events. Queued unsafe retries require a new single-use grant.
+- Treat the installed `config/runtime_security.override.json` and each project's audit set as different ownership domains. Upgrades preserve the override; they must not copy, rotate, or recreate `<artifact_root>/config/runtime_security.audit.key`.
+- Before accepting a custom-runtime run, require healthy security audit status. `local_unsafe` fails closed when audit is unavailable; trusted-default degraded operation must remain explicitly marked and reviewed.
+- Treat production guarded worker execution as Windows-only in v0.8.0. On macOS or Linux, surface `runtime_containment_unavailable`; never reinterpret the test-only mock process group as production containment.
 - Use `--allow-write` only for scoped implementation tasks after Codex has identified the write set.
 - Never print or persist raw API keys. The orchestrator redacts secrets, but still avoid requesting secrets in prompts.
 - After any write-enabled Claude Code run, inspect diffs and run verification before reporting success.

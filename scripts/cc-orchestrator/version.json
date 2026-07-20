@@ -1,9 +1,11 @@
 {
   "name": "claude-code-orchestrator-skill",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "schema_version": 2,
-  "released_at": "2026-06-16",
+  "released_at": "2026-07-18",
   "notes": [
+    "Adds guarded runtime launch end to end: provider-environment isolation, immutable launch contracts, explicit two-factor authorization for pinned custom runtimes, process-identity-safe stop semantics, protected prompt transport, single-use queue grants, and authenticated bounded security audit trails.",
+    "Documents that production guarded worker execution is Windows-only in v0.8.0; macOS and Linux fail closed until kernel-enforced whole-process-tree containment is available.",
     "Adds controller operations hardening for GitHub issues #3-#12: transactional role-team launch, hard output budgets, route-preserving follow-ups, Windows UTF-8 validation, risk/secret classification, source-vs-artifact diffs, operations dashboard, controller pressure reports, and supervisor decision review.",
     "Completes the issue audit by expanding controller pressure reports, usage summaries, and dashboard output with model totals, token estimates, warning/blocking counts, and sanitized metadata writes.",
     "Records Claude stream modelUsage as actual_model_usage, groups usage by actual model when available, and flags route_mismatch when the declared route differs from the billed model.",
@@ -17,6 +19,7 @@
     "scripts/cc-orchestrator/config/model_registry.json",
     "scripts/cc-orchestrator/config/model_benchmark_history.json",
     "scripts/cc-orchestrator/config/local_policy.override.json",
+    "scripts/cc-orchestrator/config/runtime_security.override.json",
     "scripts/cc-orchestrator/config/worker_quality_history.json",
     "scripts/cc-orchestrator/config/cost_guard.json",
     "scripts/cc-orchestrator/config/queue_policy.json",

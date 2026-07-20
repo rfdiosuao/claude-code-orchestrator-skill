@@ -38,6 +38,8 @@ The default install target is:
 ~/.codex/skills/claude-code-orchestrator
 ```
 
+> **Platform boundary:** Production guarded worker execution is Windows-only in v0.8.0. macOS and Linux can install and run administrative checks, but launch commands fail closed until whole-process-tree containment is implemented.
+
 ## Set the tool path
 
 Windows PowerShell:

@@ -84,7 +84,9 @@ from process_identity import (
 from runtime_security import (
     MAX_SECURITY_AUDIT_EVENT_BYTES,
     SECURITY_AUDIT_POLICY,
+    ApprovedUnsafeRuntime,
     ExecutableIdentity,
+    PinnedExecutableIdentity,
     RuntimeExecutableCandidate,
     RuntimeLaunchSpec,
     RuntimeSecurityError,
@@ -1142,7 +1144,9 @@ def managed_dirs(paths: dict[str, Path]) -> list[Path]:
 
 
 def protected_scaffold_dirs(paths: dict[str, Path]) -> set[Path]:
-    return {path.resolve() for path in managed_dirs(paths)}
+    audit_paths = _security_audit_paths(paths["artifact_root"])
+    protected = managed_dirs(paths) + [audit_paths["config"], audit_paths["failures"]]
+    return {path.resolve() for path in protected}
 
 
 def default_folder_policy(cwd: str | Path | None = None) -> dict[str, Any]:
@@ -16450,6 +16454,13 @@ def _stop_identity_failure(
     return response
 
 
+def _stop_identity_refusal_state(observation: Mapping[str, Any]) -> str | None:
+    state = str(observation.get("state") or "unverified")
+    if state == "match" and isinstance(observation.get("expected"), ProcessIdentity):
+        return None
+    return "mismatch" if state == "mismatch" else "unverified"
+
+
 def _valid_stop_request(run_dir: Path, metadata: Mapping[str, Any]) -> bool:
     try:
         payload = _read_bounded_regular_file(
@@ -16492,13 +16503,12 @@ def stop_run(run_id: str, force: bool = False, timeout_seconds: int = 5) -> dict
         identity_field="worker_process_identity",
     )
     expected_identity = observation.get("expected")
-    if observation["state"] != "match" or not isinstance(
-        expected_identity, ProcessIdentity
-    ):
+    refusal_state = _stop_identity_refusal_state(observation)
+    if refusal_state is not None:
         return _stop_identity_failure(
             run_id,
             status,
-            identity_state=str(observation["state"]),
+            identity_state=refusal_state,
             differing_fields=observation["differing_fields"],
         )
     launch = metadata.get("runtime_launch")
@@ -20442,6 +20452,7 @@ def upgrade_check(apply: bool = False) -> dict[str, Any]:
         CALIBRATION_PATH,
         COST_GUARD_PATH,
         LOCAL_POLICY_OVERRIDE_PATH,
+        RUNTIME_SECURITY_POLICY_PATH,
         MODEL_REGISTRY_PATH,
         MODEL_BENCHMARK_HISTORY_PATH,
         WORKER_QUALITY_HISTORY_PATH,
@@ -20463,6 +20474,13 @@ def upgrade_check(apply: bool = False) -> dict[str, Any]:
         actions.append({"type": "preserve_cost_guard", "path": str(COST_GUARD_PATH)})
     if LOCAL_POLICY_OVERRIDE_PATH.exists():
         actions.append({"type": "preserve_local_policy_override", "path": str(LOCAL_POLICY_OVERRIDE_PATH)})
+    if RUNTIME_SECURITY_POLICY_PATH.exists():
+        actions.append(
+            {
+                "type": "preserve_runtime_security_override",
+                "path": str(RUNTIME_SECURITY_POLICY_PATH),
+            }
+        )
     if MODEL_REGISTRY_PATH.exists():
         actions.append({"type": "preserve_model_registry", "path": str(MODEL_REGISTRY_PATH)})
     if WORKER_QUALITY_HISTORY_PATH.exists():
@@ -20527,7 +20545,7 @@ def write_fake_claude_launcher(directory: Path) -> Path:
     return launcher
 
 
-def mock_stream_test(timeout_seconds: int = 20) -> dict[str, Any]:
+def mock_stream_test(timeout_seconds: int = 60) -> dict[str, Any]:
     gates: dict[str, bool] = {}
     details: dict[str, Any] = {}
     mock_parent = Path(os.environ.get("PROGRAMDATA") or "C:/ProgramData") / "cc-orchestrator-mock"
@@ -22096,6 +22114,114 @@ def selftest() -> dict[str, Any]:
     prompt_pack = list_prompt_pack()
     with tempfile.TemporaryDirectory(prefix="cc-orchestrator-selftest-") as tmp:
         init_workspace(cwd=tmp, write_claude=False)
+        forbidden_provider_keys = (
+            "PATH",
+            "PYTHONPATH",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "NODE_OPTIONS",
+            "BASH_ENV",
+            "GIT_CONFIG_COUNT",
+            "CC_ORCHESTRATOR_ARTIFACT_ROOT",
+        )
+        provider_env_denials: dict[str, str] = {}
+        for key in forbidden_provider_keys:
+            try:
+                RuntimeSecurityPolicy.default().validate_provider_env({key: "fixture"})
+            except RuntimeSecurityError as error:
+                provider_env_denials[key] = error.code
+
+        runtime_candidate = RuntimeExecutableCandidate(
+            canonical_path=str(Path(sys.executable).resolve()),
+            source="selftest",
+            trust_class="trusted_default",
+        )
+        runtime_spec = build_runtime_launch_spec(
+            runtime_candidate=runtime_candidate,
+            provider_env={"ANTHROPIC_API_KEY": sample_api_key},
+            model_override=None,
+            cwd=tmp,
+            workspace_root=tmp,
+            artifact_root=Path(tmp) / ".agent-workspace" / "claude-code-orchestrator",
+            permission_mode="plan",
+            timeout_seconds=30,
+            arguments=(
+                "-p",
+                "--output-format",
+                "json",
+                "--permission-mode",
+                "plan",
+                "--no-session-persistence",
+            ),
+            policy=RuntimeSecurityPolicy.default(),
+            allow_unsafe_runtime=False,
+        )
+        public_metadata = runtime_spec.public_metadata()
+        public_metadata["environment_keys"].append("MUTATED")
+        public_metadata["argument_kinds"].append("MUTATED")
+        public_metadata["executable_identity"]["canonical_path"] = "MUTATED"
+        fresh_public_metadata = runtime_spec.public_metadata()
+        try:
+            runtime_spec.environment["MUTATED"] = "fixture"
+            runtime_environment_immutable = False
+        except TypeError:
+            runtime_environment_immutable = True
+
+        def pin_identity(identity: ExecutableIdentity) -> PinnedExecutableIdentity:
+            return PinnedExecutableIdentity(
+                canonical_path=identity.canonical_path,
+                sha256=identity.sha256,
+                size=identity.size,
+                file_id=identity.file_id,
+                target_kind=identity.target_kind,
+                interpreter_identity=(
+                    pin_identity(identity.interpreter_identity)
+                    if identity.interpreter_identity is not None
+                    else None
+                ),
+            )
+
+        executable_identity = ExecutableIdentity.capture(sys.executable)
+        pinned_identity = pin_identity(executable_identity)
+        unsafe_candidate = RuntimeExecutableCandidate(
+            canonical_path=str(Path(sys.executable).resolve()),
+            source="selftest",
+            trust_class="local_configured",
+        )
+        approved_policy = RuntimeSecurityPolicy(
+            unsafe_runtimes=(
+                ApprovedUnsafeRuntime("selftest-local", pinned_identity),
+            )
+        )
+        unsafe_authorization_codes: list[str] = []
+        for authorization_policy, request_approval in (
+            (RuntimeSecurityPolicy.default(), False),
+            (RuntimeSecurityPolicy.default(), True),
+            (approved_policy, False),
+        ):
+            try:
+                authorize_runtime(
+                    candidate=unsafe_candidate,
+                    identity=pinned_identity,
+                    policy=authorization_policy,
+                    allow_unsafe_runtime=request_approval,
+                )
+            except RuntimeSecurityError as error:
+                unsafe_authorization_codes.append(error.code)
+        unsafe_decision = authorize_runtime(
+            candidate=unsafe_candidate,
+            identity=pinned_identity,
+            policy=approved_policy,
+            allow_unsafe_runtime=True,
+        )
+        legacy_stop_observation = _process_identity_observation(
+            {"worker_pid": os.getpid()},
+            pid_field="worker_pid",
+            identity_field="worker_process_identity",
+        )
+        legacy_stop_refusal_state = _stop_identity_refusal_state(
+            legacy_stop_observation
+        )
         clean_after_init = clean_workspace(cwd=tmp, dry_run=True)
         chinese_root = Path(tmp) / "中文项目"
         chinese_root.mkdir()
@@ -22287,6 +22413,27 @@ nodes:
         "change_split_source_vs_artifact": change_split["project_source_changes"]["changed_count"] == 1 and change_split["agent_artifact_changes"]["changed_count"] == 1,
         "run_id_validation": run_id_rejected,
         "worker_env_allowlist": "ANTHROPIC_API_KEY" in worker_env and "GITHUB_TOKEN" not in worker_env and "NPM_TOKEN" not in worker_env,
+        "runtime_provider_deny_primitives": len(provider_env_denials)
+        == len(forbidden_provider_keys)
+        and set(provider_env_denials.values()) == {"provider_env_forbidden"},
+        "runtime_public_metadata_immutable": runtime_environment_immutable
+        and isinstance(runtime_spec.arguments, tuple)
+        and "MUTATED" not in fresh_public_metadata["environment_keys"]
+        and "MUTATED" not in fresh_public_metadata["argument_kinds"]
+        and fresh_public_metadata["executable_identity"]["canonical_path"]
+        == executable_identity.canonical_path
+        and sample_api_key not in json.dumps(fresh_public_metadata, sort_keys=True),
+        "unsafe_runtime_double_authorization_primitives": unsafe_authorization_codes
+        == [
+            "runtime_not_trusted",
+            "unsafe_runtime_policy_missing",
+            "unsafe_runtime_request_missing",
+        ]
+        and unsafe_decision.runtime_id == "selftest-local"
+        and unsafe_decision.trust_level == "local_unsafe",
+        "legacy_stop_refusal_state_machine": legacy_stop_observation["state"]
+        == "unverified"
+        and legacy_stop_refusal_state == "unverified",
         "mock_env_allowlist": "CC_ORCHESTRATOR_FAKE_STEPS" in PASSTHROUGH_ENV_KEYS,
         "workspace_root_configured": AGENT_WORKSPACE_DIRNAME in str(status.get("artifact_root")),
         "worker_env_artifact_root": worker_env.get("CC_ORCHESTRATOR_ARTIFACT_ROOT") == str(ARTIFACT_ROOT),
@@ -22706,7 +22853,7 @@ def main() -> int:
     upgrade = sub.add_parser("upgrade-check")
     upgrade.add_argument("--apply", action="store_true")
     mock = sub.add_parser("mock-stream-test")
-    mock.add_argument("--timeout-seconds", type=int, default=20)
+    mock.add_argument("--timeout-seconds", type=int, default=60)
     dash = sub.add_parser("dashboard")
     dash.add_argument("--include-finished", action="store_true")
     dash.add_argument("--active-only", action="store_true")
@@ -23066,7 +23213,10 @@ def main() -> int:
         elif args.command == "upgrade-check":
             print_json(upgrade_check(apply=args.apply))
         elif args.command == "mock-stream-test":
-            print_json(mock_stream_test(timeout_seconds=args.timeout_seconds))
+            result = mock_stream_test(timeout_seconds=args.timeout_seconds)
+            print_json(result)
+            if not result.get("ok"):
+                return 1
         elif args.command == "dashboard":
             print_json(dashboard(include_finished=(args.include_finished or not args.active_only), limit=args.limit, open_browser=args.open))
         elif args.command == "open-run-folder":

@@ -144,3 +144,91 @@ python tools\cc-orchestrator\cc_orchestrator.py run-visible "Inspect this projec
 - CCSwitch remains the source of provider URLs, tokens, and model names.
 
 To add a stronger model later, add or update the provider in CCSwitch, then rerun `score-models`, `write-auto-policy`, and `write-reports`.
+
+## Guarded runtime operations
+
+### Platform support
+
+Production guarded worker execution is currently Windows-only in v0.8.0 because Windows Job Objects provide the required kernel-enforced whole-process-tree containment. macOS and Linux remain supported for installation, configuration, reports, and contract checks, but every production worker launch fails closed with `runtime_containment_unavailable`. The process-group mechanism used by `mock-stream-test` is an explicit test fixture and must never be treated as production containment.
+
+Recognized Claude Code installations use the `trusted_default` path and need no new configuration. Ambient `CLAUDE_CODE_BIN` and inherited `PATH` values are not runtime approvals. A custom executable must be an absolute path in `config/runtime_security.override.json`, have a complete recursive identity pin, and receive a separate approval on every request.
+
+Generate a policy candidate locally, review it, and then place the reviewed JSON at `config/runtime_security.override.json`:
+
+```powershell
+$env:RUNTIME_EXE = "C:\absolute\path\to\claude.exe"
+@'
+import json, os
+from runtime_security import ExecutableIdentity
+
+def pin(identity):
+    return {
+        "canonical_path": identity.canonical_path,
+        "sha256": identity.sha256,
+        "size": identity.size,
+        "file_id": None if identity.file_id is None else list(identity.file_id),
+        "target_kind": identity.target_kind,
+        "interpreter_identity": None if identity.interpreter_identity is None else pin(identity.interpreter_identity),
+    }
+
+identity = ExecutableIdentity.capture(os.environ["RUNTIME_EXE"])
+print(json.dumps({
+    "schema_version": 1,
+    "runtime_executable": identity.canonical_path,
+    "extra_provider_env_keys": [],
+    "unsafe_runtimes": [{"runtime_id": "reviewed-local-runtime", "identity": pin(identity)}],
+}, indent=2))
+'@ | python -
+```
+
+Recreate and review the full pin after any executable, wrapper, or interpreter update. Do not copy only the digest: `canonical_path`, `sha256`, `size`, `file_id`, `target_kind`, and the recursive `interpreter_identity` are all part of the approval.
+
+The policy alone is insufficient. For a reviewed request, add `--allow-unsafe-runtime` to the selected CLI command or set MCP `allow_unsafe_runtime=true`. This flag is request-scoped; controllers must never infer or add it automatically. Queue grants are protected, bound to the queued authorization, and consumed once. A retry or follow-up that needs the custom runtime requires a new grant.
+
+### Security errors
+
+| Code | Operator action |
+| --- | --- |
+| `provider_env_invalid` | Correct malformed or duplicate provider entries. |
+| `provider_env_forbidden` | Remove process-control, loader, shell, Git-config, path, or orchestrator variables. They cannot be allowlisted. |
+| `provider_env_unrecognized` | Remove the key or explicitly add a non-forbidden vendor key to `extra_provider_env_keys`. |
+| `provider_env_too_large` | Reduce the value or total provider environment size. |
+| `runtime_policy_invalid` | Correct the exact schema and absolute paths; never weaken the parser. |
+| `runtime_candidate_unrecognized` | Install Claude Code in a recognized layout or pin the custom executable. |
+| `unsafe_runtime_request_invalid` | Send a literal boolean approval through the supported CLI/MCP surface. |
+| `runtime_not_trusted` | Review the candidate; do not retry with approval until a matching local pin exists. |
+| `unsafe_runtime_policy_missing` | Add and review the local identity pin before requesting unsafe use. |
+| `unsafe_runtime_request_missing` | Obtain user approval for this request, then resubmit it with the request flag. |
+| `runtime_identity_changed` | Stop, recapture the complete identity chain, investigate the change, and update the pin only after review. |
+| `runtime_containment_unavailable` | Use a platform/backend that can prove ownership and contain the process tree. |
+| `process_identity_mismatch` | Do not signal the PID; inspect the recorded identity and clean up the owned process manually. |
+| `process_identity_unverified` | Do not signal the PID; use supported identity capture or perform manual process cleanup. |
+| `secure_payload_store_unavailable` | Restore the OS-protected payload store before retrying prompt or queue work. |
+| `visible_runtime_unsupported` | Use `run-streaming` and `poll-run` instead of an unguarded visible launch. |
+| `runtime_policy_drift` | Submit a new queue job under the current policy; do not reuse the stale authorization. |
+| `security_audit_unavailable` | Restore the last known-good private audit set before another custom-runtime launch. |
+| `trusted_runtime_authorized` | Informational; no operator action is required. |
+| `unsafe_runtime_authorized` | Monitor the run and keep final acceptance pending controller review. |
+
+Public `security_error` responses can also report bounded launch or operation failures. Follow their `next_step`, inspect the run metadata, and retry only after confirming cleanup. Never turn a timeout, identity failure, or audit failure into a raw PID kill.
+
+### Stop, prompt, and audit rules
+
+`stop-run --force` accelerates cleanup only after process identity has been verified; it does not bypass identity checks. Legacy PID-only metadata, missing launch nonces, mismatches, and unsupported capability states return `stopped=false`. Surface that result to the user and perform any necessary manual cleanup outside the orchestrator.
+
+Immediate task/context text is delivered after spawn through an anonymous stdin pipe. It is not placed in argv, `prompt.txt`, runtime metadata, or the security audit. Queued text stays in the OS-protected payload store and is removed according to the queue transaction rather than copied into queue metadata.
+
+The project audit set is separate from the installed Skill:
+
+- `<artifact_root>/config/runtime_security.audit.key` is the 32-byte private HMAC key.
+- `<artifact_root>/logs/security-events.ndjson` is the append-only local hash chain.
+- `<artifact_root>/logs/security-events.checkpoint.json` authenticates event count, tail hash, and byte length.
+- Lock and failure-marker material under `<artifact_root>/config` and the sibling bootstrap directory records cross-process failures.
+
+Events are allowlisted and secret-free: schema/timestamp, code/severity, run/runtime/trust identifiers, provider pseudonym, policy decision and dedupe identifiers, safe field names, recommended action, predecessor hash, and record hash. Values from prompts, credentials, provider endpoints, and arbitrary details are not stored. The per-event limit is 16 KiB; the log limit is 32 MiB, and health becomes unhealthy before less than one maximum-size event remains.
+
+There is no automatic rotation or repair. When capacity is low or verification fails, stop writers and preserve the key, log, checkpoint, lock, and applicable failure markers as one private evidence set. Restore only a matching known-good set, or switch the project to a fresh artifact root after archiving the old set. Never delete/rekey one component in place. Audit failure blocks `local_unsafe`; a trusted-default launch may continue only with explicit `audit_degraded` status. Code rollback must preserve the installed override and all project audit material.
+
+For operations, alert externally at 70% audit capacity and pause new `local_unsafe` work at 85%; the built-in hard gate is reserved for the final 16 KiB. During upgrade, stop concurrent installer runs and record the timestamped backup path. If installation or verification fails, the previous tree remains in that backup even if the active target is incomplete.
+
+Do not run a pre-0.8.0 installer to roll back: older installers do not know how to restore `runtime_security.override.json`. Either restore the complete pre-upgrade backup, or extract the old tag and replace versioned files while explicitly excluding the override. Preserve and hash the override before and after rollback. Do not roll back or clean the project artifact root; archive its key, log, checkpoint, lock, failure markers, and sibling bootstrap failure directory together with their permissions. If the old code lacks guarded custom-runtime support, disable custom/unsafe runtimes after rollback and use only a recognized trusted default.

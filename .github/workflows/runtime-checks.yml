@@ -6,12 +6,34 @@ on:
       - main
     paths:
       - scripts/cc-orchestrator/**
+      - install/**
       - examples/workflows/**
+      - docs/superpowers/**
+      - docs-site/**
+      - README.md
+      - README.zh-CN.md
+      - SKILL.md
+      - version.json
+      - package.json
+      - package-lock.json
+      - .gitignore
+      - .github/workflows/deploy-docs.yml
       - .github/workflows/runtime-checks.yml
   pull_request:
     paths:
       - scripts/cc-orchestrator/**
+      - install/**
       - examples/workflows/**
+      - docs/superpowers/**
+      - docs-site/**
+      - README.md
+      - README.zh-CN.md
+      - SKILL.md
+      - version.json
+      - package.json
+      - package-lock.json
+      - .gitignore
+      - .github/workflows/deploy-docs.yml
       - .github/workflows/runtime-checks.yml
   workflow_dispatch:
 
@@ -21,7 +43,7 @@ permissions:
 jobs:
   runtime:
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -49,8 +71,105 @@ jobs:
       - name: Compile Python entrypoints
         run: python -m py_compile scripts/cc-orchestrator/cc_orchestrator.py scripts/cc-orchestrator/runtime_security.py scripts/cc-orchestrator/process_identity.py scripts/cc-orchestrator/secure_payload_store.py scripts/cc-orchestrator/server.py
 
-      - name: Run guarded runtime contract tests
-        run: python -m unittest scripts/cc-orchestrator/tests/test_runtime_security.py scripts/cc-orchestrator/tests/test_process_identity.py scripts/cc-orchestrator/tests/test_secure_payload_store.py scripts/cc-orchestrator/tests/test_public_surfaces.py -v
+      - name: Run complete runtime test suite
+        run: python -m unittest discover -s scripts/cc-orchestrator/tests -v
 
       - name: Run orchestrator selftest
         run: python scripts/cc-orchestrator/cc_orchestrator.py selftest
+
+      - name: Run mock streaming integration test
+        run: python scripts/cc-orchestrator/cc_orchestrator.py mock-stream-test --timeout-seconds 60
+
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Check release version consistency
+        shell: python
+        run: |
+          import json
+          from pathlib import Path
+
+          root = json.loads(Path("version.json").read_text(encoding="utf-8"))
+          portable = json.loads(Path("scripts/cc-orchestrator/version.json").read_text(encoding="utf-8"))
+          package = json.loads(Path("package.json").read_text(encoding="utf-8"))
+          lock = json.loads(Path("package-lock.json").read_text(encoding="utf-8"))
+          assert root == portable
+          assert root["version"] == "0.8.0"
+          assert root["released_at"] == "2026-07-18"
+          assert any("guarded runtime" in note.lower() for note in root["notes"])
+          assert root["version"] == package["version"] == lock["version"] == lock["packages"][""]["version"]
+
+      - name: Scan tracked files for secrets
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+
+          patterns = [
+              re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{10,}"),
+              re.compile(r"(?<![A-Za-z0-9_])ghp_[A-Za-z0-9_]{20,}"),
+              re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
+              re.compile(r"npm_[A-Za-z0-9]{20,}"),
+              re.compile(r"AKIA[0-9A-Z]{16}"),
+              re.compile(r"AIza[0-9A-Za-z_-]{35}"),
+              re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]{20,}"),
+              re.compile(r"-----BEGIN (RSA|OPENSSH|PRIVATE) KEY-----"),
+          ]
+          names = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")
+          hits = []
+          for name in filter(None, names):
+              path = Path(name)
+              if path.name == "runtime_security.audit.key":
+                  hits.append(name)
+                  continue
+              try:
+                  text = path.read_text(encoding="utf-8")
+              except (OSError, UnicodeDecodeError):
+                  continue
+              for line_no, line in enumerate(text.splitlines(), 1):
+                  if any(pattern.search(line) for pattern in patterns):
+                      hits.append(f"{name}:{line_no}")
+          if hits:
+              print("Potential secrets found:")
+              print("\n".join(hits))
+              sys.exit(1)
+
+      - name: Install docs dependencies
+        run: npm ci
+
+      - name: Audit docs dependencies
+        run: npm audit --audit-level=moderate
+
+      - name: Build docs
+        run: npm run docs:build
+
+      - name: Check patch formatting
+        shell: bash
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            git diff --check "${{ github.event.pull_request.base.sha }}...${{ github.sha }}"
+          elif [[ "$GITHUB_EVENT_NAME" == "push" && "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
+            git diff --check "${{ github.event.before }}" "${{ github.sha }}"
+          else
+            git show --check --format= "${{ github.sha }}"
+          fi

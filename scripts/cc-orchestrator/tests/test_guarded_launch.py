@@ -2177,7 +2177,7 @@ class SecondReviewScrubAndScannerTests(GuardedLaunchFixture):
         self.assertLess(float(completed.stdout.strip()), 1.5)
         self.assertIsNotNone(
             orchestrator.classify_secret_line(
-                "prefix sk-abcdefghijklmnopqrstuvwxyz", "fixture", 1
+                "prefix sk-" + "abcdefghijklmnopqrstuvwxyz", "fixture", 1
             )
         )
 

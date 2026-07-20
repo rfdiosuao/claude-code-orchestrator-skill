@@ -38,9 +38,9 @@
 | `scripts/cc-orchestrator/tests/test_guarded_launch.py` | End-to-end fake one-shot/stream/visible/queue/team/follow-up launch coverage |
 | `scripts/cc-orchestrator/tests/test_public_surfaces.py` | CLI and MCP propagation/error-contract coverage |
 | `scripts/cc-orchestrator/tests/test_secure_payload_store.py` | DPAPI/Keychain/Secret Service adapters, opaque queue records, cleanup |
-| `scripts/cc-orchestrator/tests/test_install_preservation.py` | Installer/upgrade preservation of policy and audit key |
-| `install/install.ps1` and `install/install.sh` | Preserve user-owned runtime policy and audit key during install/upgrade |
-| `.gitignore` | Exclude user-owned runtime policy and audit key |
+| `scripts/cc-orchestrator/tests/test_install_preservation.py` | Preserve the installed override while proving project audit keys remain untouched |
+| `install/install.ps1` and `install/install.sh` | Preserve the user-owned runtime override; exclude and never copy project audit keys |
+| `.gitignore` | Exclude the installed override and artifact-root audit keys |
 | `.github/workflows/runtime-checks.yml` | Cross-platform Python matrix and security test gates |
 | `scripts/cc-orchestrator/README.md` | Operator configuration and failure recovery |
 | `SKILL.md` | Controller-facing secure-launch rules |
@@ -1028,12 +1028,20 @@ Run: `git add scripts/cc-orchestrator/runtime_security.py scripts/cc-orchestrato
 - Modify: `install/install.ps1`
 - Modify: `install/install.sh`
 - Modify: `.gitignore`
+- Modify: `package.json`
+- Modify: `package-lock.json`
+- Modify: `README.md`
+- Modify: `README.zh-CN.md`
+- Modify: `docs-site/changelog.md`
+- Modify: `docs-site/zh/changelog.md`
+- Create: `scripts/cc-orchestrator/tests/test_install_preservation.py`
+- Create: `scripts/cc-orchestrator/tests/test_selftest_contract.py`
 
-- [ ] **Step 1: Extend selftest with security gates**
+- [x] **Step 1: Extend selftest with security gates**
 
 Add deterministic selftest gates for provider deny families, immutable public metadata, double authorization, and legacy stop refusal. Keep real process/API tests in `unittest`. Confirm `selftest` exits nonzero whenever any gate is false.
 
-- [ ] **Step 2: Expand CI to the required matrix**
+- [x] **Step 2: Expand CI to the required matrix**
 
 Change the OS matrix to:
 
@@ -1062,7 +1070,7 @@ Add steps:
 
 Keep action SHAs pinned and add `docs/superpowers/**` and `SKILL.md` to path filters.
 
-- [ ] **Step 3: Document the operator workflow**
+- [x] **Step 3: Document the operator workflow**
 
 Document:
 
@@ -1076,15 +1084,15 @@ Document:
 
 Update `SKILL.md` so controllers never auto-set unsafe approval and always surface identity mismatch to the user.
 
-- [ ] **Step 4: Bump release metadata consistently**
+- [x] **Step 4: Bump release metadata consistently**
 
-Set both version files to `0.8.0`, release date `2026-07-18`, and add guarded-runtime notes. Add `scripts/cc-orchestrator/config/runtime_security.override.json` and `scripts/cc-orchestrator/config/runtime_security.audit.key` to both `local_user_owned_files` arrays and `.gitignore`. Update both installers' copy exclusions and preservation/hash checks for these files. Assert both JSON files are identical and installer tests prove policy/key bytes survive an upgrade unchanged.
+Set both version files to `0.8.0`, release date `2026-07-18`, and add guarded-runtime notes. Add only `scripts/cc-orchestrator/config/runtime_security.override.json` to both `local_user_owned_files` arrays, `.gitignore`, and both installers' copy exclusions and preservation checks. The audit key lives at `<artifact_root>/config/runtime_security.audit.key`, outside the installed Skill tree: installers must not copy, generate, rotate, or preserve it. Assert both JSON files are identical, the installed policy survives an upgrade byte-for-byte, and an external artifact-root key remains untouched.
 
-- [ ] **Step 5: Create installer preservation tests**
+- [x] **Step 5: Create installer preservation tests**
 
-Create `scripts/cc-orchestrator/tests/test_install_preservation.py`. In temporary source/target trees, seed unique policy and audit-key bytes, run the installer preservation/copy logic for PowerShell and shell where the host supports it, and assert content plus SHA-256 are unchanged. On a host that cannot execute one installer, parse its declared preserved-file list and require both paths; CI supplies native execution on Windows and Ubuntu/macOS.
+Create `scripts/cc-orchestrator/tests/test_install_preservation.py`. In temporary install and project trees, seed unique policy and external artifact-key bytes, run the native installer for the host, and assert both SHA-256 values are unchanged. Parse both installers and require the policy path while forbidding any audit-key path; CI supplies native execution on Windows and Ubuntu/macOS.
 
-- [ ] **Step 6: Run the complete local release gate**
+- [x] **Step 6: Run the complete local release gate**
 
 Run:
 
@@ -1092,10 +1100,11 @@ Run:
 python -m py_compile scripts/cc-orchestrator/cc_orchestrator.py scripts/cc-orchestrator/server.py scripts/cc-orchestrator/runtime_security.py scripts/cc-orchestrator/process_identity.py scripts/cc-orchestrator/secure_payload_store.py
 python -m unittest discover -s scripts/cc-orchestrator/tests -v
 python scripts/cc-orchestrator/cc_orchestrator.py selftest
-python scripts/cc-orchestrator/cc_orchestrator.py mock-stream-test
+python scripts/cc-orchestrator/cc_orchestrator.py mock-stream-test --timeout-seconds 60
 python -c "import json, pathlib; a=json.loads(pathlib.Path('version.json').read_text(encoding='utf-8')); b=json.loads(pathlib.Path('scripts/cc-orchestrator/version.json').read_text(encoding='utf-8')); assert a == b"
 python -m unittest scripts/cc-orchestrator/tests/test_install_preservation.py -v
 npm ci
+npm audit --audit-level=moderate
 npm run docs:build
 git diff --check
 ```
@@ -1105,29 +1114,31 @@ Expected:
 - compilation succeeds;
 - all new unit/integration tests pass;
 - selftest returns `"ok": true`;
-- mock stream reports all supported process-control gates and explicitly marks unsupported platform gates;
+- mock stream reports all exercised streaming, polling, stop, output-budget, final-only, usage, and cwd-artifact gates; platform-specific process capabilities remain covered by native unit tests and healthcheck;
 - version assertion succeeds;
 - VitePress build succeeds;
 - `git diff --check` is silent.
 
-- [ ] **Step 7: Run repository-wide secret and unfinished-marker scans**
+Local result: 480 tests passed with 15 platform skips and no failures; all 18 mock-stream gates passed; dependency audit reported 0 vulnerabilities.
+
+- [x] **Step 7: Run repository-wide secret and unfinished-marker scans**
 
 Run:
 
 ```powershell
-rg -n "sk-[A-Za-z0-9_-]{8,}|Bearer\s+[A-Za-z0-9._~+/=-]{20,}" . --glob '!node_modules/**' --glob '!.git/**'
+rg -n --pcre2 "(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{8,}|Bearer\s+[A-Za-z0-9._~+/=-]{20,}" . --glob '!node_modules/**' --glob '!.git/**'
 $markers = @(('TO' + 'DO'), ('T' + 'BD'), ('FIX' + 'ME'), ('implement ' + 'later')) -join '|'
-rg -n $markers scripts/cc-orchestrator/runtime_security.py scripts/cc-orchestrator/process_identity.py scripts/cc-orchestrator/tests
+rg -n $markers scripts/cc-orchestrator/cc_orchestrator.py scripts/cc-orchestrator/runtime_security.py scripts/cc-orchestrator/process_identity.py scripts/cc-orchestrator/secure_payload_store.py scripts/cc-orchestrator/tests
 ```
 
 Expected: no real secrets and no unfinished implementation markers.
 
-- [ ] **Step 8: Commit, push, and open the fork PR**
+- [x] **Step 8: Commit, push, and open the fork PR**
 
 Run:
 
 ```powershell
-git add .github/workflows/runtime-checks.yml scripts/cc-orchestrator/README.md SKILL.md version.json scripts/cc-orchestrator/version.json scripts/cc-orchestrator/cc_orchestrator.py
+git add .github/workflows/runtime-checks.yml install .gitignore package.json package-lock.json README.md README.zh-CN.md docs-site docs/superpowers/plans/2026-07-18-guarded-runtime-launch.md scripts/cc-orchestrator/README.md SKILL.md version.json scripts/cc-orchestrator/version.json scripts/cc-orchestrator/cc_orchestrator.py scripts/cc-orchestrator/tests
 git commit -m "docs: release guarded runtime launch"
 git push fork security/guarded-runtime-launch
 gh pr create --repo rfdiosuao/claude-code-orchestrator-skill --base main --head security/guarded-runtime-launch --title "feat: add guarded runtime launch" --body-file .github/PULL_REQUEST_TEMPLATE.md

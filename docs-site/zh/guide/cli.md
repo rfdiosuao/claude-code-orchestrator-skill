@@ -130,10 +130,11 @@ run 会存到：
 ```text
 .agent-workspace/claude-code-orchestrator/runs/<run_id>/
   metadata.json
-  prompt.txt
   stdout.txt
   stderr.txt
 ```
+
+即时 prompt/context 通过受控 stdin 发送，不会持久化到 run 目录。
 
 Windows 实时看 stdout：
 
