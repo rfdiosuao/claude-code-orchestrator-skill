@@ -27,6 +27,7 @@ import threading
 import time
 import uuid
 import zipfile
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -124,6 +125,12 @@ _OPERATION_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextV
 _HELD_ARTIFACT_LOCKS: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar(
     "cc_orchestrator_held_artifact_locks", default=frozenset()
 )
+_TERMINAL_EVENT_APPEND: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "cc_orchestrator_terminal_event_append", default=False
+)
+_ATOMIC_PRECOMMIT: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
+    "cc_orchestrator_atomic_precommit", default=None
+)
 _PROCESS_ARTIFACT_LOCK_TOKENS: dict[str, str] = {}
 _PROCESS_ARTIFACT_LOCK_TOKENS_LOCK = threading.Lock()
 _LEGACY_RECLAIM_LOCKS: dict[str, threading.Lock] = {}
@@ -132,6 +139,8 @@ _PROCESS_LAUNCH_LOCK_TOKENS: dict[str, str] = {}
 _PROCESS_LAUNCH_LOCK_TOKENS_LOCK = threading.Lock()
 _ACTIVE_CLEANUP_OWNERS: dict[str, threading.Thread] = {}
 _ACTIVE_CLEANUP_OWNERS_LOCK = threading.Lock()
+TERMINALIZATION_TIMEOUT_SECONDS = 1.0
+WORKER_FINALIZATION_GRACE_SECONDS = TERMINALIZATION_TIMEOUT_SECONDS + 0.25
 
 
 def _effective_deadline(deadline: float | None = None) -> float | None:
@@ -142,6 +151,18 @@ def _check_deadline(deadline: float | None = None, message: str = "Operation exc
     effective = _effective_deadline(deadline)
     if effective is not None and time.monotonic() >= effective:
         raise TimeoutError(message)
+
+
+@contextlib.contextmanager
+def _terminal_artifact_scope() -> Any:
+    """Give best-effort terminal persistence a short, independent deadline."""
+    token = _OPERATION_DEADLINE.set(
+        time.monotonic() + TERMINALIZATION_TIMEOUT_SECONDS
+    )
+    try:
+        yield
+    finally:
+        _OPERATION_DEADLINE.reset(token)
 
 
 def _guard_public_launch_transaction(timeout_position: int) -> Any:
@@ -169,9 +190,10 @@ def _guard_public_launch_transaction(timeout_position: int) -> Any:
             except TimeoutError:
                 return {
                     "ok": False,
-                    "status": "blocked_runtime_launch",
+                    "status": "timed_out",
                     "timed_out": True,
-                    "exit_code": None,
+                    "stop_reason": "timeout",
+                    "exit_code": 124,
                     "terminal_state_count": 1,
                     "persisted": False,
                     "persistence_state": "not_created",
@@ -257,6 +279,44 @@ CONTROLLER_OS_BASELINE_KEYS = (
 )
 _ACTIVE_WORKER_HANDLES: dict[str, subprocess.Popen[Any]] = {}
 _ACTIVE_WORKER_HANDLES_LOCK = threading.Lock()
+
+
+@dataclass
+class _OwnedProcessTree:
+    generation: str
+    process: subprocess.Popen[Any]
+    kind: str
+    handle: int
+    deadline: float
+    owner_token: str = "caller"
+    state: str = "caller_owned"
+    termination_requested: threading.Event = field(default_factory=threading.Event)
+    completed: threading.Event = field(default_factory=threading.Event)
+    owner: threading.Thread | None = None
+    member_handles: dict[int, int] = field(default_factory=dict)
+    member_wait_confirmed: set[int] = field(default_factory=set)
+    member_close_attempted: set[int] = field(default_factory=set)
+    streams_close_attempted: set[str] = field(default_factory=set)
+    members_captured: bool = False
+    assignment_verified: bool = False
+    job_termination_attempted: bool = False
+    job_active_zero: bool = False
+    job_closed: bool = False
+    root_reaped: bool = False
+    readers_closed: bool = False
+    cleanup_result: str = "owned"
+    api_failures: list[str] = field(default_factory=list)
+    proof_failures: list[str] = field(default_factory=list)
+    lock: Any = field(default_factory=threading.RLock, repr=False)
+
+    def request_termination(self) -> None:
+        self.termination_requested.set()
+
+
+_OWNED_PROCESS_TREES: dict[str, _OwnedProcessTree] = {}
+_OWNED_PROCESS_TREES_LOCK = threading.Lock()
+_PENDING_DESCENDANT_CLEANUPS: dict[int, _OwnedProcessTree] = {}
+_PENDING_DESCENDANT_CLEANUPS_LOCK = threading.Lock()
 CLAUDE_MD_MARKER_BEGIN = "<!-- claude-code-orchestrator:begin -->"
 CLAUDE_MD_MARKER_END = "<!-- claude-code-orchestrator:end -->"
 SECRET_KEY_RE = re.compile(r"(key|token|secret|authorization|auth)", re.IGNORECASE)
@@ -413,10 +473,12 @@ class _OwnedCleanupPending(OrchestratorError):
         self,
         process: subprocess.Popen[Any],
         threads: tuple[threading.Thread, ...] | list[threading.Thread] = (),
+        response_updates: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(f"Owned process {process.pid} is awaiting confirmed reaping.")
         self.process = process
         self.threads = tuple(threads)
+        self.response_updates = dict(response_updates or {})
 
 
 @dataclass(frozen=True)
@@ -575,22 +637,41 @@ def local_configured_candidate(path: str | Path) -> RuntimeExecutableCandidate:
     )
 
 
-def _trusted_candidate_source(path: Path) -> str | None:
+def _trusted_candidate_source(
+    path: Path, *, discovered_path: Path | None = None
+) -> str | None:
     normalized = path.as_posix().casefold()
     local_names = {"claude", "claude.exe"}
-    official_local = (user_home() / ".local" / "bin" / path.name).resolve(
-        strict=False
+    origin = discovered_path or path
+    official_local = user_home() / ".local" / "bin" / origin.name
+    origin_key = os.path.normcase(os.path.abspath(str(origin)))
+    official_key = os.path.normcase(os.path.abspath(str(official_local)))
+    canonical_key = os.path.normcase(os.path.abspath(str(path)))
+    versions_root = os.path.normcase(
+        os.path.abspath(str(user_home() / ".local" / "share" / "claude" / "versions"))
     )
-    if path.name.casefold() in local_names and path == official_local:
-        return "official_user_local"
+    if origin.name.casefold() in local_names and origin_key == official_key:
+        try:
+            within_versions = (
+                os.path.commonpath((canonical_key, versions_root))
+                == versions_root
+            )
+        except ValueError:
+            within_versions = False
+        if canonical_key == official_key or within_versions:
+            return "official_user_local"
     package_suffixes = (
         "/node_modules/@anthropic-ai/claude-code/bin/claude",
         "/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
     )
-    if normalized.endswith(package_suffixes):
-        if "/.workbuddy/binaries/node/versions/" in normalized:
-            return "workbuddy_package"
-        return "anthropic_package"
+    origin_normalized = Path(origin_key).as_posix().casefold()
+    if (
+        normalized.endswith(package_suffixes)
+        and origin_normalized.endswith(package_suffixes)
+        and canonical_key == origin_key
+        and "/.workbuddy/binaries/node/versions/" in normalized
+    ):
+        return "workbuddy_package"
     return None
 
 
@@ -640,7 +721,7 @@ def discover_claude_candidate(
             if resolved and Path(resolved).is_file():
                 candidates.insert(0, (Path(resolved), "environment_override"))
 
-    resolved_candidates: dict[str, tuple[Path, str]] = {}
+    resolved_candidates: dict[str, tuple[Path, str, Path]] = {}
     for candidate, provenance in candidates:
         try:
             resolved = canonical_path(candidate)
@@ -651,7 +732,8 @@ def discover_claude_candidate(
         if previous is None or (
             provenance == "enumerated_root" and previous[1] != "enumerated_root"
         ):
-            resolved_candidates[key] = (resolved, provenance)
+            origin = Path(os.path.abspath(str(candidate.expanduser())))
+            resolved_candidates[key] = (resolved, provenance, origin)
     if not resolved_candidates:
         ambient = os.environ.get("CLAUDE_CODE_BIN")
         action = (
@@ -667,18 +749,23 @@ def discover_claude_candidate(
             suggested_action=action,
         )
 
-    selected, provenance = sorted(
+    selected, provenance, discovered_path = sorted(
         resolved_candidates.values(),
         key=lambda item: (
             0
             if item[1] == "enumerated_root"
-            and _trusted_candidate_source(item[0]) is not None
+            and _trusted_candidate_source(
+                item[0], discovered_path=item[2]
+            )
+            is not None
             else 1,
             _claude_candidate_rank(str(item[0])),
         ),
     )[0]
     trusted_source = (
-        _trusted_candidate_source(selected)
+        _trusted_candidate_source(
+            selected, discovered_path=discovered_path
+        )
         if provenance == "enumerated_root"
         else None
     )
@@ -1254,9 +1341,17 @@ def migrate_data(cwd: str | Path | None = None, apply: bool = False) -> dict[str
 def run_dir_active(run_dir: Path) -> bool:
     try:
         metadata = read_json_file(run_dir / "metadata.json", {})
-        return pid_alive(int(metadata.get("child_pid") or 0)) or pid_alive(int(metadata.get("worker_pid") or 0))
+        if (
+            metadata.get("status") in {"cleanup_pending", "cleanup_incomplete"}
+            or metadata.get("cleanup_state") == "cleanup_incomplete"
+        ):
+            return True
+        return any(
+            pid_alive(int(metadata.get(field) or 0))
+            for field in ("child_pid", "worker_pid", "owned_process_pid")
+        )
     except Exception:
-        return False
+        return True
 
 
 def older_than(path: Path, days: int) -> bool:
@@ -1883,30 +1978,10 @@ def _publish_artifact_lock_candidate(candidate: Path, lock_path: Path) -> None:
     if anchor is None:
         raise OrchestratorError("Artifact lock candidate capability is unavailable.")
     if anchor[0] == "posix":
-        import ctypes
-
-        current = os.stat(
-            candidate.name, dir_fd=anchor[1], follow_symlinks=False
+        published_fd = _publish_posix_retained_source(
+            anchor, lock_path.name
         )
-        if (int(current.st_dev), int(current.st_ino)) != anchor[5]:
-            raise OrchestratorError("Artifact lock candidate identity changed.")
-        libc = ctypes.CDLL(None, use_errno=True)
-        linkat = getattr(libc, "linkat", None)
-        if linkat is None:
-            raise OrchestratorError(
-                "This platform cannot publish a handle-bound artifact lock."
-            )
-        if linkat(
-            anchor[4].fileno(),
-            ctypes.c_char_p(b""),
-            anchor[1],
-            ctypes.c_char_p(os.fsencode(lock_path.name)),
-            0x1000,
-        ) != 0:
-            error = ctypes.get_errno()
-            if error == errno.EEXIST:
-                raise FileExistsError(error, os.strerror(error), str(lock_path))
-            raise OSError(error, os.strerror(error), str(lock_path))
+        os.close(published_fd)
         return
 
     import ctypes
@@ -2257,6 +2332,239 @@ EVENT_RECOVERY_TAIL_BYTES = 4 * 1024 * 1024
 _WINDOWS_REPARSE_POINT = 0x400
 _PREPARED_ATOMIC_PARENTS: dict[str, tuple[str, Any, Any]] = {}
 _PREPARED_ATOMIC_PARENTS_LOCK = threading.Lock()
+
+
+def _posix_fd_digest(fd: int, size: int) -> str:
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < size:
+        chunk = os.pread(fd, min(1024 * 1024, size - offset), offset)
+        if not chunk:
+            raise OrchestratorError(
+                "Retained artifact source ended before its recorded size."
+            )
+        digest.update(chunk)
+        offset += len(chunk)
+    return digest.hexdigest()
+
+
+def _publish_posix_retained_source(
+    anchor: tuple[Any, ...], destination_name: str
+) -> int:
+    """Publish an absent POSIX name from the retained source FD, never its path."""
+    import ctypes
+
+    directory_fd = int(anchor[1])
+    source_fd = int(anchor[4].fileno())
+    expected_identity = anchor[5]
+    source = os.fstat(source_fd)
+    if (
+        not stat.S_ISREG(source.st_mode)
+        or (int(source.st_dev), int(source.st_ino)) != expected_identity
+        or int(source.st_size) > MAX_MANAGED_ARTIFACT_BYTES
+    ):
+        raise OrchestratorError("Retained artifact source capability changed.")
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    published = False
+    if sys.platform.startswith("linux"):
+        linkat = getattr(libc, "linkat", None)
+        if linkat is None:
+            raise OrchestratorError(
+                "FD-bound Linux artifact publication is unavailable."
+            )
+        try:
+            linkat.argtypes = (
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+            )
+            linkat.restype = ctypes.c_int
+        except AttributeError:
+            pass
+        destination = ctypes.c_char_p(os.fsencode(destination_name))
+        ctypes.set_errno(0)
+        result = linkat(
+            source_fd,
+            ctypes.c_char_p(b""),
+            directory_fd,
+            destination,
+            0x1000,
+        )
+        if result != 0:
+            error = ctypes.get_errno()
+            fallback_errors = {
+                errno.EPERM,
+                errno.ENOENT,
+                errno.EINVAL,
+                errno.ENOSYS,
+                getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+            }
+            if error not in fallback_errors:
+                if error == errno.EEXIST:
+                    raise FileExistsError(
+                        error, os.strerror(error), destination_name
+                    )
+                raise OSError(error, os.strerror(error), destination_name)
+            ctypes.set_errno(0)
+            result = linkat(
+                -100,
+                ctypes.c_char_p(
+                    os.fsencode(f"/proc/self/fd/{source_fd}")
+                ),
+                directory_fd,
+                destination,
+                0x400,
+            )
+        if result != 0:
+            error = ctypes.get_errno()
+            if error == errno.EEXIST:
+                raise FileExistsError(
+                    error, os.strerror(error), destination_name
+                )
+            raise OrchestratorError(
+                "FD-bound Linux artifact publication failed."
+            ) from OSError(error, os.strerror(error), destination_name)
+        published = True
+    elif sys.platform == "darwin":
+        clone = getattr(libc, "fclonefileat", None)
+        if clone is None:
+            raise OrchestratorError(
+                "FD-bound macOS artifact publication is unavailable."
+            )
+        try:
+            clone.argtypes = (
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+            )
+            clone.restype = ctypes.c_int
+        except AttributeError:
+            pass
+        ctypes.set_errno(0)
+        if clone(
+            source_fd,
+            directory_fd,
+            ctypes.c_char_p(os.fsencode(destination_name)),
+            0,
+        ) != 0:
+            error = ctypes.get_errno()
+            if error == errno.EEXIST:
+                raise FileExistsError(
+                    error, os.strerror(error), destination_name
+                )
+            raise OrchestratorError(
+                "FD-bound macOS artifact publication failed."
+            ) from OSError(error, os.strerror(error), destination_name)
+        published = True
+    else:
+        raise OrchestratorError(
+            "FD-bound artifact publication is unsupported on this POSIX platform."
+        )
+
+    if not published:
+        raise OrchestratorError("POSIX artifact publication failed closed.")
+    open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    open_flags |= getattr(os, "O_CLOEXEC", 0)
+    published_fd = os.open(
+        destination_name, open_flags, dir_fd=directory_fd
+    )
+    published_details = os.fstat(published_fd)
+    published_key = (
+        int(published_details.st_dev),
+        int(published_details.st_ino),
+    )
+    try:
+        if (
+            not stat.S_ISREG(published_details.st_mode)
+            or int(published_details.st_size) != int(source.st_size)
+            or _posix_fd_digest(published_fd, int(published_details.st_size))
+            != _posix_fd_digest(source_fd, int(source.st_size))
+        ):
+            raise OrchestratorError(
+                "Published artifact does not match its retained source."
+            )
+        os.fsync(directory_fd)
+        return published_fd
+    except Exception:
+        os.close(published_fd)
+        try:
+            current = os.stat(
+                destination_name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if (int(current.st_dev), int(current.st_ino)) == published_key:
+                os.unlink(destination_name, dir_fd=directory_fd)
+                os.fsync(directory_fd)
+        except (FileNotFoundError, OSError):
+            pass
+        raise
+
+
+def _exchange_posix_names(
+    directory_fd: int, first_name: str, second_name: str
+) -> None:
+    """Atomically swap two existing names within one retained directory."""
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    first = ctypes.c_char_p(os.fsencode(first_name))
+    second = ctypes.c_char_p(os.fsencode(second_name))
+    if sys.platform.startswith("linux"):
+        exchange = getattr(libc, "renameat2", None)
+        if exchange is None:
+            raise OrchestratorError(
+                "Atomic Linux generation exchange is unavailable."
+            )
+        try:
+            exchange.argtypes = (
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            )
+            exchange.restype = ctypes.c_int
+        except AttributeError:
+            pass
+        ctypes.set_errno(0)
+        result = exchange(
+            directory_fd, first, directory_fd, second, 0x2
+        )
+    elif sys.platform == "darwin":
+        exchange = getattr(libc, "renameatx_np", None)
+        if exchange is None:
+            raise OrchestratorError(
+                "Atomic macOS generation exchange is unavailable."
+            )
+        try:
+            exchange.argtypes = (
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            )
+            exchange.restype = ctypes.c_int
+        except AttributeError:
+            pass
+        ctypes.set_errno(0)
+        result = exchange(
+            directory_fd, first, directory_fd, second, 0x2
+        )
+    else:
+        raise OrchestratorError(
+            "Atomic generation exchange is unsupported on this POSIX platform."
+        )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OrchestratorError(
+            "Atomic artifact generation exchange failed."
+        ) from OSError(error, os.strerror(error))
 
 
 def _lstat_managed_path(path: Path, *, is_dir: bool) -> os.stat_result:
@@ -3678,7 +3986,12 @@ def _prepare_private_atomic_write(
                 temporary_path, parent_handle=_parent_handle
             )
             handle = handle_context.__enter__()
-            source_details = os.fstat(handle.fileno())
+            import msvcrt
+
+            native_source = msvcrt.get_osfhandle(handle.fileno())
+            source_identity = _windows_relative_handle_details(
+                native_source, temporary_path.name
+            )["file_id"]
             parent_anchor = (
                 "windows",
                 parent_context,
@@ -3686,8 +3999,14 @@ def _prepare_private_atomic_write(
                 _parent_handle,
                 handle_context,
                 handle,
-                (int(source_details.st_dev), int(source_details.st_ino)),
+                (int(source_identity[0]), int(source_identity[1])),
             )
+            source_details = os.fstat(handle.fileno())
+            if (
+                int(source_details.st_dev),
+                int(source_details.st_ino),
+            ) != parent_anchor[6]:
+                raise OrchestratorError("Managed artifact source handle changed.")
         else:
             directory_fd = _open_posix_directory_fd(path.parent)
             temporary_path = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
@@ -3843,6 +4162,9 @@ def _windows_replace_relative(
     information.FileNameLength = len(filename.encode("utf-16-le"))
     information.FileName = filename
     io_status = IoStatusBlock()
+    precommit = _ATOMIC_PRECOMMIT.get()
+    if precommit is not None:
+        precommit()
     status = ntdll.NtSetInformationFile(
         native_handle,
         ctypes.byref(io_status),
@@ -3888,58 +4210,130 @@ def _windows_delete_retained_file(handle: Any) -> None:
 def _posix_replace_relative(
     temporary_path: Path, path: Path, directory_fd: int
 ) -> None:
-    import ctypes
-
     with _PREPARED_ATOMIC_PARENTS_LOCK:
         anchor = _PREPARED_ATOMIC_PARENTS.get(str(temporary_path))
     if anchor is None or anchor[0] != "posix":
         raise OrchestratorError("Atomic artifact source handle is unavailable.")
-    current = os.stat(
-        temporary_path.name, dir_fd=directory_fd, follow_symlinks=False
-    )
-    if (int(current.st_dev), int(current.st_ino)) != anchor[5]:
-        raise OrchestratorError("Atomic artifact source identity changed.")
-    libc = ctypes.CDLL(None, use_errno=True)
-    linkat = getattr(libc, "linkat", None)
-    if linkat is None:
-        raise OrchestratorError(
-            "This platform cannot bind atomic replacement to an open source handle."
-        )
-    bound_name = f".{path.name}.{uuid.uuid4().hex}.bound"
-    at_empty_path = 0x1000
-    result = linkat(
-        anchor[4].fileno(),
-        ctypes.c_char_p(b""),
-        directory_fd,
-        ctypes.c_char_p(os.fsencode(bound_name)),
-        at_empty_path,
-    )
-    if result != 0:
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error))
+    previous_fd: int | None = None
+    previous_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    previous_flags |= getattr(os, "O_CLOEXEC", 0)
     try:
-        os.replace(
-            bound_name,
-            path.name,
-            src_dir_fd=directory_fd,
-            dst_dir_fd=directory_fd,
+        previous_fd = os.open(
+            path.name, previous_flags, dir_fd=directory_fd
         )
+    except FileNotFoundError:
+        previous_fd = None
+
+    def unlink_known_generation(
+        name: str, expected_key: tuple[int, int]
+    ) -> bool:
         try:
             current = os.stat(
-                temporary_path.name,
+                name,
                 dir_fd=directory_fd,
                 follow_symlinks=False,
             )
-            if (int(current.st_dev), int(current.st_ino)) == anchor[5]:
-                os.unlink(temporary_path.name, dir_fd=directory_fd)
-        except FileNotFoundError:
-            pass
-    except Exception:
+            if (int(current.st_dev), int(current.st_ino)) != expected_key:
+                return False
+            os.unlink(name, dir_fd=directory_fd)
+            return True
+        except OSError:
+            return False
+
+    def remove_original_source_name() -> None:
+        unlink_known_generation(temporary_path.name, anchor[5])
+
+    precommit = _ATOMIC_PRECOMMIT.get()
+    try:
+        if precommit is not None:
+            precommit()
+        if previous_fd is None:
+            published_fd = _publish_posix_retained_source(anchor, path.name)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(published_fd)
+            remove_original_source_name()
+            return
+
+        previous = os.fstat(previous_fd)
+        if not stat.S_ISREG(previous.st_mode):
+            raise OrchestratorError(
+                "Atomic artifact target is not a regular file."
+            )
+        previous_key = (int(previous.st_dev), int(previous.st_ino))
+        bound_name = f".{path.name}.{uuid.uuid4().hex}.bound"
+        bound_fd = _publish_posix_retained_source(anchor, bound_name)
+        bound = os.fstat(bound_fd)
+        bound_key = (int(bound.st_dev), int(bound.st_ino))
+        bound_cleanup_key: tuple[int, int] | None = bound_key
         try:
-            os.unlink(bound_name, dir_fd=directory_fd)
-        except FileNotFoundError:
-            pass
-        raise
+            current_target = os.stat(
+                path.name, dir_fd=directory_fd, follow_symlinks=False
+            )
+            current_bound = os.stat(
+                bound_name, dir_fd=directory_fd, follow_symlinks=False
+            )
+            if (
+                (int(current_target.st_dev), int(current_target.st_ino))
+                != previous_key
+                or (int(current_bound.st_dev), int(current_bound.st_ino))
+                != bound_key
+            ):
+                raise OrchestratorError(
+                    "Atomic artifact generation changed before exchange."
+                )
+            _exchange_posix_names(directory_fd, bound_name, path.name)
+            bound_cleanup_key = None
+            published = os.stat(
+                path.name, dir_fd=directory_fd, follow_symlinks=False
+            )
+            displaced = os.stat(
+                bound_name, dir_fd=directory_fd, follow_symlinks=False
+            )
+            published_key = (int(published.st_dev), int(published.st_ino))
+            displaced_key = (int(displaced.st_dev), int(displaced.st_ino))
+            if published_key != bound_key or displaced_key != previous_key:
+                _exchange_posix_names(
+                    directory_fd, bound_name, path.name
+                )
+                restored = os.stat(
+                    path.name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                restored_bound = os.stat(
+                    bound_name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    int(restored.st_dev),
+                    int(restored.st_ino),
+                ) != displaced_key or (
+                    int(restored_bound.st_dev),
+                    int(restored_bound.st_ino),
+                ) != published_key:
+                    raise OrchestratorError(
+                        "Atomic artifact commit is indeterminate after rollback."
+                    )
+                os.fsync(directory_fd)
+                bound_cleanup_key = published_key
+                raise OrchestratorError(
+                    "Atomic artifact exchange published an unexpected generation."
+                )
+            os.fsync(directory_fd)
+            bound_cleanup_key = previous_key
+            remove_original_source_name()
+        finally:
+            os.close(bound_fd)
+            if bound_cleanup_key is not None and unlink_known_generation(
+                bound_name, bound_cleanup_key
+            ):
+                os.fsync(directory_fd)
+    finally:
+        if previous_fd is not None:
+            os.close(previous_fd)
 
 
 def _replace_prepared_atomic_write(
@@ -3964,14 +4358,18 @@ def _replace_prepared_atomic_write(
                 _check_deadline(effective)
                 if precommit is not None:
                     precommit()
-                if parent_anchor[0] == "posix":
-                    directory_fd = parent_anchor[1]
-                    os.fsync(directory_fd)
-                    _posix_replace_relative(temporary_path, path, directory_fd)
-                else:
-                    _windows_replace_relative(
-                        temporary_path, path, parent_anchor[3]
-                    )
+                precommit_token = _ATOMIC_PRECOMMIT.set(precommit)
+                try:
+                    if parent_anchor[0] == "posix":
+                        directory_fd = parent_anchor[1]
+                        os.fsync(directory_fd)
+                        _posix_replace_relative(temporary_path, path, directory_fd)
+                    else:
+                        _windows_replace_relative(
+                            temporary_path, path, parent_anchor[3]
+                        )
+                finally:
+                    _ATOMIC_PRECOMMIT.reset(precommit_token)
                 replaced = True
                 return
             except PermissionError:
@@ -4173,14 +4571,18 @@ def run_git_command(
         remaining = _remaining_deadline(_effective_deadline(), 1.0)
         if remaining <= 0:
             _retain_worker_handle(
-                f"git-cleanup-{process.pid}-{uuid.uuid4().hex}", process
+                f"git-cleanup-{process.pid}-{uuid.uuid4().hex}",
+                process,
+                request_cleanup=True,
             )
             raise
         try:
             stdout, stderr = process.communicate(timeout=remaining)
         except subprocess.TimeoutExpired:
             _retain_worker_handle(
-                f"git-cleanup-{process.pid}-{uuid.uuid4().hex}", process
+                f"git-cleanup-{process.pid}-{uuid.uuid4().hex}",
+                process,
+                request_cleanup=True,
             )
             raise
     if len((stdout or "").encode("utf-8", errors="replace")) + len(
@@ -4367,6 +4769,40 @@ class _LaunchLock:
         self.token = uuid.uuid4().hex
         self.generation = uuid.uuid4().hex
         self.identity: tuple[int, int] | None = None
+
+    def _rollback_published_generation(self, key: str, deadline: float) -> None:
+        """Retire only the generation published by this acquisition attempt."""
+        try:
+            with _locked_artifact_lock_generation(
+                self.path, deadline=deadline
+            ) as (_handle, details, owner_payload):
+                owner = json.loads(owner_payload.decode("utf-8"))
+                generation = _artifact_lock_file_identity(details)
+                if (
+                    isinstance(owner, Mapping)
+                    and owner.get("pid") == os.getpid()
+                    and owner.get("token") == self.token
+                    and owner.get("generation") == self.generation
+                    and _artifact_lock_path_matches_generation(
+                        self.path, generation
+                    )
+                ):
+                    _retire_artifact_lock_file_generation(
+                        self.path, self.generation, generation
+                    )
+        except (
+            FileNotFoundError,
+            OSError,
+            OrchestratorError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ):
+            pass
+        finally:
+            with _PROCESS_LAUNCH_LOCK_TOKENS_LOCK:
+                if _PROCESS_LAUNCH_LOCK_TOKENS.get(key) == self.token:
+                    _PROCESS_LAUNCH_LOCK_TOKENS.pop(key, None)
+            self.identity = None
 
     def _legacy_directory_abandoned(self) -> bool:
         owner_path = self.path / "owner.json"
@@ -4556,17 +4992,21 @@ class _LaunchLock:
                     )
                 time.sleep(0.01)
             except OSError as exc:
+                self._rollback_published_generation(key, deadline)
                 raise OrchestratorError(
                     "Could not acquire the launch lock."
                 ) from exc
+            except Exception:
+                self._rollback_published_generation(key, deadline)
+                raise
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
         key = os.path.normcase(str(self.path.resolve(strict=False)))
-        deadline_token = _OPERATION_DEADLINE.set(None)
+        release_deadline = _effective_deadline()
         try:
             try:
                 with _locked_artifact_lock_generation(
-                    self.path, deadline=_effective_deadline()
+                    self.path, deadline=release_deadline
                 ) as (_handle, details, owner_payload):
                     owner = json.loads(owner_payload.decode("utf-8"))
                     if not isinstance(owner, Mapping):
@@ -4594,7 +5034,6 @@ class _LaunchLock:
             with _PROCESS_LAUNCH_LOCK_TOKENS_LOCK:
                 if _PROCESS_LAUNCH_LOCK_TOKENS.get(key) == self.token:
                     _PROCESS_LAUNCH_LOCK_TOKENS.pop(key, None)
-            _OPERATION_DEADLINE.reset(deadline_token)
         return False
 
 
@@ -4867,13 +5306,28 @@ def _git_transition_evidence(
         str(after.get("_raw_staged_diff_text") or ""),
         list(after.get("_raw_staged_diff_paths") or []),
     )
-    # Compare logical workspace content, not the Git layer carrying it. A
-    # stage/unstage/commit moves the same records between these sets and drops
-    # out individually, while a real edit remains even when the file also
-    # moved layers during the transaction.
-    before_logical = before_staged | before_worktree
-    after_logical = head_changes | after_staged | after_worktree
-    changes = before_logical ^ after_logical
+    # Compare logical workspace content with multiplicity. Identical lines may
+    # move between the staged and worktree layers; set union would collapse
+    # those occurrences and misclassify a layer move as a new edit.
+    def record_counter(
+        records: set[tuple[str, str, str, int]],
+    ) -> Counter[tuple[str, str, str]]:
+        return Counter((path, kind, line) for path, kind, line, _ in records)
+
+    before_logical = record_counter(before_staged) + record_counter(before_worktree)
+    after_logical = (
+        record_counter(head_changes)
+        + record_counter(after_staged)
+        + record_counter(after_worktree)
+    )
+    logical_delta = (after_logical - before_logical) + (
+        before_logical - after_logical
+    )
+    changes = {
+        (*record, occurrence)
+        for record, count in logical_delta.items()
+        for occurrence in range(1, count + 1)
+    }
     before_hashes = before.get("_raw_hashes") or {}
     after_hashes = after.get("_raw_hashes") or {}
     if isinstance(before_hashes, Mapping) and isinstance(after_hashes, Mapping):
@@ -5181,13 +5635,14 @@ def append_event(run_dir: Path, event: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
             events_bytes = handle.tell()
-        _atomic_write_text(
-            seq_path,
-            json.dumps(
-                {"seq": seq, "events_bytes": events_bytes},
-                separators=(",", ":"),
-            ),
-        )
+        if not _TERMINAL_EVENT_APPEND.get():
+            _atomic_write_text(
+                seq_path,
+                json.dumps(
+                    {"seq": seq, "events_bytes": events_bytes},
+                    separators=(",", ":"),
+                ),
+            )
 
 
 def parse_events_delta(path: Path, offset: int = 0, max_bytes: int = 20000) -> dict[str, Any]:
@@ -6454,10 +6909,19 @@ def _endpoint_sensitive_values(value: str) -> tuple[str, ...]:
     try:
         parsed = urlsplit(value)
     except ValueError:
+        if value.casefold().startswith(("http:", "https:")):
+            return _normalize_sensitive_values(
+                (value, unquote(value), unquote_plus(value))
+            )
         return ()
-    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
+    if parsed.scheme.casefold() in {"http", "https"} and not parsed.netloc:
+        return _normalize_sensitive_values(
+            (value, unquote(value), unquote_plus(value))
+        )
+    if parsed.scheme.casefold() not in {"http", "https"}:
         return ()
     sensitive: list[str] = []
+    sensitive.extend((value, unquote(value), unquote_plus(value)))
     for component in (parsed.username, parsed.password):
         if not component:
             continue
@@ -6468,17 +6932,20 @@ def _endpoint_sensitive_values(value: str) -> tuple[str, ...]:
             continue
         decoded_key = unquote_plus(raw_key)
         decoded_value = unquote_plus(raw_value)
-        if should_redact_key(decoded_key, decoded_value):
-            sensitive.extend((raw_value, unquote(raw_value), decoded_value))
+        sensitive.extend((raw_value, unquote(raw_value), decoded_value))
     try:
         query = parse_qsl(parsed.query, keep_blank_values=True)
     except ValueError:
         query = []
-    sensitive.extend(
-        query_value
-        for query_key, query_value in query
-        if query_value and should_redact_key(query_key, query_value)
-    )
+    sensitive.extend(query_value for _query_key, query_value in query if query_value)
+    if parsed.fragment:
+        sensitive.extend(
+            (
+                parsed.fragment,
+                unquote(parsed.fragment),
+                unquote_plus(parsed.fragment),
+            )
+        )
     return _normalize_sensitive_values(sensitive)
 
 
@@ -6486,29 +6953,27 @@ def _sanitize_endpoint(value: str) -> str:
     try:
         parsed = urlsplit(value)
     except ValueError:
-        return value
+        return (
+            SCRUBBED_VALUE
+            if value.casefold().startswith(("http:", "https:"))
+            else value
+        )
     if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
-        return value
+        return (
+            SCRUBBED_VALUE
+            if parsed.scheme.casefold() in {"http", "https"}
+            else value
+        )
     hostname = parsed.hostname
     if not hostname:
-        return value
+        return SCRUBBED_VALUE
     host = f"[{hostname}]" if ":" in hostname and not hostname.startswith("[") else hostname
     try:
         port = parsed.port
     except ValueError:
         port = None
     netloc = f"{host}:{port}" if port is not None else host
-    query = []
-    try:
-        for key, item in parse_qsl(parsed.query, keep_blank_values=True):
-            query.append(
-                (key, SCRUBBED_VALUE if should_redact_key(key, item) else item)
-            )
-    except ValueError:
-        return value
-    return urlunsplit(
-        (parsed.scheme, netloc, parsed.path, urlencode(query), parsed.fragment)
-    )
+    return urlunsplit((parsed.scheme.casefold(), netloc, "", "", ""))
 
 
 def _collect_route_sensitive_values(value: Any) -> tuple[str, ...]:
@@ -6572,9 +7037,7 @@ def _scrub_output_text(text: str, sensitive_values: tuple[str, ...]) -> str:
 def _scrub_guarded_value(value: Any, sensitive_values: tuple[str, ...]) -> Any:
     if isinstance(value, Mapping):
         return {
-            _scrub_exact_text(str(key), sensitive_values): _scrub_guarded_value(
-                item, sensitive_values
-            )
+            str(key): _scrub_guarded_value(item, sensitive_values)
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple)):
@@ -6582,6 +7045,18 @@ def _scrub_guarded_value(value: Any, sensitive_values: tuple[str, ...]) -> Any:
     if isinstance(value, str):
         return _scrub_exact_text(value, sensitive_values)
     return value
+
+
+def _scrub_data_keyed_mapping(
+    value: Mapping[str, Any], sensitive_values: tuple[str, ...]
+) -> dict[str, Any]:
+    """Scrub mappings whose keys are user data, such as Git path indexes."""
+    return {
+        _scrub_exact_text(str(key), sensitive_values): _scrub_guarded_value(
+            item, sensitive_values
+        )
+        for key, item in value.items()
+    }
 
 
 @dataclass
@@ -6995,6 +7470,31 @@ def _git_snapshot_projection(
     return _scrub_guarded_value(public, sensitive_values)
 
 
+def _failed_git_snapshot(
+    label: str,
+    error: BaseException,
+    sensitive_values: tuple[str, ...] = (),
+    *,
+    is_git_repo: bool = False,
+) -> dict[str, Any]:
+    error_code = (
+        "git_evidence_timeout"
+        if isinstance(error, (TimeoutError, subprocess.TimeoutExpired))
+        else "git_evidence_capture_failed"
+    )
+    return {
+        "ok": False,
+        "label": label,
+        "is_git_repo": is_git_repo,
+        "error": _scrub_exact_text(str(error), sensitive_values),
+        "evidence_complete": False,
+        "evidence_errors": [error_code],
+        "_raw_error": str(error),
+        "_raw_evidence_complete": False,
+        "_raw_evidence_errors": [error_code],
+    }
+
+
 def capture_git_snapshot(
     run_dir: Path,
     cwd: Path,
@@ -7005,7 +7505,7 @@ def capture_git_snapshot(
     """Capture a complete, root-bound view of repository and file state."""
     deadline = _effective_deadline(deadline)
     cwd = cwd.resolve()
-    result = {"ok": False, "label": label, "is_git_repo": False}
+    is_git_repo = False
     try:
         def command_timeout(limit: float) -> float:
             effective = _effective_deadline(deadline)
@@ -7036,6 +7536,7 @@ def capture_git_snapshot(
         if not root_text:
             raise OrchestratorError("Git repository discovery returned no top-level path.")
         repo_root = Path(root_text).resolve()
+        is_git_repo = True
         if repo_root != cwd:
             return {
                 "ok": False,
@@ -7198,7 +7699,7 @@ def capture_git_snapshot(
         safe_status = _scrub_exact_text(str(redact(raw_status)), sensitive_values)
         safe_items = _scrub_guarded_value(status_items, sensitive_values)
         safe_untracked = _scrub_guarded_value(untracked_paths, sensitive_values)
-        safe_hashes = _scrub_guarded_value(hashes, sensitive_values)
+        safe_hashes = _scrub_data_keyed_mapping(hashes, sensitive_values)
         raw_state = {
             "head": head,
             "head_identity": raw_head_identity,
@@ -7212,6 +7713,9 @@ def capture_git_snapshot(
             "command_errors": command_errors,
         }
         safe_state = _scrub_guarded_value(raw_state, sensitive_values)
+        safe_state["index_entries"] = _scrub_data_keyed_mapping(
+            index_entries, sensitive_values
+        )
         artifact_payloads = (
             (diff_path, safe_diff),
             (staged_diff_path, safe_staged_diff),
@@ -7287,13 +7791,12 @@ def capture_git_snapshot(
             "_raw_evidence_errors": [*evidence_errors, *command_errors],
         }
     except Exception as exc:
-        return {
-            "ok": False,
-            "label": label,
-            "is_git_repo": True,
-            "error": _scrub_exact_text(str(exc), sensitive_values),
-            "_raw_error": str(exc),
-        }
+        return _failed_git_snapshot(
+            label,
+            exc,
+            sensitive_values,
+            is_git_repo=is_git_repo,
+        )
 
 
 def _launch_failure_error(code: str, message: str) -> RuntimeSecurityError:
@@ -7313,13 +7816,27 @@ def _record_blocked_launch(
     sensitive_values: tuple[str, ...] = (),
     **updates: Any,
 ) -> dict[str, Any]:
+    effective_deadline = _effective_deadline()
+    deadline_expired = (
+        effective_deadline is not None
+        and time.monotonic() >= effective_deadline
+    )
     proposed = _scrub_guarded_value(dict(metadata), sensitive_values)
     proposed.update(_scrub_guarded_value(updates, sensitive_values))
+    timeout_primary = (
+        status == "timed_out"
+        or deadline_expired
+        or _has_timeout_evidence(proposed)
+    )
+    terminal_status = "timed_out" if timeout_primary else status
+    terminal_exit_code = 124 if timeout_primary else None
+    if timeout_primary:
+        proposed.update({"timed_out": True, "stop_reason": "timeout"})
     proposed.update(
         {
-            "status": status,
+            "status": terminal_status,
             "finished_at": utc_now_iso(),
-            "exit_code": None,
+            "exit_code": terminal_exit_code,
             "security_error": _scrub_guarded_value(
                 error.to_dict(), sensitive_values
             ),
@@ -7341,11 +7858,22 @@ def _record_blocked_launch(
             blocked = _scrub_guarded_value(dict(metadata), sensitive_values)
             blocked.update(_scrub_guarded_value(current, sensitive_values))
             blocked.update(_scrub_guarded_value(updates, sensitive_values))
+            blocked_timeout = (
+                status == "timed_out"
+                or deadline_expired
+                or _has_timeout_evidence(blocked)
+            )
+            blocked_status = "timed_out" if blocked_timeout else status
+            blocked_exit_code = 124 if blocked_timeout else None
+            if blocked_timeout:
+                blocked.update(
+                    {"timed_out": True, "stop_reason": "timeout"}
+                )
             blocked.update(
                 {
-                    "status": status,
+                    "status": blocked_status,
                     "finished_at": utc_now_iso(),
-                    "exit_code": None,
+                    "exit_code": blocked_exit_code,
                     "security_error": _scrub_guarded_value(
                         error.to_dict(), sensitive_values
                     ),
@@ -7366,10 +7894,1474 @@ def _record_blocked_launch(
         }
 
 
+def _has_timeout_evidence(*states: Mapping[str, Any]) -> bool:
+    for state in states:
+        if state.get("timed_out") is True or state.get("stop_reason") == "timeout":
+            return True
+        output_budget = state.get("output_budget")
+        if (
+            isinstance(output_budget, Mapping)
+            and output_budget.get("stop_reason") == "timeout"
+        ):
+            return True
+    return False
+
+
+def _transaction_deadline_expired(
+    *states: Mapping[str, Any], fallback: float | None = None
+) -> bool:
+    deadlines: list[float] = []
+    for state in states:
+        value = state.get("transaction_deadline_monotonic")
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        ):
+            deadlines.append(float(value))
+    if not deadlines and fallback is not None and math.isfinite(float(fallback)):
+        deadlines.append(float(fallback))
+    return bool(deadlines) and time.monotonic() >= min(deadlines)
+
+
+def _terminal_cleanup_confirmed(metadata: Mapping[str, Any]) -> bool:
+    return metadata.get("cleanup_state") == "cleanup_confirmed"
+
+
+def _degraded_terminal_result(
+    proposed: Mapping[str, Any], sensitive_values: tuple[str, ...] = ()
+) -> dict[str, Any]:
+    degraded = _scrub_guarded_value(dict(proposed), sensitive_values)
+    degraded.update(
+        {
+            "terminal_state_count": 0,
+            "persisted": False,
+            "persistence_state": "degraded",
+        }
+    )
+    if degraded.get("status") in {None, "succeeded"}:
+        degraded.update(
+            {
+                "status": "failed",
+                "exit_code": 1,
+                "acceptance_status": "blocked_artifact_finalization",
+                "finalization_state": "failed",
+                "finalization_error": {
+                    "code": "artifact_finalization_failed",
+                    "message": "Execution artifacts could not be finalized safely.",
+                },
+            }
+        )
+    return degraded
+
+
+def _persist_terminal_state(
+    run_dir: Path,
+    metadata: Mapping[str, Any],
+    *,
+    updates: Mapping[str, Any],
+    event: Mapping[str, Any] | None = None,
+    sensitive_values: tuple[str, ...] = (),
+    remove_pid: bool = False,
+    launch_deadline: float | None = None,
+) -> dict[str, Any]:
+    """Persist one terminal transition after process cleanup has concluded."""
+    _ = remove_pid
+    launch_deadline = _validated_finite_deadline(
+        launch_deadline, label="Terminal launch deadline"
+    )
+    safe_updates = _scrub_guarded_value(dict(updates), sensitive_values)
+    timeout_evidence = _has_timeout_evidence(metadata, safe_updates)
+    deadline_exempt = safe_updates.get("status") == "stopped" or (
+        not timeout_evidence
+        and (
+            safe_updates.get("status") == "cleanup_incomplete"
+            or safe_updates.get("cleanup_state") == "cleanup_incomplete"
+        )
+    )
+
+    def apply_launch_timeout(
+        candidate: dict[str, Any], *, force: bool = False
+    ) -> None:
+        if (
+            launch_deadline is not None
+            and (force or time.monotonic() >= launch_deadline)
+            and not deadline_exempt
+        ):
+            candidate.update(
+                {
+                    "status": "timed_out",
+                    "timed_out": True,
+                    "exit_code": 124,
+                    "stop_reason": "timeout",
+                }
+            )
+
+    apply_launch_timeout(safe_updates)
+    proposed = _scrub_guarded_value(dict(metadata), sensitive_values)
+    proposed.update(safe_updates)
+    try:
+        with _terminal_artifact_scope():
+            terminal_deadline = _validated_finite_deadline(
+                _effective_deadline(), label="Terminal persistence deadline"
+            )
+            with artifact_lock(run_dir, deadline=terminal_deadline):
+                try:
+                    current = _read_metadata_unlocked(
+                        run_dir, deadline=terminal_deadline
+                    )
+                except FileNotFoundError:
+                    current = {}
+                if int(current.get("terminal_state_count") or 0) >= 1:
+                    return _scrub_guarded_value(
+                        {
+                            **current,
+                            "persisted": True,
+                            "persistence_state": "persisted",
+                        },
+                        sensitive_values,
+                    )
+                terminal = _scrub_guarded_value(
+                    {**dict(metadata), **current}, sensitive_values
+                )
+                terminal.update(safe_updates)
+                terminal.update(
+                    {
+                        "terminal_state_count": 1,
+                        "persisted": True,
+                        "persistence_state": "persisted",
+                    }
+                )
+                apply_launch_timeout(terminal)
+
+                def launch_deadline_precommit() -> None:
+                    if (
+                        launch_deadline is not None
+                        and time.monotonic() >= launch_deadline
+                        and terminal.get("status") != "timed_out"
+                        and not deadline_exempt
+                    ):
+                        raise TimeoutError(
+                            "Terminal commit crossed the launch deadline."
+                        )
+
+                try:
+                    _atomic_write_bytes(
+                        run_dir / "metadata.json",
+                        _metadata_bytes(terminal),
+                        deadline=terminal_deadline,
+                        precommit=launch_deadline_precommit,
+                    )
+                except TimeoutError:
+                    apply_launch_timeout(terminal, force=True)
+                    _atomic_write_bytes(
+                        run_dir / "metadata.json",
+                        _metadata_bytes(terminal),
+                        deadline=terminal_deadline,
+                    )
+            if _terminal_cleanup_confirmed(terminal):
+                try:
+                    _unlink_managed_file(run_dir / "pid.txt")
+                except Exception:
+                    pass
+            if event is not None:
+                event_token = _TERMINAL_EVENT_APPEND.set(True)
+                try:
+                    persisted_event = dict(event)
+                    if persisted_event.get("type") == "process_exited":
+                        persisted_event.update(
+                            {
+                                "status": terminal.get("status"),
+                                "exit_code": terminal.get("exit_code"),
+                            }
+                        )
+                    append_event(
+                        run_dir,
+                        _scrub_guarded_value(
+                            persisted_event, sensitive_values
+                        ),
+                    )
+                except Exception:
+                    pass
+                finally:
+                    _TERMINAL_EVENT_APPEND.reset(event_token)
+            return terminal
+    except Exception:
+        return _degraded_terminal_result(proposed, sensitive_values)
+
+
+def _persist_streaming_terminal_state(
+    run_dir: Path,
+    metadata: Mapping[str, Any],
+    *,
+    updates: Mapping[str, Any],
+    events: tuple[Mapping[str, Any], ...] = (),
+    sensitive_values: tuple[str, ...] = (),
+    remove_pid: bool = False,
+    launch_deadline: float | None = None,
+) -> dict[str, Any]:
+    """Scrub, secure, and publish one complete streaming terminal state."""
+    _ = remove_pid
+    launch_deadline = _validated_finite_deadline(
+        launch_deadline, label="Streaming launch deadline"
+    )
+    safe_updates = _scrub_guarded_value(dict(updates), sensitive_values)
+    lifecycle_stopped = safe_updates.get("status") == "stopped"
+    lifecycle_timed_out = _has_timeout_evidence(metadata, safe_updates)
+    lifecycle_cleanup_incomplete = (
+        not lifecycle_timed_out
+        and (
+            safe_updates.get("status") == "cleanup_incomplete"
+            or safe_updates.get("cleanup_state") == "cleanup_incomplete"
+        )
+    )
+
+    def failed_updates() -> dict[str, Any]:
+        failed = dict(safe_updates)
+        timed_out = _has_timeout_evidence(metadata, failed)
+        cleanup_incomplete = (
+            failed.get("status") == "cleanup_incomplete"
+            or failed.get("cleanup_state") == "cleanup_incomplete"
+        )
+        status = (
+            "timed_out"
+            if timed_out
+            else "cleanup_incomplete"
+            if cleanup_incomplete
+            else "failed"
+        )
+        exit_code = failed.get("exit_code")
+        if status == "timed_out":
+            exit_code = 124
+        elif status == "failed" and exit_code in {None, 0}:
+            exit_code = 1
+        failed.update(
+            {
+                "status": status,
+                "finished_at": utc_now_iso(),
+                "exit_code": exit_code,
+                "acceptance_status": "blocked_artifact_finalization",
+                "finalization_state": "failed",
+                "finalization_error": {
+                    "code": "artifact_finalization_failed",
+                    "message": "Streaming execution artifacts could not be finalized safely.",
+                },
+            }
+        )
+        if timed_out:
+            failed.update({"timed_out": True, "stop_reason": "timeout"})
+        return failed
+
+    def terminal_candidate(
+        current: Mapping[str, Any], candidate_updates: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        terminal = _scrub_guarded_value(
+            {**dict(metadata), **dict(current)}, sensitive_values
+        )
+        terminal.update(
+            _scrub_guarded_value(dict(candidate_updates), sensitive_values)
+        )
+        terminal.update(
+            {
+                "terminal_state_count": 1,
+                "persisted": True,
+                "persistence_state": "persisted",
+            }
+        )
+        return terminal
+
+    def apply_launch_deadline(
+        terminal: dict[str, Any], *, force: bool = False
+    ) -> dict[str, Any]:
+        if (
+            launch_deadline is not None
+            and (force or time.monotonic() >= launch_deadline)
+            and not lifecycle_stopped
+            and not lifecycle_cleanup_incomplete
+        ):
+            terminal.update(
+                {
+                    "status": "timed_out",
+                    "timed_out": True,
+                    "exit_code": 124,
+                    "stop_reason": "timeout",
+                }
+            )
+        return terminal
+
+    def launch_deadline_precommit() -> None:
+        if (
+            launch_deadline is not None
+            and time.monotonic() >= launch_deadline
+            and not lifecycle_stopped
+            and not lifecycle_cleanup_incomplete
+        ):
+            raise TimeoutError(
+                "Streaming terminal commit crossed the launch deadline."
+            )
+
+    def append_terminal_events(
+        terminal: Mapping[str, Any], candidate_events: tuple[Mapping[str, Any], ...]
+    ) -> None:
+        event_token = _TERMINAL_EVENT_APPEND.set(True)
+        try:
+            for event in candidate_events:
+                persisted_event = dict(event)
+                if persisted_event.get("type") == "process_exited":
+                    persisted_event.update(
+                        {
+                            "status": terminal.get("status"),
+                            "exit_code": terminal.get("exit_code"),
+                        }
+                    )
+                try:
+                    append_event(
+                        run_dir,
+                        _scrub_guarded_value(
+                            persisted_event, sensitive_values
+                        ),
+                    )
+                except Exception:
+                    pass
+        finally:
+            _TERMINAL_EVENT_APPEND.reset(event_token)
+
+    proposed = apply_launch_deadline(
+        terminal_candidate({}, failed_updates())
+    )
+    with _terminal_artifact_scope():
+        terminal_deadline = _validated_finite_deadline(
+            _effective_deadline(), label="Streaming terminal deadline"
+        )
+        if terminal_deadline is None:
+            return _degraded_terminal_result(proposed, sensitive_values)
+        remaining = max(0.0, terminal_deadline - time.monotonic())
+        normal_deadline = terminal_deadline - min(0.075, remaining / 3)
+        prepared_paths: list[Path] = []
+        terminal: dict[str, Any] | None = None
+        won_transition = False
+        try:
+            with artifact_lock(run_dir, deadline=terminal_deadline):
+                try:
+                    current = _read_metadata_unlocked(
+                        run_dir, deadline=terminal_deadline
+                    )
+                except FileNotFoundError:
+                    current = {}
+                if int(current.get("terminal_state_count") or 0) >= 1:
+                    return _scrub_guarded_value(
+                        {
+                            **current,
+                            "persisted": True,
+                            "persistence_state": "persisted",
+                        },
+                        sensitive_values,
+                    )
+
+                failure_terminal = terminal_candidate(
+                    current, failed_updates()
+                )
+                failure_path = _prepare_private_atomic_write(
+                    run_dir / "metadata.json",
+                    _metadata_bytes(failure_terminal),
+                    deadline=terminal_deadline,
+                )
+                prepared_paths.append(failure_path)
+                timeout_terminal: dict[str, Any] | None = None
+                timeout_path: Path | None = None
+                if (
+                    launch_deadline is not None
+                    and not lifecycle_stopped
+                    and not lifecycle_cleanup_incomplete
+                ):
+                    timeout_terminal = apply_launch_deadline(
+                        terminal_candidate(current, safe_updates), force=True
+                    )
+                    timeout_path = _prepare_private_atomic_write(
+                        run_dir / "metadata.json",
+                        _metadata_bytes(timeout_terminal),
+                        deadline=terminal_deadline,
+                    )
+                    prepared_paths.append(timeout_path)
+
+                normal_ready = False
+                normal_token = _OPERATION_DEADLINE.set(normal_deadline)
+                try:
+                    _scrub_run_artifacts(run_dir, sensitive_values)
+                    _secure_run_artifacts(run_dir)
+                    _check_deadline(
+                        normal_deadline,
+                        "Streaming artifact preparation exceeded its terminal deadline.",
+                    )
+                    normal_ready = True
+                except Exception:
+                    normal_ready = False
+                finally:
+                    _OPERATION_DEADLINE.reset(normal_token)
+
+                if normal_ready:
+                    normal_terminal = terminal_candidate(
+                        current, safe_updates
+                    )
+                    try:
+                        _atomic_write_bytes(
+                            run_dir / "metadata.json",
+                            _metadata_bytes(normal_terminal),
+                            deadline=terminal_deadline,
+                            precommit=launch_deadline_precommit,
+                        )
+                        terminal = normal_terminal
+                    except Exception:
+                        terminal = None
+
+                if terminal is None:
+                    use_timeout = (
+                        timeout_path is not None
+                        and timeout_terminal is not None
+                        and launch_deadline is not None
+                        and time.monotonic() >= launch_deadline
+                    )
+                    if not use_timeout and timeout_path is not None:
+                        try:
+                            _replace_prepared_atomic_write(
+                                failure_path,
+                                run_dir / "metadata.json",
+                                deadline=terminal_deadline,
+                                precommit=launch_deadline_precommit,
+                            )
+                            prepared_paths.remove(failure_path)
+                            terminal = failure_terminal
+                        except TimeoutError:
+                            use_timeout = True
+                    if use_timeout:
+                        assert timeout_path is not None
+                        assert timeout_terminal is not None
+                        _replace_prepared_atomic_write(
+                            timeout_path,
+                            run_dir / "metadata.json",
+                            deadline=terminal_deadline,
+                        )
+                        prepared_paths.remove(timeout_path)
+                        terminal = timeout_terminal
+                    elif terminal is None:
+                        _replace_prepared_atomic_write(
+                            failure_path,
+                            run_dir / "metadata.json",
+                            deadline=terminal_deadline,
+                        )
+                        prepared_paths.remove(failure_path)
+                        terminal = failure_terminal
+                won_transition = True
+        except Exception:
+            return _degraded_terminal_result(proposed, sensitive_values)
+        finally:
+            for prepared_path in tuple(prepared_paths):
+                try:
+                    _discard_prepared_atomic_write(prepared_path)
+                except Exception:
+                    pass
+
+        if not won_transition or terminal is None:
+            return _degraded_terminal_result(proposed, sensitive_values)
+        if _terminal_cleanup_confirmed(terminal):
+            try:
+                _unlink_managed_file(run_dir / "pid.txt")
+            except Exception:
+                pass
+        terminal_events = events
+        if terminal.get("finalization_state") == "failed":
+            terminal_events = (
+                {
+                    "type": "process_exited",
+                    "status": terminal.get("status"),
+                    "exit_code": terminal.get("exit_code"),
+                    "duration_ms": terminal.get("duration_ms"),
+                    "finalization_state": "failed",
+                },
+            )
+        append_terminal_events(terminal, terminal_events)
+        return terminal
+
+
 def _remaining_deadline(deadline: float | None, ceiling: float) -> float:
     if deadline is None:
         return ceiling
     return max(0.0, min(ceiling, deadline - time.monotonic()))
+
+
+def _validated_finite_deadline(
+    deadline: float | None, *, label: str
+) -> float | None:
+    if deadline is None:
+        return None
+    if (
+        not isinstance(deadline, (int, float))
+        or isinstance(deadline, bool)
+        or not math.isfinite(float(deadline))
+    ):
+        raise OrchestratorError(f"{label} must be finite.")
+    return float(deadline)
+
+
+def _cleanup_attempt_deadline(
+    record: _OwnedProcessTree, deadline: float | None
+) -> float:
+    requested = _validated_finite_deadline(
+        _effective_deadline(deadline), label="Owned process cleanup deadline"
+    )
+    durable = _validated_finite_deadline(
+        record.deadline, label="Owned process durable deadline"
+    )
+    assert durable is not None
+    return min(durable, requested) if requested is not None else durable
+
+
+def _owned_process_cleanup_deadline(
+    process: subprocess.Popen[Any],
+    deadline: float | None,
+    *,
+    timeout_evidence: bool,
+) -> float | None:
+    requested = _validated_finite_deadline(
+        _effective_deadline(deadline), label="Owned process cleanup deadline"
+    )
+    record = _owned_process_record(process)
+    if record is None:
+        return requested
+    if timeout_evidence:
+        return float(record.deadline)
+    return _cleanup_attempt_deadline(record, requested)
+
+
+def _live_thread_names(
+    threads: tuple[threading.Thread, ...] | list[threading.Thread],
+) -> list[str]:
+    return sorted(
+        {
+            thread.name
+            for thread in threads
+            if thread is not threading.current_thread() and thread.is_alive()
+        }
+    )
+
+
+_OWNED_PROCESS_GENERATION_ATTRIBUTE = "_cc_owned_process_generation"
+_OWNED_PROCESS_RESULT_ATTRIBUTE = "_cc_owned_process_cleanup_result"
+
+
+def _owned_process_record(
+    process: subprocess.Popen[Any],
+) -> _OwnedProcessTree | None:
+    generation = getattr(process, _OWNED_PROCESS_GENERATION_ATTRIBUTE, None)
+    if not isinstance(generation, str):
+        return None
+    with _OWNED_PROCESS_TREES_LOCK:
+        record = _OWNED_PROCESS_TREES.get(generation)
+    if record is None or record.process is not process:
+        return None
+    return record
+
+
+def _ensure_owned_process_record(
+    process: subprocess.Popen[Any], *, deadline: float | None = None
+) -> _OwnedProcessTree:
+    existing = _owned_process_record(process)
+    if existing is not None:
+        return existing
+    generation = uuid.uuid4().hex
+    effective = _validated_finite_deadline(
+        _effective_deadline(deadline), label="Owned process deadline"
+    )
+    record = _OwnedProcessTree(
+        generation=generation,
+        process=process,
+        kind="uncontained",
+        handle=0,
+        deadline=float(
+            effective if effective is not None else time.monotonic()
+        ),
+        owner_token=f"caller:{generation}",
+        job_active_zero=True,
+    )
+    _publish_owned_process_record(record)
+    return record
+
+
+def _record_owner_matches(
+    record: _OwnedProcessTree, owner_token: str | None
+) -> bool:
+    if owner_token is None:
+        return record.state == "caller_owned"
+    return (
+        record.state == "cleanup_owned"
+        and record.owner_token == owner_token
+    )
+
+
+def _publish_owned_process_record(record: _OwnedProcessTree) -> None:
+    with _OWNED_PROCESS_TREES_LOCK:
+        if record.generation in _OWNED_PROCESS_TREES:
+            raise OrchestratorError("Owned process generation is already published.")
+        setattr(
+            record.process,
+            _OWNED_PROCESS_GENERATION_ATTRIBUTE,
+            record.generation,
+        )
+        _OWNED_PROCESS_TREES[record.generation] = record
+
+
+def _remove_owned_process_record(record: _OwnedProcessTree) -> bool:
+    removed = False
+    with _OWNED_PROCESS_TREES_LOCK:
+        if _OWNED_PROCESS_TREES.get(record.generation) is record:
+            _OWNED_PROCESS_TREES.pop(record.generation, None)
+            removed = True
+    if (
+        removed
+        and getattr(
+            record.process, _OWNED_PROCESS_GENERATION_ATTRIBUTE, None
+        )
+        == record.generation
+    ):
+        try:
+            delattr(record.process, _OWNED_PROCESS_GENERATION_ATTRIBUTE)
+        except AttributeError:
+            pass
+    if removed:
+        try:
+            setattr(
+                record.process,
+                _OWNED_PROCESS_RESULT_ATTRIBUTE,
+                record.cleanup_result,
+            )
+        except (AttributeError, TypeError):
+            pass
+    return removed
+
+
+def _detach_owned_process_record(process: subprocess.Popen[Any]) -> bool:
+    """Release provisional launch ownership after a verified handoff."""
+    record = _owned_process_record(process)
+    if record is None:
+        return False
+    with record.lock:
+        if record.state != "caller_owned" or record.termination_requested.is_set():
+            return False
+    removed = _remove_owned_process_record(record)
+    if removed:
+        try:
+            delattr(process, _OWNED_PROCESS_RESULT_ATTRIBUTE)
+        except AttributeError:
+            pass
+    return removed
+
+
+def _create_windows_kill_job() -> int:
+    import ctypes
+    from ctypes import wintypes
+
+    class BasicLimitInformation(ctypes.Structure):
+        _fields_ = (
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        )
+
+    class IoCounters(ctypes.Structure):
+        _fields_ = tuple((name, ctypes.c_ulonglong) for name in (
+            "ReadOperationCount",
+            "WriteOperationCount",
+            "OtherOperationCount",
+            "ReadTransferCount",
+            "WriteTransferCount",
+            "OtherTransferCount",
+        ))
+
+    class ExtendedLimitInformation(ctypes.Structure):
+        _fields_ = (
+            ("BasicLimitInformation", BasicLimitInformation),
+            ("IoInfo", IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        )
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        raise ctypes.WinError(ctypes.get_last_error())
+    information = ExtendedLimitInformation()
+    information.BasicLimitInformation.LimitFlags = 0x00002000
+    if not kernel32.SetInformationJobObject(
+        job, 9, ctypes.byref(information), ctypes.sizeof(information)
+    ):
+        error = ctypes.get_last_error()
+        kernel32.CloseHandle(job)
+        raise ctypes.WinError(error)
+    return int(job)
+
+
+def _close_windows_handle(handle: int) -> None:
+    if not handle:
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    if not kernel32.CloseHandle(handle):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _assign_windows_job(process: subprocess.Popen[Any], job: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    native_process = getattr(process, "_handle", None)
+    if native_process is None:
+        raise OrchestratorError("Owned Windows process handle is unavailable.")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    if not kernel32.AssignProcessToJobObject(job, int(native_process)):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _verify_windows_job_assignment(
+    process: subprocess.Popen[Any], job: int
+) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    native_process = getattr(process, "_handle", None)
+    if native_process is None:
+        raise OrchestratorError("Owned Windows process handle is unavailable.")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.IsProcessInJob.argtypes = (
+        wintypes.HANDLE,
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.BOOL),
+    )
+    kernel32.IsProcessInJob.restype = wintypes.BOOL
+    assigned = wintypes.BOOL()
+    if not kernel32.IsProcessInJob(
+        int(native_process), job, ctypes.byref(assigned)
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if not assigned.value:
+        raise OrchestratorError(
+            "Owned Windows process was not assigned to its exact Job Object."
+        )
+
+
+def _resume_windows_process(process: subprocess.Popen[Any]) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    native_process = getattr(process, "_handle", None)
+    if native_process is None:
+        return
+    ntdll = ctypes.WinDLL("ntdll")
+    ntdll.NtResumeProcess.argtypes = (wintypes.HANDLE,)
+    ntdll.NtResumeProcess.restype = ctypes.c_long
+    status = int(ntdll.NtResumeProcess(int(native_process)))
+    if status < 0:
+        raise OSError(status, "Owned Windows process could not be resumed.")
+
+
+def _owned_process_popen(
+    command: list[str],
+    *,
+    final_identity: ExecutableIdentity | None = None,
+    ownership_deadline: float | None = None,
+    **kwargs: Any,
+) -> subprocess.Popen[Any]:
+    """Create a process inside containment, with identity validation adjacent."""
+    job: int | None = None
+    record: _OwnedProcessTree | None = None
+    process: subprocess.Popen[Any] | None = None
+    launch_deadline = _validated_finite_deadline(
+        _effective_deadline(), label="Owned process launch deadline"
+    )
+    owned_deadline = _validated_finite_deadline(
+        ownership_deadline, label="Owned process deadline"
+    )
+    if owned_deadline is None:
+        owned_deadline = (
+            launch_deadline + WORKER_FINALIZATION_GRACE_SECONDS
+            if launch_deadline is not None
+            else None
+        )
+    if owned_deadline is None:
+        owned_deadline = time.monotonic()
+    if os.name == "nt":
+        creationflags = int(kwargs.get("creationflags") or 0) | int(
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        )
+        job = _create_windows_kill_job()
+        creationflags |= int(
+            getattr(subprocess, "CREATE_SUSPENDED", 0x00000004)
+        )
+        kwargs["creationflags"] = creationflags
+    else:
+        kwargs["start_new_session"] = True
+    if final_identity is not None and not final_identity.matches_current_file():
+        if job is not None:
+            _close_windows_handle(job)
+        raise _runtime_identity_changed(final_identity.canonical_path)
+    try:
+        process = subprocess.Popen(command, **kwargs)
+        generation = uuid.uuid4().hex
+        if os.name == "nt":
+            assert job is not None
+            _assign_windows_job(process, job)
+            _verify_windows_job_assignment(process, job)
+            record = _OwnedProcessTree(
+                generation=generation,
+                process=process,
+                kind="windows",
+                handle=job,
+                deadline=float(owned_deadline),
+                owner_token=f"caller:{generation}",
+                assignment_verified=True,
+            )
+            _publish_owned_process_record(record)
+            job = None
+            _resume_windows_process(process)
+        else:
+            record = _OwnedProcessTree(
+                generation=generation,
+                process=process,
+                kind="posix",
+                handle=int(process.pid),
+                deadline=float(owned_deadline),
+                owner_token=f"caller:{generation}",
+            )
+            _publish_owned_process_record(record)
+        return process
+    except Exception as launch_error:
+        if process is not None:
+            cleanup_deadline = launch_deadline
+            if record is not None:
+                cleanup_deadline = _cleanup_attempt_deadline(
+                    record, launch_deadline
+                )
+            elif cleanup_deadline is None:
+                cleanup_deadline = float(owned_deadline)
+            if not _bounded_process_cleanup(
+                process, deadline=cleanup_deadline
+            ):
+                raise _OwnedCleanupPending(process) from launch_error
+        raise
+    finally:
+        if job is not None:
+            _close_windows_handle(job)
+
+
+def _capture_windows_job_members(
+    record: _OwnedProcessTree, *, attempt_deadline: float | None = None
+) -> None:
+    if record.kind != "windows" or record.members_captured:
+        return
+    try:
+        member_pids = _windows_job_process_ids(
+            record.handle, deadline=attempt_deadline
+        )
+    except Exception as exc:
+        record.api_failures.append(f"job_membership_query: {exc}")
+        record.members_captured = True
+        return
+    for pid in member_pids:
+        if pid == int(record.process.pid):
+            continue
+        handle = _open_windows_process_sync_handle(pid)
+        if handle is None:
+            record.proof_failures.append(
+                f"member_handle_unavailable:{pid}"
+            )
+            continue
+        try:
+            if not _windows_process_handle_in_job(handle, record.handle):
+                record.proof_failures.append(
+                    f"member_not_in_exact_job:{pid}"
+                )
+                _close_windows_handle(handle)
+                continue
+        except Exception as exc:
+            record.api_failures.append(
+                f"member_job_validation:{pid}: {exc}"
+            )
+            try:
+                _close_windows_handle(handle)
+            except Exception as close_exc:
+                record.api_failures.append(
+                    f"member_validation_close:{pid}: {close_exc}"
+                )
+            continue
+        record.member_handles[pid] = handle
+        with _PENDING_DESCENDANT_CLEANUPS_LOCK:
+            _PENDING_DESCENDANT_CLEANUPS[pid] = record
+    record.members_captured = True
+
+
+def _terminate_owned_containment(
+    process: subprocess.Popen[Any],
+    *,
+    force: bool,
+    deadline: float | None = None,
+    _owner_token: str | None = None,
+) -> None:
+    record = _owned_process_record(process)
+    if record is None:
+        return
+    with record.lock:
+        if not _record_owner_matches(record, _owner_token):
+            return
+        if record.kind == "windows":
+            if not force or record.job_termination_attempted:
+                return
+            _capture_windows_job_members(
+                record,
+                attempt_deadline=_cleanup_attempt_deadline(record, deadline),
+            )
+            record.job_termination_attempted = True
+            try:
+                _terminate_windows_job(record.handle)
+            except Exception as exc:
+                record.api_failures.append(f"terminate_job: {exc}")
+                raise
+            return
+        if record.root_reaped or record.process.poll() is not None:
+            return
+        if not force:
+            try:
+                os.killpg(record.handle, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            return
+        try:
+            os.killpg(record.handle, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+
+def _release_owned_containment(
+    process: subprocess.Popen[Any], *, terminate_descendants: bool = False,
+    deadline: float | None = None,
+    threads: tuple[threading.Thread, ...] = (),
+    _owner_token: str | None = None,
+) -> bool:
+    record = _owned_process_record(process)
+    if record is None:
+        return getattr(
+            process, _OWNED_PROCESS_RESULT_ATTRIBUTE, None
+        ) == "cleanup_confirmed"
+    attempt_deadline = _cleanup_attempt_deadline(record, deadline)
+    with record.lock:
+        if not _record_owner_matches(record, _owner_token):
+            return False
+        record.root_reaped = process.poll() is not None
+    try:
+        return _finalize_owned_process_record(
+            record,
+            threads,
+            terminate_descendants=terminate_descendants,
+            owner_token=_owner_token,
+            attempt_deadline=attempt_deadline,
+        )
+    except Exception as exc:
+        with record.lock:
+            record.api_failures.append(f"containment_release: {exc}")
+            record.cleanup_result = "cleanup_failed"
+            record.state = "cleanup_incomplete"
+            record.completed.set()
+        return False
+
+
+def _mark_owned_cleanup_incomplete(
+    process: subprocess.Popen[Any], reason: str
+) -> None:
+    record = _owned_process_record(process)
+    if record is None:
+        return
+    with record.lock:
+        if record.cleanup_result == "cleanup_confirmed":
+            return
+        if reason not in record.proof_failures:
+            record.proof_failures.append(reason)
+        record.cleanup_result = "cleanup_incomplete"
+        record.state = "cleanup_incomplete"
+        record.completed.set()
+
+
+def _windows_job_process_ids(
+    job: int, *, deadline: float | None = None
+) -> list[int]:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.QueryInformationJobObject.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+    )
+    kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+    capacity = 16
+    deadline = _validated_finite_deadline(
+        _effective_deadline(deadline), label="Windows Job membership deadline"
+    )
+    while True:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("Windows Job membership query exceeded its deadline.")
+
+        class ProcessIdList(ctypes.Structure):
+            _fields_ = (
+                ("NumberOfAssignedProcesses", wintypes.DWORD),
+                ("NumberOfProcessIdsInList", wintypes.DWORD),
+                ("ProcessIdList", ctypes.c_size_t * capacity),
+            )
+
+        members = ProcessIdList()
+        returned = wintypes.DWORD()
+        queried = kernel32.QueryInformationJobObject(
+            job,
+            3,
+            ctypes.byref(members),
+            ctypes.sizeof(members),
+            ctypes.byref(returned),
+        )
+        assigned = int(members.NumberOfAssignedProcesses)
+        listed = int(members.NumberOfProcessIdsInList)
+        if queried and assigned <= listed <= capacity:
+            return [
+                int(members.ProcessIdList[index]) for index in range(listed)
+            ]
+        error = ctypes.get_last_error()
+        if not queried and error != 234:
+            raise ctypes.WinError(error)
+        capacity = max(capacity * 2, assigned, listed, capacity + 1)
+
+
+def _windows_job_active_processes(job: int) -> int:
+    import ctypes
+    from ctypes import wintypes
+
+    class BasicAccountingInformation(ctypes.Structure):
+        _fields_ = (
+            ("TotalUserTime", ctypes.c_longlong),
+            ("TotalKernelTime", ctypes.c_longlong),
+            ("ThisPeriodTotalUserTime", ctypes.c_longlong),
+            ("ThisPeriodTotalKernelTime", ctypes.c_longlong),
+            ("TotalPageFaultCount", wintypes.DWORD),
+            ("TotalProcesses", wintypes.DWORD),
+            ("ActiveProcesses", wintypes.DWORD),
+            ("TotalTerminatedProcesses", wintypes.DWORD),
+        )
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.QueryInformationJobObject.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+    )
+    kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+    information = BasicAccountingInformation()
+    if not kernel32.QueryInformationJobObject(
+        job,
+        1,
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+        None,
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return int(information.ActiveProcesses)
+
+
+def _open_windows_process_sync_handle(pid: int) -> int | None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    handle = kernel32.OpenProcess(0x00101000, False, pid)
+    if not handle:
+        return None
+    return int(handle)
+
+
+def _windows_process_handle_in_job(handle: int, job: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.IsProcessInJob.argtypes = (
+        wintypes.HANDLE,
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.BOOL),
+    )
+    kernel32.IsProcessInJob.restype = wintypes.BOOL
+    assigned = wintypes.BOOL()
+    if not kernel32.IsProcessInJob(handle, job, ctypes.byref(assigned)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return bool(assigned.value)
+
+
+def _wait_windows_handle_exit(handle: int, timeout_ms: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    result = int(
+        kernel32.WaitForSingleObject(handle, max(0, int(timeout_ms)))
+    )
+    if result == 0x00000000:
+        return True
+    if result == 0x00000102:
+        return False
+    if result == 0xFFFFFFFF:
+        raise ctypes.WinError(ctypes.get_last_error())
+    raise OSError(result, "Unexpected Windows process wait result.")
+
+
+def _terminate_windows_job(job: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+    kernel32.TerminateJobObject.restype = wintypes.BOOL
+    if not kernel32.TerminateJobObject(job, 1):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _close_process_streams(
+    process: subprocess.Popen[Any], *, _owner_token: str | None = None
+) -> bool:
+    record = _owned_process_record(process)
+    if record is None:
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
+        return True
+    with record.lock:
+        if not _record_owner_matches(record, _owner_token):
+            return False
+        closed = True
+        for name in ("stdin", "stdout", "stderr"):
+            stream = getattr(process, name, None)
+            if stream is None or name in record.streams_close_attempted:
+                continue
+            record.streams_close_attempted.add(name)
+            try:
+                stream.close()
+            except (OSError, ValueError) as exc:
+                record.api_failures.append(f"{name}_close: {exc}")
+                closed = False
+        return closed
+
+
+def _wait_owned_root(
+    record: _OwnedProcessTree,
+    *,
+    owner_token: str | None,
+    attempt_deadline: float,
+) -> bool:
+    with record.lock:
+        if not _record_owner_matches(record, owner_token):
+            return False
+        if record.root_reaped:
+            return True
+        process = record.process
+    reaped = False
+    wait_error: OSError | None = None
+    try:
+        process.wait(timeout=max(0.0, attempt_deadline - time.monotonic()))
+        reaped = process.poll() is not None
+    except subprocess.TimeoutExpired:
+        pass
+    except OSError as exc:
+        wait_error = exc
+    with record.lock:
+        if not _record_owner_matches(record, owner_token):
+            return False
+        record.root_reaped = record.root_reaped or reaped
+        if not record.root_reaped and wait_error is None:
+            record.proof_failures.append("root_wait_deadline")
+        if wait_error is not None:
+            record.api_failures.append(f"root_wait: {wait_error}")
+        return record.root_reaped
+
+
+def _close_owned_readers(
+    record: _OwnedProcessTree,
+    threads: tuple[threading.Thread, ...],
+    *,
+    owner_token: str | None,
+    attempt_deadline: float,
+) -> bool:
+    streams_closed = _close_process_streams(
+        record.process, _owner_token=owner_token
+    )
+    for thread in threads:
+        if thread is threading.current_thread() or not thread.is_alive():
+            continue
+        thread.join(timeout=max(0.0, attempt_deadline - time.monotonic()))
+    with record.lock:
+        if not _record_owner_matches(record, owner_token):
+            return False
+        threads_closed = all(
+            thread is threading.current_thread() or not thread.is_alive()
+            for thread in threads
+        )
+        if not threads_closed:
+            record.proof_failures.append("reader_join_deadline")
+        record.readers_closed = streams_closed and threads_closed
+        return record.readers_closed
+
+
+def _finish_windows_job_proof(
+    record: _OwnedProcessTree, *, attempt_deadline: float
+) -> None:
+    for pid, handle in tuple(record.member_handles.items()):
+        if pid not in record.member_wait_confirmed:
+            try:
+                confirmed = _wait_windows_handle_exit(
+                    handle,
+                    int(
+                        max(0.0, attempt_deadline - time.monotonic())
+                        * 1000
+                    ),
+                )
+                if confirmed:
+                    record.member_wait_confirmed.add(pid)
+                else:
+                    record.proof_failures.append(
+                        f"member_wait_deadline:{pid}"
+                    )
+            except Exception as exc:
+                record.api_failures.append(f"member_wait:{pid}: {exc}")
+    try:
+        record.job_active_zero = (
+            _windows_job_active_processes(record.handle) == 0
+        )
+        if not record.job_active_zero:
+            record.proof_failures.append("job_active_processes_nonzero")
+    except Exception as exc:
+        record.api_failures.append(f"job_active_process_query: {exc}")
+        record.job_active_zero = False
+
+
+def _close_windows_containment_handles(record: _OwnedProcessTree) -> None:
+    for pid, handle in tuple(record.member_handles.items()):
+        if pid in record.member_close_attempted:
+            continue
+        record.member_close_attempted.add(pid)
+        try:
+            _close_windows_handle(handle)
+        except Exception as exc:
+            record.api_failures.append(f"member_close:{pid}: {exc}")
+    if not record.job_closed:
+        try:
+            _close_windows_handle(record.handle)
+            record.job_closed = True
+        except Exception as exc:
+            record.api_failures.append(f"job_close: {exc}")
+    if record.job_closed:
+        with _PENDING_DESCENDANT_CLEANUPS_LOCK:
+            for pid in tuple(record.member_handles):
+                if _PENDING_DESCENDANT_CLEANUPS.get(pid) is record:
+                    _PENDING_DESCENDANT_CLEANUPS.pop(pid, None)
+
+
+def _finalize_owned_process_record(
+    record: _OwnedProcessTree,
+    threads: tuple[threading.Thread, ...],
+    *,
+    terminate_descendants: bool,
+    owner_token: str | None,
+    attempt_deadline: float,
+) -> bool:
+    attempt_deadline = float(
+        _validated_finite_deadline(
+            attempt_deadline, label="Owned process cleanup attempt deadline"
+        )
+    )
+    with record.lock:
+        if not _record_owner_matches(record, owner_token):
+            return False
+        if record.kind == "windows":
+            if terminate_descendants and not record.job_termination_attempted:
+                _capture_windows_job_members(
+                    record, attempt_deadline=attempt_deadline
+                )
+                record.job_termination_attempted = True
+                try:
+                    _terminate_windows_job(record.handle)
+                except Exception as exc:
+                    record.api_failures.append(f"terminate_job: {exc}")
+        kind = record.kind
+    if kind == "windows":
+        _finish_windows_job_proof(
+            record, attempt_deadline=attempt_deadline
+        )
+    elif kind == "posix":
+        with record.lock:
+            if not _record_owner_matches(record, owner_token):
+                return False
+            try:
+                os.killpg(record.handle, 0)
+            except ProcessLookupError:
+                record.job_active_zero = True
+            except (PermissionError, OSError) as exc:
+                record.api_failures.append(f"process_group_query: {exc}")
+            else:
+                record.job_active_zero = False
+                if terminate_descendants and record.root_reaped:
+                    record.proof_failures.append(
+                        "process_group_alive_after_root_exit"
+                    )
+    else:
+        with record.lock:
+            if not _record_owner_matches(record, owner_token):
+                return False
+            record.job_active_zero = True
+    _close_owned_readers(
+        record,
+        threads,
+        owner_token=owner_token,
+        attempt_deadline=attempt_deadline,
+    )
+    with record.lock:
+        members_confirmed = (
+            record.kind != "windows"
+            or len(record.member_wait_confirmed) == len(record.member_handles)
+        )
+        proof_complete = (
+            record.root_reaped
+            and record.readers_closed
+            and record.job_active_zero
+            and members_confirmed
+            and not record.api_failures
+            and not record.proof_failures
+        )
+        if record.kind == "windows" and proof_complete:
+            _close_windows_containment_handles(record)
+        handles_closed = record.kind != "windows" or (
+            record.job_closed
+            and len(record.member_close_attempted)
+            == len(record.member_handles)
+        )
+        confirmed = (
+            proof_complete and handles_closed and not record.api_failures
+        )
+        if confirmed:
+            record.cleanup_result = "cleanup_confirmed"
+            record.state = "completed"
+            _remove_owned_process_record(record)
+        else:
+            record.cleanup_result = (
+                "cleanup_failed"
+                if record.api_failures
+                else "cleanup_incomplete"
+            )
+            record.state = "cleanup_incomplete"
+        record.completed.set()
+        return confirmed
+
+
+def _bounded_process_cleanup(
+    process: subprocess.Popen[Any],
+    threads: tuple[threading.Thread, ...] = (),
+    *,
+    deadline: float | None = None,
+    _owner_token: str | None = None,
+) -> bool:
+    requested_deadline = _validated_finite_deadline(
+        _effective_deadline(deadline), label="Owned process cleanup deadline"
+    )
+    prior_result = getattr(process, _OWNED_PROCESS_RESULT_ATTRIBUTE, None)
+    if prior_result is not None and _owned_process_record(process) is None:
+        return prior_result == "cleanup_confirmed"
+    record = _ensure_owned_process_record(process, deadline=requested_deadline)
+    attempt_deadline = _cleanup_attempt_deadline(record, requested_deadline)
+    with record.lock:
+        if not _record_owner_matches(record, _owner_token):
+            record.request_termination()
+            completed = record.completed
+            wait_deadline = attempt_deadline
+        else:
+            completed = None
+            wait_deadline = attempt_deadline
+            try:
+                if process.poll() is None:
+                    process.terminate()
+            except OSError as exc:
+                record.api_failures.append(f"root_terminate: {exc}")
+    if completed is not None:
+        completed.wait(max(0.0, wait_deadline - time.monotonic()))
+        return record.cleanup_result == "cleanup_confirmed"
+    try:
+        _terminate_owned_containment(
+            process,
+            force=False,
+            deadline=attempt_deadline,
+            _owner_token=_owner_token,
+        )
+        _terminate_owned_containment(
+            process,
+            force=True,
+            deadline=attempt_deadline,
+            _owner_token=_owner_token,
+        )
+    except Exception:
+        pass
+    with record.lock:
+        if _record_owner_matches(record, _owner_token):
+            try:
+                if process.poll() is None and record.kind != "windows":
+                    process.kill()
+            except OSError as exc:
+                record.api_failures.append(f"root_kill: {exc}")
+    _wait_owned_root(
+        record,
+        owner_token=_owner_token,
+        attempt_deadline=attempt_deadline,
+    )
+    return _finalize_owned_process_record(
+        record,
+        threads,
+        terminate_descendants=True,
+        owner_token=_owner_token,
+        attempt_deadline=attempt_deadline,
+    )
 
 
 def _runtime_execution_deadline(
@@ -7377,9 +9369,254 @@ def _runtime_execution_deadline(
 ) -> float:
     remaining = max(0.0, launch_deadline - started_monotonic)
     finalization_reserve = min(
-        remaining, 0.55, max(0.25, remaining * 0.65)
+        remaining, 0.2, max(0.05, remaining * 0.2)
     )
     return launch_deadline - finalization_reserve
+
+
+def _sleep_stream_worker_iteration(
+    deadline: float, *, termination_requested: bool
+) -> bool:
+    remaining = _remaining_deadline(deadline, 0.05)
+    if termination_requested and remaining <= 0:
+        return False
+    time.sleep(
+        min(0.01 if termination_requested else 0.05, max(0.001, remaining))
+    )
+    return True
+
+
+def _worker_cleanup_response_updates(
+    *, timed_out: bool, stopped: bool
+) -> dict[str, Any]:
+    if timed_out:
+        return {
+            "timed_out": True,
+            "stop_reason": "timeout",
+            "exit_code": 124,
+        }
+    if stopped:
+        return {"stop_reason": "user_requested"}
+    return {}
+
+
+def _owned_process_owner_main(
+    record: _OwnedProcessTree,
+    owner_token: str,
+    attempt_deadline: float,
+    ready: threading.Event,
+    commit: threading.Event,
+    cancel: threading.Event,
+    accepted: threading.Event,
+    threads: tuple[threading.Thread, ...],
+    on_complete: Any,
+) -> None:
+    operation_token: contextvars.Token[float | None] | None = None
+    try:
+        deadline = float(
+            _validated_finite_deadline(
+                attempt_deadline, label="Cleanup owner deadline"
+            )
+        )
+        operation_token = _OPERATION_DEADLINE.set(deadline)
+        ready.set()
+        while not commit.is_set() and not cancel.is_set():
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0:
+                cancel.set()
+                return
+            commit.wait(min(remaining, 0.05))
+        if cancel.is_set():
+            return
+        with record.lock:
+            if not _record_owner_matches(record, owner_token):
+                return
+        accepted.set()
+        while not record.termination_requested.is_set():
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0:
+                break
+            try:
+                record.process.wait(timeout=min(remaining, 0.05))
+                with record.lock:
+                    if not _record_owner_matches(record, owner_token):
+                        return
+                    record.root_reaped = True
+                break
+            except subprocess.TimeoutExpired:
+                continue
+            except OSError as exc:
+                with record.lock:
+                    record.api_failures.append(f"owner_root_wait: {exc}")
+                break
+        if record.root_reaped:
+            _finalize_owned_process_record(
+                record,
+                threads,
+                terminate_descendants=True,
+                owner_token=owner_token,
+                attempt_deadline=deadline,
+            )
+        else:
+            _bounded_process_cleanup(
+                record.process,
+                threads,
+                deadline=deadline,
+                _owner_token=owner_token,
+            )
+    except Exception as exc:
+        with record.lock:
+            record.api_failures.append(f"cleanup_owner: {exc}")
+            record.cleanup_result = "cleanup_failed"
+            record.state = "cleanup_incomplete"
+            record.completed.set()
+    finally:
+        with record.lock:
+            if (
+                record.state == "cleanup_owned"
+                and record.owner_token == owner_token
+                and not record.completed.is_set()
+            ):
+                record.proof_failures.append("cleanup_owner_exited")
+                record.cleanup_result = "cleanup_incomplete"
+                record.state = "cleanup_incomplete"
+                record.completed.set()
+        try:
+            on_complete(record)
+        except Exception:
+            pass
+        if operation_token is not None:
+            _OPERATION_DEADLINE.reset(operation_token)
+
+
+def _start_owned_process_owner(
+    record: _OwnedProcessTree,
+    *,
+    owner_name: str,
+    threads: tuple[threading.Thread, ...] = (),
+    active_run_id: str | None = None,
+    request_cleanup: bool,
+    attempt_deadline: float | None = None,
+    on_complete: Any = lambda _record: None,
+) -> bool:
+    owner_token = f"cleanup:{record.generation}:{uuid.uuid4().hex}"
+    ready = threading.Event()
+    commit = threading.Event()
+    cancel = threading.Event()
+    accepted = threading.Event()
+    owner: threading.Thread | None = None
+    owner_started = False
+    callback_lock = threading.Lock()
+    callback_called = False
+    transfer_deadline = _cleanup_attempt_deadline(
+        record,
+        record.deadline if attempt_deadline is None else attempt_deadline,
+    )
+
+    def complete_once(completed_record: _OwnedProcessTree) -> None:
+        nonlocal callback_called
+        with callback_lock:
+            if callback_called:
+                return
+            callback_called = True
+        with _ACTIVE_CLEANUP_OWNERS_LOCK:
+            registered_owner = _ACTIVE_CLEANUP_OWNERS.get(owner_name)
+            if registered_owner is owner or registered_owner is threading.current_thread():
+                _ACTIVE_CLEANUP_OWNERS.pop(owner_name, None)
+        try:
+            on_complete(completed_record)
+        except Exception:
+            pass
+
+    try:
+        owner = threading.Thread(
+            target=_owned_process_owner_main,
+            args=(
+                record,
+                owner_token,
+                transfer_deadline,
+                ready,
+                commit,
+                cancel,
+                accepted,
+                threads,
+                complete_once,
+            ),
+            name=owner_name,
+            daemon=False,
+        )
+        with _ACTIVE_CLEANUP_OWNERS_LOCK:
+            _ACTIVE_CLEANUP_OWNERS[owner_name] = owner
+        owner.start()
+        owner_started = True
+        if not ready.wait(max(0.0, transfer_deadline - time.monotonic())):
+            raise OrchestratorError("Cleanup owner did not become ready.")
+        if active_run_id is not None:
+            with _ACTIVE_WORKER_HANDLES_LOCK:
+                existing = _ACTIVE_WORKER_HANDLES.get(active_run_id)
+                if existing is not None and existing is not record.process:
+                    raise OrchestratorError(
+                        "A different worker already owns this active run id."
+                    )
+                _ACTIVE_WORKER_HANDLES[active_run_id] = record.process
+        with record.lock:
+            if record.state != "caller_owned":
+                raise OrchestratorError(
+                    "Owned process is no longer caller-owned for transfer."
+                )
+            record.owner_token = owner_token
+            record.owner = owner
+            record.state = "cleanup_owned"
+            if request_cleanup:
+                record.request_termination()
+        commit.set()
+        if not accepted.wait(
+            max(0.0, transfer_deadline - time.monotonic())
+        ):
+            raise OrchestratorError("Cleanup owner did not accept ownership.")
+        with record.lock:
+            valid_owner = (
+                record.owner is owner
+                and owner.is_alive()
+                and not record.completed.is_set()
+            )
+        if not valid_owner:
+            raise OrchestratorError("Cleanup ownership was not retained.")
+        return True
+    except Exception:
+        cancel.set()
+        commit.set()
+        if accepted.is_set():
+            record.request_termination()
+            if owner is not None and (
+                owner.is_alive() and not record.completed.is_set()
+            ):
+                return True
+        if active_run_id is not None:
+            with _ACTIVE_WORKER_HANDLES_LOCK:
+                if _ACTIVE_WORKER_HANDLES.get(active_run_id) is record.process:
+                    _ACTIVE_WORKER_HANDLES.pop(active_run_id, None)
+        with record.lock:
+            if record.state == "cleanup_owned" and record.owner is owner:
+                record.owner_token = f"caller:{record.generation}"
+                record.owner = None
+                record.state = "caller_owned"
+        if (
+            owner_started
+            and owner is not None
+            and owner is not threading.current_thread()
+        ):
+            owner.join(
+                timeout=max(0.0, transfer_deadline - time.monotonic())
+            )
+        _bounded_process_cleanup(
+            record.process, threads, deadline=transfer_deadline
+        )
+        if not owner_started:
+            complete_once(record)
+        elif owner is not None and not owner.is_alive():
+            complete_once(record)
+        return False
 
 
 def _cleanup_pending_response(
@@ -7387,6 +9624,9 @@ def _cleanup_pending_response(
     process: subprocess.Popen[Any],
     sensitive_values: tuple[str, ...] = (),
     threads: tuple[threading.Thread, ...] | list[threading.Thread] = (),
+    *,
+    response_updates: Mapping[str, Any] | None = None,
+    attempt_deadline: float | None = None,
 ) -> dict[str, Any]:
     owned_threads = tuple(
         thread
@@ -7400,23 +9640,58 @@ def _cleanup_pending_response(
         if artifact_root and RUN_ID_RE.match(run_id)
         else None
     )
+    record = _owned_process_record(process)
+    transaction_deadline = _validated_finite_deadline(
+        _effective_deadline(), label="Cleanup transaction deadline"
+    )
+    inherited_deadline = _validated_finite_deadline(
+        _effective_deadline(attempt_deadline), label="Cleanup response deadline"
+    )
+    safe_response_updates = _scrub_guarded_value(
+        dict(response_updates or {}), sensitive_values
+    )
+    if record is None:
+        record = _ensure_owned_process_record(
+            process, deadline=inherited_deadline
+        )
+    timed_out_cleanup = _has_timeout_evidence(
+        metadata, safe_response_updates
+    ) or _transaction_deadline_expired(
+        metadata, fallback=transaction_deadline
+    )
+    if timed_out_cleanup:
+        safe_response_updates.update(
+            _worker_cleanup_response_updates(
+                timed_out=True, stopped=False
+            )
+        )
+    cleanup_deadline = _owned_process_cleanup_deadline(
+        process,
+        inherited_deadline,
+        timeout_evidence=timed_out_cleanup,
+    )
+    assert cleanup_deadline is not None
     owner_name = f"cc-cleanup-owner-{run_id or process.pid}-{uuid.uuid4().hex[:8]}"
     pending_state = {
+        **safe_response_updates,
         "status": "cleanup_pending",
         "cleanup_state": "durable_owner_pending",
         "cleanup_owner": owner_name,
         "owned_process_pid": process.pid,
-        "live_cleanup_threads": [
-            thread.name for thread in owned_threads if thread.is_alive()
-        ],
+        "live_cleanup_threads": _live_thread_names(owned_threads),
         "terminal_state_count": 0,
         "persisted": True,
         "persistence_state": "persisted",
     }
     current = {**dict(metadata), **pending_state}
     if run_dir is not None:
-        token = _OPERATION_DEADLINE.set(None)
+        token = _OPERATION_DEADLINE.set(cleanup_deadline)
         try:
+            _atomic_write_text(
+                run_dir / "pid.txt",
+                str(process.pid),
+                deadline=cleanup_deadline,
+            )
             current = update_metadata(run_dir, **pending_state)
             append_event(
                 run_dir,
@@ -7437,77 +9712,92 @@ def _cleanup_pending_response(
         finally:
             _OPERATION_DEADLINE.reset(token)
 
-    def own_cleanup() -> None:
-        try:
-            if process.poll() is None:
-                try:
-                    process.terminate()
-                except OSError:
-                    pass
-            if process.poll() is None:
-                try:
-                    process.kill()
-                except OSError:
-                    pass
-            try:
-                process.wait()
-            except OSError:
-                pass
-            for stream in (process.stdin, process.stdout, process.stderr):
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except OSError:
-                        pass
-            for thread in owned_threads:
-                thread.join()
-            if run_dir is not None:
-                token = _OPERATION_DEADLINE.set(None)
-                try:
-                    _unlink_managed_file(run_dir / "pid.txt")
-                    confirmed = {
-                        "status": "blocked_runtime_launch",
-                        "cleanup_state": "cleanup_confirmed",
-                        "cleanup_owner": owner_name,
-                        "owned_process_pid": process.pid,
-                        "live_cleanup_threads": [],
-                        "finished_at": utc_now_iso(),
-                        "exit_code": None,
-                        "terminal_state_count": 1,
-                        "persisted": True,
-                        "persistence_state": "persisted",
-                    }
-                    update_metadata(run_dir, **confirmed)
-                    append_event(
-                        run_dir,
-                        {
-                            "type": "cleanup_confirmed",
-                            "status": "blocked_runtime_launch",
-                            "owned_process_pid": process.pid,
-                        },
-                    )
-                except Exception:
-                    pass
-                finally:
-                    _OPERATION_DEADLINE.reset(token)
-        finally:
-            with _ACTIVE_CLEANUP_OWNERS_LOCK:
-                _ACTIVE_CLEANUP_OWNERS.pop(owner_name, None)
+    def terminal_cleanup_state(complete: bool) -> dict[str, Any]:
+        timed_out = _has_timeout_evidence(current, safe_response_updates)
+        terminal_status = (
+            "timed_out"
+            if timed_out
+            else "cleanup_incomplete"
+            if not complete
+            else "blocked_runtime_launch"
+        )
+        terminal = {
+            **safe_response_updates,
+            "status": terminal_status,
+            "cleanup_state": (
+                "cleanup_confirmed" if complete else "cleanup_incomplete"
+            ),
+            "cleanup_owner": owner_name,
+            "owned_process_pid": process.pid,
+            "live_cleanup_threads": (
+                [] if complete else _live_thread_names(owned_threads)
+            ),
+            "finished_at": utc_now_iso(),
+            "exit_code": 124 if timed_out else None,
+            "terminal_state_count": 1,
+            "persisted": True,
+            "persistence_state": "persisted",
+        }
+        if timed_out:
+            terminal.update(
+                {"timed_out": True, "stop_reason": "timeout"}
+            )
+        reconciled = {**current, **terminal}
+        if run_dir is None:
+            return reconciled
+        return _persist_terminal_state(
+            run_dir,
+            current,
+            updates=terminal,
+            event={
+                "type": (
+                    "cleanup_confirmed"
+                    if complete
+                    else "cleanup_incomplete"
+                ),
+                "status": terminal_status,
+                "owned_process_pid": process.pid,
+            },
+            sensitive_values=sensitive_values,
+            remove_pid=complete,
+        )
 
-    owner = threading.Thread(
-        target=own_cleanup,
-        name=owner_name,
-        daemon=False,
+    terminal_result: list[dict[str, Any]] = []
+
+    def owner_complete(completed_record: _OwnedProcessTree) -> None:
+        terminal_result.append(
+            terminal_cleanup_state(
+                completed_record.cleanup_result == "cleanup_confirmed"
+            )
+        )
+
+    if record is not None and record.completed.is_set():
+        return _scrub_guarded_value(
+            terminal_cleanup_state(
+                record.cleanup_result == "cleanup_confirmed"
+            ),
+            sensitive_values,
+        )
+    if cleanup_deadline is not None and time.monotonic() >= cleanup_deadline:
+        complete = _bounded_process_cleanup(
+            process, owned_threads, deadline=cleanup_deadline
+        )
+        return _scrub_guarded_value(
+            terminal_cleanup_state(complete), sensitive_values
+        )
+
+    _start_owned_process_owner(
+        record,
+        owner_name=owner_name,
+        threads=owned_threads,
+        request_cleanup=True,
+        attempt_deadline=cleanup_deadline,
+        on_complete=owner_complete,
     )
-    with _ACTIVE_CLEANUP_OWNERS_LOCK:
-        _ACTIVE_CLEANUP_OWNERS[owner_name] = owner
-    try:
-        owner.start()
-    except Exception:
-        with _ACTIVE_CLEANUP_OWNERS_LOCK:
-            _ACTIVE_CLEANUP_OWNERS.pop(owner_name, None)
-        own_cleanup()
-    return _scrub_guarded_value(current, sensitive_values)
+    return _scrub_guarded_value(
+        terminal_result[-1] if terminal_result else current,
+        sensitive_values,
+    )
 
 
 def _complete_isolated_worker_cleanup(
@@ -7516,6 +9806,7 @@ def _complete_isolated_worker_cleanup(
     pending: _OwnedCleanupPending,
 ) -> dict[str, Any]:
     """Keep the isolated worker responsible until process and threads are gone."""
+    metadata = {**dict(metadata), **pending.response_updates}
     process = pending.process
     threads = tuple(
         thread
@@ -7523,8 +9814,27 @@ def _complete_isolated_worker_cleanup(
         if thread is not threading.current_thread()
     )
     inherited_deadline = _effective_deadline()
-    live_names = [thread.name for thread in threads if thread.is_alive()]
-    durable_token = _OPERATION_DEADLINE.set(None)
+    record = _owned_process_record(process)
+    timed_out_cleanup = _has_timeout_evidence(
+        metadata
+    ) or _transaction_deadline_expired(
+        metadata, fallback=_effective_deadline()
+    )
+    if timed_out_cleanup:
+        metadata.update(
+            _worker_cleanup_response_updates(
+                timed_out=True, stopped=False
+            )
+        )
+    cleanup_deadline = _owned_process_cleanup_deadline(
+        process,
+        inherited_deadline,
+        timeout_evidence=timed_out_cleanup,
+    )
+    if cleanup_deadline is None:
+        cleanup_deadline = time.monotonic()
+    live_names = _live_thread_names(threads)
+    durable_token = _OPERATION_DEADLINE.set(cleanup_deadline)
     try:
         pending_state = {
             "status": "cleanup_pending",
@@ -7536,6 +9846,11 @@ def _complete_isolated_worker_cleanup(
             "persistence_state": "persisted",
         }
         try:
+            _atomic_write_text(
+                run_dir / "pid.txt",
+                str(process.pid),
+                deadline=cleanup_deadline,
+            )
             current = update_metadata(run_dir, **pending_state)
             append_event(
                 run_dir,
@@ -7554,107 +9869,75 @@ def _complete_isolated_worker_cleanup(
     finally:
         _OPERATION_DEADLINE.reset(durable_token)
 
-    if process.poll() is None:
-        try:
-            process.terminate()
-        except OSError:
-            pass
-        remaining = _remaining_deadline(inherited_deadline, 5.0)
-        if remaining > 0:
-            try:
-                process.wait(timeout=remaining)
-            except subprocess.TimeoutExpired:
-                pass
-    if process.poll() is None:
-        try:
-            process.kill()
-        except OSError:
-            pass
-        # Durable ownership means this worker remains alive until the owned
-        # handle confirms reaping; no daemon-only handoff is claimed.
-        try:
-            process.wait()
-        except OSError:
-            pass
-    for stream in (process.stdin, process.stdout, process.stderr):
-        if stream is not None:
-            try:
-                stream.close()
-            except OSError:
-                pass
-    for thread in threads:
-        thread.join()
-
-    durable_token = _OPERATION_DEADLINE.set(None)
-    try:
-        _unlink_managed_file(run_dir / "pid.txt")
-        confirmed_updates = {
-            "status": "blocked_runtime_launch",
-            "cleanup_state": "cleanup_confirmed",
-            "owned_process_pid": process.pid,
-            "live_cleanup_threads": [],
-            "finished_at": utc_now_iso(),
-            "exit_code": None,
-            "terminal_state_count": 1,
-            "persisted": True,
-            "persistence_state": "persisted",
-        }
-        try:
-            confirmed = update_metadata(run_dir, **confirmed_updates)
-            append_event(
-                run_dir,
-                {
-                    "type": "cleanup_confirmed",
-                    "status": "blocked_runtime_launch",
-                    "owned_process_pid": process.pid,
+    complete = _bounded_process_cleanup(
+        process, threads, deadline=cleanup_deadline
+    )
+    timed_out = _has_timeout_evidence(metadata, current)
+    terminal_status = (
+        "timed_out"
+        if timed_out
+        else "cleanup_incomplete"
+        if not complete
+        else "failed"
+    )
+    confirmed_updates = {
+        "status": terminal_status,
+        "cleanup_state": (
+            "cleanup_confirmed" if complete else "cleanup_incomplete"
+        ),
+        "owned_process_pid": process.pid,
+        "live_cleanup_threads": (
+            [] if complete else _live_thread_names(threads)
+        ),
+        "finished_at": utc_now_iso(),
+        "exit_code": 124 if timed_out else None if not complete else 1,
+        "terminal_state_count": 1,
+        "persisted": True,
+        "persistence_state": "persisted",
+    }
+    if timed_out:
+        confirmed_updates.update(
+            {"timed_out": True, "stop_reason": "timeout"}
+        )
+    elif complete:
+        confirmed_updates.update(
+            {
+                "acceptance_status": "blocked_artifact_finalization",
+                "finalization_state": "failed",
+                "finalization_error": {
+                    "code": "artifact_finalization_failed",
+                    "message": "Streaming execution artifacts could not be finalized safely.",
                 },
-            )
-            return confirmed
-        except Exception:
-            return {
-                **current,
-                **confirmed_updates,
-                "persisted": False,
-                "persistence_state": "degraded",
             }
-    finally:
-        _OPERATION_DEADLINE.reset(durable_token)
+        )
+    return _persist_terminal_state(
+        run_dir,
+        current,
+        updates=confirmed_updates,
+        event={
+            "type": (
+                "cleanup_confirmed" if complete else "cleanup_incomplete"
+            ),
+            "status": terminal_status,
+            "owned_process_pid": process.pid,
+        },
+        remove_pid=complete,
+    )
 
 
 def _terminate_owned_process(
     process: subprocess.Popen[Any], *, deadline: float | None = None
 ) -> bool:
-    deadline = _effective_deadline(deadline)
-    if process.poll() is None:
-        try:
-            process.terminate()
-            remaining = _remaining_deadline(deadline, 5.0)
-            if remaining <= 0:
-                raise subprocess.TimeoutExpired(process.args, 0)
-            process.wait(timeout=remaining)
-        except (OSError, subprocess.TimeoutExpired):
-            if process.poll() is None:
-                try:
-                    process.kill()
-                except OSError:
-                    pass
-                remaining = _remaining_deadline(deadline, 5.0)
-                if remaining > 0:
-                    try:
-                        process.wait(timeout=remaining)
-                    except subprocess.TimeoutExpired:
-                        pass
-    if process.poll() is None:
-        key = f"cleanup-{process.pid}-{uuid.uuid4().hex}"
-        _retain_worker_handle(key, process)
-        return False
-    for stream in (process.stdin, process.stdout, process.stderr):
-        if stream is not None:
-            try:
-                stream.close()
-            except OSError:
-                pass
-    return True
+    effective_deadline = _validated_finite_deadline(
+        _effective_deadline(deadline), label="Owned process termination deadline"
+    )
+    record = _owned_process_record(process)
+    cleanup_deadline = (
+        _cleanup_attempt_deadline(record, effective_deadline)
+        if record is not None
+        else effective_deadline
+    )
+    return _bounded_process_cleanup(process, deadline=cleanup_deadline)
 
 
 def _output_bytes(value: Any) -> bytes:
@@ -7684,11 +9967,21 @@ def _terminate_and_drain_owned_process(
     *,
     deadline: float | None = None,
 ) -> tuple[bytes, bytes]:
+    record = _owned_process_record(process)
+    if record is not None:
+        deadline = _cleanup_attempt_deadline(record, deadline)
+    else:
+        deadline = _validated_finite_deadline(
+            _effective_deadline(deadline),
+            label="Owned process drain deadline",
+        )
+    _terminate_owned_containment(process, force=False, deadline=deadline)
     if process.poll() is None:
         try:
             process.terminate()
         except OSError:
             pass
+    _terminate_owned_containment(process, force=True, deadline=deadline)
     try:
         remaining = _remaining_deadline(deadline, 5.0)
         if remaining <= 0:
@@ -7712,36 +10005,218 @@ def _terminate_and_drain_owned_process(
         stderr = _prefer_complete_output(timeout_error.stderr, stderr)
     if process.poll() is None:
         _retain_worker_handle(
-            f"cleanup-{process.pid}-{uuid.uuid4().hex}", process
+            f"cleanup-{process.pid}-{uuid.uuid4().hex}",
+            process,
+            request_cleanup=True,
+        )
+    else:
+        _close_process_streams(process)
+        _release_owned_containment(
+            process,
+            terminate_descendants=True,
+            deadline=deadline,
         )
     return _output_bytes(stdout), _output_bytes(stderr)
 
 
-def _retain_worker_handle(run_id: str, worker: subprocess.Popen[Any]) -> None:
+def _retain_worker_handle(
+    run_id: str,
+    worker: subprocess.Popen[Any],
+    *,
+    request_cleanup: bool = False,
+) -> bool:
     with _ACTIVE_WORKER_HANDLES_LOCK:
         if any(handle is worker for handle in _ACTIVE_WORKER_HANDLES.values()):
-            return
-        _ACTIVE_WORKER_HANDLES[run_id] = worker
+            return True
 
-    def reap() -> None:
+    record = _owned_process_record(worker)
+    if record is None:
+        record = _ensure_owned_process_record(
+            worker, deadline=_effective_deadline()
+        )
+    owner_name = f"cc-worker-reaper-{run_id}"
+
+    def release_registries(_record: _OwnedProcessTree) -> None:
+        if _record.cleanup_result == "cleanup_confirmed":
+            with _ACTIVE_WORKER_HANDLES_LOCK:
+                if _ACTIVE_WORKER_HANDLES.get(run_id) is worker:
+                    _ACTIVE_WORKER_HANDLES.pop(run_id, None)
+        with _ACTIVE_CLEANUP_OWNERS_LOCK:
+            if _ACTIVE_CLEANUP_OWNERS.get(owner_name) is threading.current_thread():
+                _ACTIVE_CLEANUP_OWNERS.pop(owner_name, None)
+
+    return _start_owned_process_owner(
+        record,
+        owner_name=owner_name,
+        active_run_id=run_id,
+        request_cleanup=request_cleanup,
+        on_complete=release_registries,
+    )
+
+
+def _spawn_detached_internal_worker(
+    command: list[str], *, ownership_deadline: float, **kwargs: Any
+) -> subprocess.Popen[bytes]:
+    if not command or not Path(command[0]).is_absolute():
+        raise OrchestratorError(
+            "The detached internal worker executable must be absolute."
+        )
+    expected_python = os.path.normcase(str(Path(sys.executable).resolve()))
+    actual_python = os.path.normcase(str(Path(command[0]).resolve()))
+    if actual_python != expected_python or kwargs.get("shell"):
+        raise OrchestratorError(
+            "The detached internal worker command is not approved."
+        )
+    worker = subprocess.Popen(command, **kwargs)
+    try:
+        _ensure_owned_process_record(worker, deadline=ownership_deadline)
+    except Exception:
+        try:
+            worker.terminate()
+            worker.wait(
+                timeout=max(0.001, ownership_deadline - time.monotonic())
+            )
+        except (OSError, subprocess.SubprocessError):
+            try:
+                worker.kill()
+            except OSError:
+                pass
+        raise
+    return worker
+
+
+def _register_background_worker_watcher(
+    run_id: str, worker: subprocess.Popen[Any]
+) -> bool:
+    if worker.poll() is not None:
+        return False
+
+    def reap_worker() -> None:
         try:
             worker.wait()
+        except (OSError, subprocess.SubprocessError):
+            pass
         finally:
-            for stream in (worker.stdin, worker.stdout, worker.stderr):
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except OSError:
-                        pass
+            _close_process_streams(worker)
             with _ACTIVE_WORKER_HANDLES_LOCK:
                 if _ACTIVE_WORKER_HANDLES.get(run_id) is worker:
                     _ACTIVE_WORKER_HANDLES.pop(run_id, None)
 
-    threading.Thread(
-        target=reap,
-        name=f"cc-worker-reaper-{run_id}",
-        daemon=False,
-    ).start()
+    try:
+        watcher = threading.Thread(
+            target=reap_worker,
+            name=f"cc-worker-watcher-{run_id}",
+            daemon=True,
+        )
+    except Exception:
+        return False
+    with _ACTIVE_WORKER_HANDLES_LOCK:
+        existing = _ACTIVE_WORKER_HANDLES.get(run_id)
+        if existing is not None and existing is not worker:
+            return False
+        _ACTIVE_WORKER_HANDLES[run_id] = worker
+    try:
+        watcher.start()
+    except Exception:
+        with _ACTIVE_WORKER_HANDLES_LOCK:
+            if _ACTIVE_WORKER_HANDLES.get(run_id) is worker:
+                _ACTIVE_WORKER_HANDLES.pop(run_id, None)
+        return False
+    return True
+
+
+def _wait_for_worker_handoff_ready(
+    run_dir: Path,
+    worker: subprocess.Popen[Any],
+    *,
+    deadline: float,
+) -> dict[str, Any]:
+    while time.monotonic() < deadline:
+        if worker.poll() is not None:
+            raise OrchestratorError(
+                "The isolated worker exited before handoff readiness."
+            )
+        latest = read_metadata(run_dir)
+        launch = latest.get("worker_launch")
+        if (
+            latest.get("worker_pid") == worker.pid
+            and str(latest.get("status") or "") in {"starting", "running"}
+            and isinstance(launch, Mapping)
+            and launch.get("nonce_consumed") is True
+            and launch.get("controller_handoff") == "ready"
+        ):
+            return latest
+        time.sleep(min(0.01, max(0.001, deadline - time.monotonic())))
+    raise TimeoutError("The isolated worker handoff did not become ready.")
+
+
+def _accept_worker_handoff(
+    run_dir: Path,
+    worker: subprocess.Popen[Any],
+    *,
+    launch_nonce: str,
+) -> dict[str, Any]:
+    with artifact_lock(run_dir):
+        metadata = read_metadata(run_dir)
+        launch = metadata.get("worker_launch")
+        if (
+            worker.poll() is not None
+            or metadata.get("worker_pid") != worker.pid
+            or str(metadata.get("status") or "") not in {"starting", "running"}
+            or not isinstance(launch, Mapping)
+            or launch.get("nonce_consumed") is not True
+            or launch.get("controller_handoff") != "ready"
+        ):
+            raise OrchestratorError(
+                "The isolated worker handoff is no longer valid."
+            )
+        try:
+            expected_identity = ProcessIdentity.from_dict(
+                metadata.get("worker_process_identity")
+            )
+        except (TypeError, ValueError) as exc:
+            raise OrchestratorError(
+                "The isolated worker handoff identity is invalid."
+            ) from exc
+        if expected_identity.pid != worker.pid:
+            raise OrchestratorError(
+                "The isolated worker handoff identity does not match its owned handle."
+            )
+        identity_check = compare_process_identity(
+            expected_identity, expected_launch_nonce=launch_nonce
+        )
+        if identity_check.state != "match":
+            raise OrchestratorError(
+                "The isolated worker changed during handoff."
+            )
+        accepted_launch = dict(launch)
+        accepted_launch.update(
+            {
+                "controller_handoff": "accepted",
+                "controller_handoff_accepted_at": utc_now_iso(),
+            }
+        )
+        metadata["worker_launch"] = accepted_launch
+
+        def handoff_precommit() -> None:
+            if worker.poll() is not None or expected_identity.pid != worker.pid:
+                raise OrchestratorError(
+                    "The isolated worker exited during handoff acceptance."
+                )
+            final_check = compare_process_identity(
+                expected_identity, expected_launch_nonce=launch_nonce
+            )
+            if final_check.state != "match":
+                raise OrchestratorError(
+                    "The isolated worker changed during handoff acceptance."
+                )
+
+        _atomic_write_bytes(
+            run_dir / "metadata.json",
+            _metadata_bytes(metadata),
+            precommit=handoff_precommit,
+        )
+        return metadata
 
 
 def _initialize_prepared_run(
@@ -7778,8 +10253,18 @@ def _initialize_prepared_run(
                 + timedelta(seconds=INTERNAL_WORKER_NONCE_TTL_SECONDS)
             ).isoformat(),
             "start_gate": "closed",
+            "controller_handoff": (
+                "team_managed"
+                if prepared.admission_reservation is not None
+                else "pending"
+            ),
         }
         metadata["controller_pid"] = os.getpid()
+        if prepared.admission_reservation is not None:
+            metadata["team_id"] = prepared.admission_reservation.team_id
+            metadata["team_manifest_path"] = str(
+                TEAMS_DIR / f"{prepared.admission_reservation.team_id}.json"
+            )
     for name in ("stdout.txt", "stderr.txt", "events.ndjson"):
         _atomic_write_text(run_dir / name, "")
     register_run_dir(
@@ -7868,6 +10353,7 @@ def _start_one_shot_launch_inner(
         )
     command = _runtime_command(identity, spec.arguments)
     process: subprocess.Popen[bytes] | None = None
+    timed_out = False
     if not identity.matches_current_file():
         return _record_blocked_launch(
             run_dir,
@@ -7899,7 +10385,11 @@ def _start_one_shot_launch_inner(
                 "before",
                 prepared.sensitive_values,
             )
-        if git_before_raw.get("is_git_repo") and not git_before_raw.get("ok"):
+        if (
+            git_before_raw.get("ok") is not True
+            or git_before_raw.get("evidence_complete") is not True
+            or git_before_raw.get("_raw_evidence_complete") is not True
+        ):
             raise OrchestratorError("Pre-launch Git evidence is unavailable.")
     except Exception:
         return _record_blocked_launch(
@@ -7931,13 +10421,37 @@ def _start_one_shot_launch_inner(
     if launch_deadline is None:
         raise OrchestratorError("One-shot launch deadline is unavailable.")
     try:
-        process = subprocess.Popen(
+        process = _owned_process_popen(
             command,
+            final_identity=identity,
             cwd=spec.cwd,
             env=dict(spec.environment),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+        )
+    except RuntimeSecurityError as error:
+        return _record_blocked_launch(
+            run_dir,
+            metadata,
+            sensitive_values=prepared.sensitive_values,
+            status="blocked_runtime_identity",
+            error=error,
+        )
+    except TimeoutError:
+        timeout_updates = _worker_cleanup_response_updates(
+            timed_out=True, stopped=False
+        )
+        return _record_blocked_launch(
+            run_dir,
+            metadata,
+            sensitive_values=prepared.sensitive_values,
+            status="timed_out",
+            error=_launch_failure_error(
+                "runtime_launch_timeout",
+                "Runtime process creation exceeded the launch deadline.",
+            ),
+            **timeout_updates,
         )
     except OSError:
         return _record_blocked_launch(
@@ -7954,6 +10468,13 @@ def _start_one_shot_launch_inner(
         runtime_deadline = _runtime_execution_deadline(
             launch_deadline, started_monotonic
         )
+        timeout_cleanup_deadline = _owned_process_cleanup_deadline(
+            process,
+            launch_deadline,
+            timeout_evidence=True,
+        )
+        if timeout_cleanup_deadline is None:
+            timeout_cleanup_deadline = launch_deadline
         try:
             child_identity = capture_process_identity(
                 process.pid, launch_nonce=spec.launch_nonce
@@ -7964,6 +10485,30 @@ def _start_one_shot_launch_inner(
             _check_deadline(
                 launch_deadline,
                 "Runtime identity validation exceeded the launch deadline.",
+            )
+        except TimeoutError:
+            timed_out = True
+            timeout_updates = _worker_cleanup_response_updates(
+                timed_out=True, stopped=False
+            )
+            if not _terminate_owned_process(
+                process, deadline=timeout_cleanup_deadline
+            ):
+                raise _OwnedCleanupPending(
+                    process,
+                    response_updates=timeout_updates,
+                )
+            return _record_blocked_launch(
+                run_dir,
+                metadata,
+                sensitive_values=prepared.sensitive_values,
+                status="timed_out",
+                error=_launch_failure_error(
+                    "runtime_launch_timeout",
+                    "Runtime identity validation exceeded the launch deadline.",
+                ),
+                child_pid=process.pid,
+                **timeout_updates,
             )
         except (OSError, TypeError, ValueError, RuntimeSecurityError) as exc:
             if not _terminate_owned_process(process, deadline=launch_deadline):
@@ -7984,15 +10529,39 @@ def _start_one_shot_launch_inner(
                 child_pid=process.pid,
             )
         try:
-            metadata = update_metadata(
-                run_dir,
-                child_pid=process.pid,
-                child_process_identity=child_identity.to_dict(),
-            )
+            artifact_token = _OPERATION_DEADLINE.set(runtime_deadline)
+            try:
+                metadata = update_metadata(
+                    run_dir,
+                    child_pid=process.pid,
+                    child_process_identity=child_identity.to_dict(),
+                )
+            finally:
+                _OPERATION_DEADLINE.reset(artifact_token)
         except Exception:
-            if not _terminate_owned_process(process, deadline=launch_deadline):
+            deadline_expired = time.monotonic() >= launch_deadline
+            failure_updates: dict[str, Any] = {
+                "child_pid": process.pid,
+                "child_process_identity": child_identity.to_dict(),
+            }
+            if deadline_expired:
+                timed_out = True
+                failure_updates.update(
+                    {"timed_out": True, "stop_reason": "timeout"}
+                )
+            if not _terminate_owned_process(
+                process,
+                deadline=(
+                    timeout_cleanup_deadline
+                    if deadline_expired
+                    else launch_deadline
+                ),
+            ):
                 return _cleanup_pending_response(
-                    metadata, process, prepared.sensitive_values
+                    metadata,
+                    process,
+                    prepared.sensitive_values,
+                    response_updates=failure_updates,
                 )
             return _record_blocked_launch(
                 run_dir,
@@ -8003,9 +10572,7 @@ def _start_one_shot_launch_inner(
                     "artifact_write_failed",
                     "Child process identity metadata could not be persisted.",
                 ),
-                child_pid=process.pid,
-                child_process_identity=child_identity.to_dict(),
-                timed_out=time.monotonic() >= launch_deadline,
+                **failure_updates,
             )
         if not identity.matches_current_file():
             if not _terminate_owned_process(process, deadline=launch_deadline):
@@ -8027,12 +10594,24 @@ def _start_one_shot_launch_inner(
             )
             if remaining <= 0:
                 timed_out = True
+                cleanup_deadline = _owned_process_cleanup_deadline(
+                    process,
+                    launch_deadline,
+                    timeout_evidence=True,
+                )
                 stdout_bytes, stderr_bytes = _terminate_and_drain_owned_process(
-                    process, deadline=launch_deadline
+                    process, deadline=cleanup_deadline
                 )
                 if process.poll() is None:
                     return _cleanup_pending_response(
-                        metadata, process, prepared.sensitive_values
+                        metadata,
+                        process,
+                        prepared.sensitive_values,
+                        response_updates={
+                            "timed_out": True,
+                            "stop_reason": "timeout",
+                            "exit_code": 124,
+                        },
                     )
                 exit_code = 124
             else:
@@ -8043,12 +10622,24 @@ def _start_one_shot_launch_inner(
                 exit_code = process.returncode
         except subprocess.TimeoutExpired as timeout_error:
             timed_out = True
+            cleanup_deadline = _owned_process_cleanup_deadline(
+                process,
+                launch_deadline,
+                timeout_evidence=True,
+            )
             drained_stdout, drained_stderr = _terminate_and_drain_owned_process(
-                process, deadline=launch_deadline
+                process, deadline=cleanup_deadline
             )
             if process.poll() is None:
                 return _cleanup_pending_response(
-                    metadata, process, prepared.sensitive_values
+                    metadata,
+                    process,
+                    prepared.sensitive_values,
+                    response_updates={
+                        "timed_out": True,
+                        "stop_reason": "timeout",
+                        "exit_code": 124,
+                    },
                 )
             stdout_bytes = _prefer_complete_output(
                 timeout_error.output, drained_stdout
@@ -8058,50 +10649,119 @@ def _start_one_shot_launch_inner(
             )
             exit_code = 124
     finally:
+        cleanup_deadline = _owned_process_cleanup_deadline(
+            process,
+            launch_deadline,
+            timeout_evidence=timed_out,
+        )
         if process.poll() is None:
-            if not _terminate_owned_process(process, deadline=launch_deadline):
-                raise _OwnedCleanupPending(process)
+            cleanup_confirmed = _terminate_owned_process(
+                process, deadline=cleanup_deadline
+            )
+        else:
+            _close_process_streams(process)
+            cleanup_confirmed = _release_owned_containment(
+                process,
+                terminate_descendants=True,
+                deadline=cleanup_deadline,
+            )
+        if not cleanup_confirmed:
+            _mark_owned_cleanup_incomplete(
+                process, "normal_completion_containment_unconfirmed"
+            )
+            response_updates: dict[str, Any] = {}
+            if timed_out:
+                response_updates.update(
+                    {
+                        "timed_out": True,
+                        "stop_reason": "timeout",
+                        "exit_code": 124,
+                    }
+                )
+            raise _OwnedCleanupPending(
+                process, response_updates=response_updates
+            )
+        metadata = update_metadata(
+            run_dir,
+            cleanup_state="cleanup_confirmed",
+            owned_process_pid=process.pid,
+            live_cleanup_threads=[],
+        )
     stdout = stdout_bytes.decode("utf-8", errors="replace")
     stderr = stderr_bytes.decode("utf-8", errors="replace")
     safe_stdout = _scrub_output_text(stdout, prepared.sensitive_values)
     safe_stderr = _scrub_output_text(stderr, prepared.sensitive_values)
     _atomic_write_text(run_dir / "stdout.txt", safe_stdout)
     _atomic_write_text(run_dir / "stderr.txt", safe_stderr)
-    actual_route = _scrub_guarded_value(
-        actual_route_from_text(
-            stdout, declared_model=(metadata.get("profile") or {}).get("model")
-        ),
-        prepared.sensitive_values,
-    )
-    git_after_raw = capture_git_snapshot(
-        run_dir,
-        Path(str(metadata["workspace_root"])),
-        "after",
-        prepared.sensitive_values,
-        deadline=launch_deadline,
-    )
-    scope_check_raw = _check_write_scope_with_evidence(
+    if time.monotonic() >= launch_deadline:
+        timed_out = True
+        exit_code = 124
+    workspace_root = Path(str(metadata["workspace_root"]))
+    if timed_out:
+        actual_route: dict[str, Any] = {}
+        git_after_raw = _failed_git_snapshot(
+            "after",
+            TimeoutError(
+                "Post-run Git evidence was not captured after timeout."
+            ),
+            prepared.sensitive_values,
+            is_git_repo=bool(git_before_raw.get("is_git_repo")),
+        )
+    else:
+        actual_route = _scrub_guarded_value(
+            actual_route_from_text(
+                stdout,
+                declared_model=(metadata.get("profile") or {}).get("model"),
+            ),
+            prepared.sensitive_values,
+        )
+        git_after_raw = capture_git_snapshot(
+            run_dir,
+            workspace_root,
+            "after",
+            prepared.sensitive_values,
+            deadline=launch_deadline,
+        )
+        if time.monotonic() >= launch_deadline:
+            timed_out = True
+            exit_code = 124
+    (
+        scope_check_raw,
+        _scope_finalization_failed,
+        scope_deadline_crossed,
+    ) = _terminal_write_scope_evidence(
         str(metadata["run_id"]),
-        Path(str(metadata["workspace_root"])),
+        workspace_root,
         git_before_raw,
         git_after_raw,
         pinned_scope,
+        timed_out=timed_out,
     )
+    if scope_deadline_crossed:
+        timed_out = True
+        exit_code = 124
     git_after = _git_snapshot_projection(
         git_after_raw, prepared.sensitive_values
     )
     scope_check = _scrub_guarded_value(
         scope_check_raw, prepared.sensitive_values
     )
-    if time.monotonic() >= launch_deadline and not timed_out:
-        timed_out = True
-        exit_code = 124
     updates: dict[str, Any] = _scrub_guarded_value(
         {
+            "status": (
+                "timed_out"
+                if timed_out
+                else "succeeded"
+                if exit_code == 0
+                else "failed"
+            ),
             "finished_at": utc_now_iso(),
             "duration_ms": int((time.monotonic() - started_monotonic) * 1000),
             "exit_code": exit_code,
             "timed_out": timed_out,
+            "cleanup_state": "cleanup_confirmed",
+            "owned_process_pid": process.pid,
+            "live_cleanup_threads": [],
             "git_after": git_after,
             "write_scope_check": scope_check,
             "acceptance_status": (
@@ -8125,38 +10785,62 @@ def _start_one_shot_launch_inner(
                 "route_mismatch": actual_route.get("route_mismatch"),
             }
         )
-    metadata = update_metadata(run_dir, **updates)
-    append_event(
-        run_dir,
-        _scrub_guarded_value(
-            {
-                "type": "process_exited",
-                "status": "timed_out" if timed_out else "completed",
-                "exit_code": exit_code,
-                "duration_ms": updates["duration_ms"],
-            },
-            prepared.sensitive_values,
-        ),
-    )
     try:
-        _publish_latest_run(metadata)
-    except Exception:
-        blocked = _record_blocked_launch(
-            run_dir,
-            metadata,
-            sensitive_values=prepared.sensitive_values,
-            status="blocked_runtime_launch",
-            error=_launch_failure_error(
-                "artifact_write_failed", "Latest-run metadata could not be persisted."
-            ),
-            child_pid=process.pid,
-            child_process_identity=child_identity.to_dict(),
-        )
         _scrub_run_artifacts(run_dir, prepared.sensitive_values)
         _secure_run_artifacts(run_dir)
-        return _scrub_guarded_value(blocked, prepared.sensitive_values)
-    _scrub_run_artifacts(run_dir, prepared.sensitive_values)
-    _secure_run_artifacts(run_dir)
+        _publish_latest_run({**metadata, **updates})
+    except Exception:
+        finalization_timed_out = _has_timeout_evidence(updates)
+        failure_status = "timed_out" if finalization_timed_out else "failed"
+        failed = _persist_terminal_state(
+            run_dir,
+            metadata,
+            updates={
+                "status": failure_status,
+                "finished_at": utc_now_iso(),
+                "exit_code": 124 if finalization_timed_out else 1,
+                **(
+                    {"timed_out": True, "stop_reason": "timeout"}
+                    if finalization_timed_out
+                    else {}
+                ),
+                "acceptance_status": "blocked_artifact_finalization",
+                "finalization_state": "failed",
+                "finalization_error": {
+                    "code": "artifact_finalization_failed",
+                    "message": "One-shot execution artifacts could not be finalized safely.",
+                },
+            },
+            event={
+                "type": "process_exited",
+                "status": failure_status,
+                "exit_code": 124 if finalization_timed_out else 1,
+                "finalization_state": "failed",
+            },
+            sensitive_values=prepared.sensitive_values,
+            remove_pid=True,
+            launch_deadline=launch_deadline,
+        )
+        try:
+            _scrub_run_artifacts(run_dir, prepared.sensitive_values)
+            _secure_run_artifacts(run_dir)
+        except Exception:
+            pass
+        return _scrub_guarded_value(failed, prepared.sensitive_values)
+    metadata = _persist_terminal_state(
+        run_dir,
+        metadata,
+        updates=updates,
+        event={
+            "type": "process_exited",
+            "status": updates["status"],
+            "exit_code": exit_code,
+            "duration_ms": updates["duration_ms"],
+        },
+        sensitive_values=prepared.sensitive_values,
+        remove_pid=True,
+        launch_deadline=launch_deadline,
+    )
     return _scrub_guarded_value({
         **metadata,
         "stdout_tail": safe_stdout[-4000:],
@@ -8182,16 +10866,57 @@ def _start_one_shot_launch(
                 pending.process,
                 prepared.sensitive_values,
                 pending.threads,
+                response_updates=pending.response_updates,
             )
         except Exception:
+            try:
+                latest = read_metadata(run_dir)
+            except Exception:
+                latest = dict(metadata)
+            if latest.get("child_pid") is not None:
+                fallback_timed_out = _has_timeout_evidence(latest) or (
+                    time.monotonic() >= deadline
+                )
+                fallback_status = (
+                    "timed_out" if fallback_timed_out else "failed"
+                )
+                return _persist_terminal_state(
+                    run_dir,
+                    latest,
+                    updates={
+                        "status": fallback_status,
+                        "finished_at": utc_now_iso(),
+                        "exit_code": 124 if fallback_timed_out else 1,
+                        **(
+                            {"timed_out": True, "stop_reason": "timeout"}
+                            if fallback_timed_out
+                            else {}
+                        ),
+                        "acceptance_status": "blocked_artifact_finalization",
+                        "finalization_state": "failed",
+                        "finalization_error": {
+                            "code": "artifact_finalization_failed",
+                            "message": "One-shot execution artifacts could not be finalized safely.",
+                        },
+                    },
+                    event={
+                        "type": "process_exited",
+                        "status": fallback_status,
+                        "exit_code": 124 if fallback_timed_out else 1,
+                        "finalization_state": "failed",
+                    },
+                    sensitive_values=prepared.sensitive_values,
+                    remove_pid=True,
+                    launch_deadline=deadline,
+                )
             return _record_blocked_launch(
                 run_dir,
-                metadata,
+                latest,
                 sensitive_values=prepared.sensitive_values,
                 status="blocked_runtime_launch",
                 error=_launch_failure_error(
                     "artifact_write_failed",
-                    "Post-launch execution artifacts could not be finalized safely.",
+                    "Pre-launch execution artifacts could not be finalized safely.",
                 ),
             )
     finally:
@@ -8383,15 +11108,58 @@ def _validate_worker_process_identity(identity: ProcessIdentity) -> None:
 
 
 def _write_pipe_chunk(pipe: Any, payload: bytes) -> None:
-    _check_deadline(
-        message="The private worker protocol exceeded the launch deadline."
+    deadline = _effective_deadline()
+    _check_deadline(deadline, "The private worker protocol exceeded the launch deadline.")
+    result: list[int] = []
+    errors: list[BaseException] = []
+    completed = threading.Event()
+
+    def write() -> None:
+        try:
+            result.append(int(pipe.write(payload)))
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    writer = threading.Thread(
+        target=write,
+        name=f"cc-deadline-writer-{uuid.uuid4().hex[:8]}",
+        daemon=True,
     )
-    written = pipe.write(payload)
+    writer.start()
+    while not completed.wait(_remaining_deadline(deadline, 0.01)):
+        if deadline is not None and time.monotonic() >= deadline:
+            if os.name == "nt" and writer.native_id is not None:
+                try:
+                    import ctypes
+                    from ctypes import wintypes
+
+                    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                    thread_handle = kernel32.OpenThread(
+                        0x0001, False, int(writer.native_id)
+                    )
+                    if thread_handle:
+                        try:
+                            kernel32.CancelSynchronousIo(thread_handle)
+                        finally:
+                            kernel32.CloseHandle(thread_handle)
+                except Exception:
+                    pass
+            try:
+                pipe.close()
+            except (OSError, ValueError):
+                pass
+            completed.wait(0.05)
+            raise TimeoutError(
+                "The private worker protocol exceeded the launch deadline."
+            )
+    if errors:
+        raise errors[0]
+    written = result[0] if result else 0
     if written != len(payload):
         raise BrokenPipeError("short write to internal worker protocol")
-    _check_deadline(
-        message="The private worker protocol exceeded the launch deadline."
-    )
+    _check_deadline(deadline, "The private worker protocol exceeded the launch deadline.")
 
 
 def _worker_start_gate_payload(metadata: Mapping[str, Any]) -> dict[str, Any]:
@@ -8534,6 +11302,9 @@ def _start_streaming_controller(
     worker_deadline = _effective_deadline()
     if worker_deadline is None:
         raise OrchestratorError("Streaming transaction deadline is unavailable.")
+    worker_cleanup_deadline = (
+        worker_deadline + WORKER_FINALIZATION_GRACE_SECONDS
+    )
     try:
         try:
             if not prepared.skip_cost_guard:
@@ -8551,8 +11322,9 @@ def _start_streaming_controller(
                 ),
             )
         try:
-            worker = subprocess.Popen(
+            worker = _spawn_detached_internal_worker(
                 worker_command,
+                ownership_deadline=worker_cleanup_deadline,
                 cwd=str(ROOT),
                 env=worker_env,
                 stdin=subprocess.PIPE,
@@ -8561,6 +11333,21 @@ def _start_streaming_controller(
             creationflags=creationflags,
             **popen_kwargs,
         )
+        except TimeoutError:
+            timeout_updates = _worker_cleanup_response_updates(
+                timed_out=True, stopped=False
+            )
+            return _record_blocked_launch(
+                run_dir,
+                metadata,
+                sensitive_values=prepared.sensitive_values,
+                status="timed_out",
+                error=_launch_failure_error(
+                    "worker_launch_timeout",
+                    "Internal worker process creation exceeded the launch deadline.",
+                ),
+                **timeout_updates,
+            )
         except OSError:
             return _record_blocked_launch(
                 run_dir,
@@ -8590,10 +11377,41 @@ def _start_streaming_controller(
             worker.stdin.flush()
             worker.stdin.close()
             worker.stdin = None
-        except (BrokenPipeError, OSError):
-            if not _terminate_owned_process(worker, deadline=worker_deadline):
+        except TimeoutError:
+            timeout_updates = _worker_cleanup_response_updates(
+                timed_out=True, stopped=False
+            )
+            if not _terminate_owned_process(
+                worker, deadline=worker_cleanup_deadline
+            ):
                 return _cleanup_pending_response(
-                    metadata, worker, prepared.sensitive_values
+                    metadata,
+                    worker,
+                    prepared.sensitive_values,
+                    response_updates=timeout_updates,
+                    attempt_deadline=worker_cleanup_deadline,
+                )
+            return _record_blocked_launch(
+                run_dir,
+                metadata,
+                sensitive_values=prepared.sensitive_values,
+                status="timed_out",
+                error=_launch_failure_error(
+                    "worker_protocol_timeout",
+                    "The private worker launch pipe exceeded its deadline.",
+                ),
+                worker_pid=worker.pid,
+                **timeout_updates,
+            )
+        except (BrokenPipeError, OSError):
+            if not _terminate_owned_process(
+                worker, deadline=worker_cleanup_deadline
+            ):
+                return _cleanup_pending_response(
+                    metadata,
+                    worker,
+                    prepared.sensitive_values,
+                    attempt_deadline=worker_cleanup_deadline,
                 )
             return _record_blocked_launch(
                 run_dir,
@@ -8611,10 +11429,41 @@ def _start_streaming_controller(
                 worker.pid, launch_nonce=spec.launch_nonce
             )
             _validate_worker_process_identity(worker_identity)
-        except (OSError, TypeError, ValueError, RuntimeSecurityError) as exc:
-            if not _terminate_owned_process(worker, deadline=worker_deadline):
+        except TimeoutError:
+            timeout_updates = _worker_cleanup_response_updates(
+                timed_out=True, stopped=False
+            )
+            if not _terminate_owned_process(
+                worker, deadline=worker_cleanup_deadline
+            ):
                 return _cleanup_pending_response(
-                    metadata, worker, prepared.sensitive_values
+                    metadata,
+                    worker,
+                    prepared.sensitive_values,
+                    response_updates=timeout_updates,
+                    attempt_deadline=worker_cleanup_deadline,
+                )
+            return _record_blocked_launch(
+                run_dir,
+                metadata,
+                sensitive_values=prepared.sensitive_values,
+                status="timed_out",
+                error=_launch_failure_error(
+                    "worker_identity_timeout",
+                    "Internal worker identity validation exceeded the launch deadline.",
+                ),
+                worker_pid=worker.pid,
+                **timeout_updates,
+            )
+        except (OSError, TypeError, ValueError, RuntimeSecurityError) as exc:
+            if not _terminate_owned_process(
+                worker, deadline=worker_cleanup_deadline
+            ):
+                return _cleanup_pending_response(
+                    metadata,
+                    worker,
+                    prepared.sensitive_values,
+                    attempt_deadline=worker_cleanup_deadline,
                 )
             error = (
                 exc
@@ -8646,7 +11495,20 @@ def _start_streaming_controller(
             )
             _append_unsafe_runtime_event(prepared, run_dir)
             _publish_latest_run(metadata)
-            _retain_worker_handle(str(metadata["run_id"]), worker)
+            if not _register_background_worker_watcher(
+                str(metadata["run_id"]), worker
+            ):
+                raise OrchestratorError(
+                    "The isolated worker watcher could not be registered."
+                )
+            with _ACTIVE_WORKER_HANDLES_LOCK:
+                registered_worker = _ACTIVE_WORKER_HANDLES.get(
+                    str(metadata["run_id"])
+                )
+            if registered_worker is not worker or worker.poll() is not None:
+                raise OrchestratorError(
+                    "The isolated worker exited before gate opening."
+                )
             if admission is not None:
                 admission_active = False
                 admission.__exit__(None, None, None)
@@ -8654,10 +11516,27 @@ def _start_streaming_controller(
                 reservation.register(str(metadata["run_id"]))
             if reservation is None:
                 metadata = _open_worker_start_gate(run_dir)
+                metadata = _wait_for_worker_handoff_ready(
+                    run_dir, worker, deadline=worker_deadline
+                )
+                metadata = _accept_worker_handoff(
+                    run_dir,
+                    worker,
+                    launch_nonce=spec.launch_nonce,
+                )
+            if not _detach_owned_process_record(worker):
+                raise OrchestratorError(
+                    "The isolated worker launch ownership could not be released."
+                )
         except Exception:
-            if not _terminate_owned_process(worker, deadline=worker_deadline):
+            if not _terminate_owned_process(
+                worker, deadline=worker_cleanup_deadline
+            ):
                 return _cleanup_pending_response(
-                    metadata, worker, prepared.sensitive_values
+                    metadata,
+                    worker,
+                    prepared.sensitive_values,
+                    attempt_deadline=worker_cleanup_deadline,
                 )
             return _record_blocked_launch(
                 run_dir,
@@ -8846,15 +11725,137 @@ def _runtime_not_trusted(message: str) -> RuntimeSecurityError:
 
 
 def _read_exact(stream: Any, length: int) -> bytes:
+    deadline = _effective_deadline()
+
+    def read_chunk(size: int) -> bytes:
+        try:
+            stream.fileno()
+        except (AttributeError, OSError, TypeError, ValueError):
+            return stream.read(size)
+        if os.name != "nt":
+            return stream.read(size)
+        result: list[bytes] = []
+        errors: list[BaseException] = []
+        completed = threading.Event()
+
+        def read() -> None:
+            try:
+                result.append(stream.read(size))
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                completed.set()
+
+        reader = threading.Thread(
+            target=read,
+            name=f"cc-deadline-reader-{uuid.uuid4().hex[:8]}",
+            daemon=True,
+        )
+        reader.start()
+        while not completed.wait(_remaining_deadline(deadline, 0.01)):
+            if deadline is not None and time.monotonic() >= deadline:
+                if reader.native_id is not None:
+                    try:
+                        import ctypes
+
+                        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                        thread_handle = kernel32.OpenThread(
+                            0x0001, False, int(reader.native_id)
+                        )
+                        if thread_handle:
+                            try:
+                                kernel32.CancelSynchronousIo(thread_handle)
+                            finally:
+                                kernel32.CloseHandle(thread_handle)
+                    except Exception:
+                        pass
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
+                completed.wait(0.05)
+                raise TimeoutError(
+                    "The private worker protocol exceeded the launch deadline."
+                )
+        if errors:
+            raise errors[0]
+        return result[0] if result else b""
+
+    def wait_readable() -> None:
+        try:
+            fd = int(stream.fileno())
+        except (AttributeError, OSError, TypeError, ValueError):
+            return
+        while True:
+            _check_deadline(
+                deadline,
+                "The private worker protocol exceeded the launch deadline.",
+            )
+            if os.name == "nt":
+                return
+            else:
+                import select
+
+                readable, _writable, _exceptional = select.select(
+                    [fd], [], [], _remaining_deadline(deadline, 0.01)
+                )
+                if readable:
+                    return
+            threading.Event().wait(_remaining_deadline(deadline, 0.005))
+
     chunks: list[bytes] = []
     remaining = length
     while remaining:
-        chunk = stream.read(remaining)
+        wait_readable()
+        chunk = read_chunk(remaining)
         if not chunk:
             raise _runtime_not_trusted("Internal worker launch payload is incomplete.")
         chunks.append(chunk)
         remaining -= len(chunk)
     return b"".join(chunks)
+
+
+def _read_protocol_trailer(stream: Any) -> bytes:
+    deadline = _effective_deadline()
+    try:
+        fd = int(stream.fileno())
+    except (AttributeError, OSError, TypeError, ValueError):
+        return stream.read(1)
+    while True:
+        _check_deadline(
+            deadline, "The private worker protocol exceeded the launch deadline."
+        )
+        if os.name == "nt":
+            try:
+                import ctypes
+                import msvcrt
+                from ctypes import wintypes
+
+                available = wintypes.DWORD()
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                ok = kernel32.PeekNamedPipe(
+                    msvcrt.get_osfhandle(fd),
+                    None,
+                    0,
+                    None,
+                    ctypes.byref(available),
+                    None,
+                )
+                if not ok and ctypes.get_last_error() in {109, 232, 233}:
+                    return b""
+                if ok and int(available.value) > 0:
+                    return stream.read(1)
+            except Exception:
+                return stream.read(1)
+        else:
+            import select
+
+            readable, _writable, _exceptional = select.select(
+                [fd], [], [], _remaining_deadline(deadline, 0.01)
+            )
+            if readable:
+                return stream.read(1)
+        threading.Event().wait(_remaining_deadline(deadline, 0.005))
 
 
 def _read_bounded_payload(stream: Any, limit: int, label: str) -> bytes:
@@ -9262,12 +12263,55 @@ def _team_own_authorization_ready(metadata: Mapping[str, Any]) -> bool:
     return False
 
 
+def _wait_for_controller_handoff_acceptance(
+    run_dir: Path, metadata: Mapping[str, Any]
+) -> dict[str, Any]:
+    worker_launch = metadata.get("worker_launch")
+    if (
+        isinstance(worker_launch, Mapping)
+        and worker_launch.get("controller_handoff") == "team_managed"
+    ):
+        return dict(metadata)
+    operation_deadline = _effective_deadline()
+    if operation_deadline is None:
+        raise _runtime_not_trusted(
+            "Streaming transaction deadline is unavailable."
+        )
+    handoff_deadline = min(
+        operation_deadline,
+        time.monotonic() + WORKER_START_GATE_TIMEOUT_SECONDS,
+    )
+    while time.monotonic() < handoff_deadline:
+        latest = read_metadata(run_dir)
+        launch = latest.get("worker_launch")
+        if str(latest.get("status") or "") not in {"starting", "running"}:
+            raise _runtime_not_trusted(
+                "Controller closed the worker handoff gate."
+            )
+        if (
+            isinstance(launch, Mapping)
+            and launch.get("nonce_consumed") is True
+            and launch.get("controller_handoff") == "accepted"
+        ):
+            return latest
+        time.sleep(
+            min(0.01, max(0.001, handoff_deadline - time.monotonic()))
+        )
+    raise _runtime_not_trusted(
+        "Controller did not accept the worker handoff in time."
+    )
+
+
 def _consume_worker_nonce(run_dir: Path, nonce: str) -> dict[str, Any]:
     operation_deadline = _effective_deadline() or (
         time.monotonic() + INTERNAL_WORKER_NONCE_TTL_SECONDS
     )
     initial = read_metadata(run_dir)
-    team_launch = bool(initial.get("team_id"))
+    initial_launch = initial.get("worker_launch")
+    team_launch = (
+        isinstance(initial_launch, Mapping)
+        and initial_launch.get("controller_handoff") == "team_managed"
+    )
     if not team_launch:
         gate_deadline = (
             time.monotonic() + WORKER_START_GATE_TIMEOUT_SECONDS
@@ -9296,20 +12340,48 @@ def _consume_worker_nonce(run_dir: Path, nonce: str) -> dict[str, Any]:
                     "Worker start gate did not open in time."
                 )
             time.sleep(0.01)
+    else:
+        registration_deadline = min(
+            operation_deadline,
+            time.monotonic() + WORKER_START_GATE_TIMEOUT_SECONDS,
+        )
+        while True:
+            latest = read_metadata(run_dir)
+            if str(latest.get("status") or "") not in {"starting", "running"}:
+                raise _runtime_not_trusted(
+                    "Controller closed the team worker registration gate."
+                )
+            if (
+                isinstance(latest.get("team_id"), str)
+                and latest.get("worker_pid") == os.getpid()
+                and isinstance(latest.get("worker_process_identity"), Mapping)
+            ):
+                break
+            if time.monotonic() >= registration_deadline:
+                raise _runtime_not_trusted(
+                    "Team worker registration did not complete in time."
+                )
+            time.sleep(0.01)
     with artifact_lock(run_dir):
         metadata = read_metadata(run_dir)
-        team_launch = bool(metadata.get("team_id"))
+        launch_state = metadata.get("worker_launch")
+        team_launch = (
+            isinstance(launch_state, Mapping)
+            and launch_state.get("controller_handoff") == "team_managed"
+        )
         gate = None if team_launch else _read_worker_start_gate(run_dir)
         if str(metadata.get("status") or "") not in {"starting", "running"}:
             raise _runtime_not_trusted("Controller closed the worker start gate.")
         public = metadata.get("runtime_launch")
         worker_launch = metadata.get("worker_launch")
+        expected_handoff = "team_managed" if team_launch else "pending"
         if (
             not isinstance(public, dict)
             or not isinstance(worker_launch, dict)
             or public.get("launch_nonce") != nonce
             or worker_launch.get("nonce_consumed") is not False
             or worker_launch.get("start_gate") != "closed"
+            or worker_launch.get("controller_handoff") != expected_handoff
         ):
             raise _runtime_not_trusted("Internal worker launch nonce is unavailable.")
         try:
@@ -9377,7 +12449,18 @@ def _consume_worker_nonce(run_dir: Path, nonce: str) -> dict[str, Any]:
             raise _runtime_not_trusted("Internal worker launch nonce has expired.")
         worker_launch = dict(worker_launch)
         worker_launch.update(
-            {"nonce_consumed": True, "nonce_consumed_at": utc_now_iso()}
+            {
+                "nonce_consumed": True,
+                "nonce_consumed_at": utc_now_iso(),
+                **(
+                    {
+                        "controller_handoff": "ready",
+                        "controller_handoff_ready_at": utc_now_iso(),
+                    }
+                    if not team_launch
+                    else {}
+                ),
+            }
         )
         metadata["worker_launch"] = worker_launch
         _atomic_write_bytes(run_dir / "metadata.json", _metadata_bytes(metadata))
@@ -9385,10 +12468,27 @@ def _consume_worker_nonce(run_dir: Path, nonce: str) -> dict[str, Any]:
 
 
 def _worker_security_failure(
-    run_dir: Path, error: RuntimeSecurityError
+    run_dir: Path,
+    error: RuntimeSecurityError,
+    *,
+    response_updates: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    updates = dict(response_updates or {})
+    timed_out = _has_timeout_evidence(
+        updates
+    ) or _transaction_deadline_expired(
+        fallback=_effective_deadline()
+    )
+    if timed_out:
+        updates.update(
+            _worker_cleanup_response_updates(
+                timed_out=True, stopped=False
+            )
+        )
     status = (
-        "blocked_runtime_identity"
+        "timed_out"
+        if timed_out
+        else "blocked_runtime_identity"
         if error.code == "runtime_identity_changed"
         else "blocked_runtime_security"
     )
@@ -9397,22 +12497,34 @@ def _worker_security_failure(
         "run_id": run_dir.name,
         "status": status,
         "security_error": error.to_dict(),
+        **updates,
     }
-    try:
-        metadata = read_metadata(run_dir)
+    scope = _terminal_artifact_scope() if timed_out else contextlib.nullcontext()
+    with scope:
+        try:
+            metadata = read_metadata(run_dir)
+        except Exception:
+            metadata = {"run_id": run_dir.name, "terminal_state_count": 0}
         if (
-            metadata.get("status") in {"starting", "running"}
+            metadata.get("status") in {None, "starting", "running"}
             and metadata.get("worker_pid") in {None, os.getpid()}
         ):
-            _record_blocked_launch(
+            recorded = _record_blocked_launch(
                 run_dir,
                 metadata,
                 status=status,
                 error=error,
                 worker_pid=os.getpid(),
+                **updates,
             )
-    except Exception:
-        pass
+            response.update(
+                {
+                    "persisted": recorded.get("persisted", False),
+                    "persistence_state": recorded.get(
+                        "persistence_state", "degraded"
+                    ),
+                }
+            )
     return response
 
 
@@ -9438,16 +12550,29 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
             raise _runtime_not_trusted(
                 "Internal worker prompt length does not match metadata."
             )
-        if sys.stdin.buffer.read(1) != b"":
+        if _read_protocol_trailer(sys.stdin.buffer) != b"":
             raise _runtime_not_trusted(
                 "Internal worker launch payload has trailing data."
             )
         nonce = str(metadata["runtime_launch"]["launch_nonce"])
         metadata = _consume_worker_nonce(run_dir, nonce)
+        metadata = _wait_for_controller_handoff_acceptance(
+            run_dir, metadata
+        )
         if not executable_identity.matches_current_file():
             raise _runtime_identity_changed(executable_identity.canonical_path)
     except RuntimeSecurityError as error:
         return _worker_security_failure(run_dir, error)
+    except TimeoutError:
+        return _worker_security_failure(
+            run_dir,
+            _runtime_not_trusted(
+                "Internal worker launch state exceeded its deadline."
+            ),
+            response_updates=_worker_cleanup_response_updates(
+                timed_out=True, stopped=False
+            ),
+        )
     except (OSError, OrchestratorError, TypeError, ValueError):
         return _worker_security_failure(
             run_dir,
@@ -9498,7 +12623,11 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
         git_before_raw = capture_git_snapshot(
             run_dir, workspace_root, "before", sensitive_values
         )
-        if git_before_raw.get("is_git_repo") and not git_before_raw.get("ok"):
+        if (
+            git_before_raw.get("ok") is not True
+            or git_before_raw.get("evidence_complete") is not True
+            or git_before_raw.get("_raw_evidence_complete") is not True
+        ):
             raise OrchestratorError("Pre-launch Git evidence is unavailable.")
         metadata = update_metadata(
             run_dir,
@@ -9568,8 +12697,9 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
                 ),
             )
     try:
-        proc = subprocess.Popen(
+        proc = _owned_process_popen(
             command,
+            final_identity=executable_identity,
             cwd=str(cwd),
             env=runtime_env,
             stdin=subprocess.PIPE,
@@ -9577,6 +12707,23 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
             stderr=subprocess.PIPE,
             creationflags=creationflags,
             **popen_kwargs,
+        )
+    except RuntimeSecurityError as error:
+        return _worker_security_failure(run_dir, error)
+    except TimeoutError:
+        timeout_updates = _worker_cleanup_response_updates(
+            timed_out=True, stopped=False
+        )
+        return _record_blocked_launch(
+            run_dir,
+            metadata,
+            sensitive_values=sensitive_values,
+            status="timed_out",
+            error=_launch_failure_error(
+                "runtime_launch_timeout",
+                "Runtime process creation exceeded the launch deadline.",
+            ),
+            **timeout_updates,
         )
     except OSError:
         return _record_blocked_launch(
@@ -9593,6 +12740,13 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
         runtime_deadline = _runtime_execution_deadline(
             launch_deadline, started_monotonic
         )
+        timeout_cleanup_deadline = _owned_process_cleanup_deadline(
+            proc,
+            launch_deadline,
+            timeout_evidence=True,
+        )
+        if timeout_cleanup_deadline is None:
+            timeout_cleanup_deadline = launch_deadline
         io_cancel = threading.Event()
         io_errors: queue.Queue[tuple[str, BaseException]] = queue.Queue()
         stdout_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=64)
@@ -9607,12 +12761,19 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
             raise _OwnedCleanupPending(proc)
         raise
 
-    def terminate_child_once() -> None:
+    def terminate_child_once(*, timeout_cleanup: bool = False) -> None:
         with termination_lock:
             if termination_requested.is_set():
                 return
             termination_requested.set()
-            if not _terminate_owned_process(proc, deadline=launch_deadline):
+            if not _terminate_owned_process(
+                proc,
+                deadline=(
+                    timeout_cleanup_deadline
+                    if timeout_cleanup
+                    else launch_deadline
+                ),
+            ):
                 cleanup_pending.set()
 
     def drain_output(
@@ -9736,13 +12897,19 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
             raise _OwnedCleanupPending(proc, started_io_threads)
         raise
 
-    def cleanup_initial_io() -> None:
+    def cleanup_initial_io(*, timed_out: bool = False) -> None:
+        cleanup_deadline = (
+            timeout_cleanup_deadline if timed_out else launch_deadline
+        )
         io_cancel.set()
-        terminate_child_once()
-        remaining = _remaining_deadline(launch_deadline, 5.0)
+        terminate_child_once(timeout_cleanup=timed_out)
+        remaining = _remaining_deadline(cleanup_deadline, 5.0)
         if remaining > 0:
             stdin_thread.join(timeout=remaining)
-        while any(thread.is_alive() for thread in drain_threads) and time.monotonic() < launch_deadline:
+        while (
+            any(thread.is_alive() for thread in drain_threads)
+            and time.monotonic() < cleanup_deadline
+        ):
             for pending_queue in (stdout_queue, stderr_queue):
                 while True:
                     try:
@@ -9750,7 +12917,12 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
                     except queue.Empty:
                         break
             for thread in drain_threads:
-                thread.join(timeout=min(0.01, _remaining_deadline(launch_deadline, 0.01)))
+                thread.join(
+                    timeout=min(
+                        0.01,
+                        _remaining_deadline(cleanup_deadline, 0.01),
+                    )
+                )
         for pending_queue in (stdout_queue, stderr_queue):
             while True:
                 try:
@@ -9762,7 +12934,13 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
             or proc.poll() is None
             or any(thread.is_alive() for thread in started_io_threads)
         ):
-            raise _OwnedCleanupPending(proc, started_io_threads)
+            raise _OwnedCleanupPending(
+                proc,
+                started_io_threads,
+                response_updates=_worker_cleanup_response_updates(
+                    timed_out=timed_out, stopped=False
+                ),
+            )
 
     try:
         try:
@@ -9786,6 +12964,23 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
             append_event(
                 run_dir,
                 {"type": "process_started", "pid": proc.pid, "status": "running"},
+            )
+        except TimeoutError:
+            cleanup_initial_io(timed_out=True)
+            timeout_updates = _worker_cleanup_response_updates(
+                timed_out=True, stopped=False
+            )
+            return _record_blocked_launch(
+                run_dir,
+                metadata,
+                sensitive_values=sensitive_values,
+                status="timed_out",
+                error=_launch_failure_error(
+                    "runtime_initialization_timeout",
+                    "Runtime child initialization exceeded the launch deadline.",
+                ),
+                child_pid=proc.pid,
+                **timeout_updates,
             )
         except RuntimeSecurityError as error:
             cleanup_initial_io()
@@ -9823,6 +13018,8 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
                 error=error,
                 child_pid=proc.pid,
             )
+    except _OwnedCleanupPending:
+        raise
     except Exception:
         cleanup_initial_io()
         return _record_blocked_launch(
@@ -10088,7 +13285,7 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
             or any(thread.is_alive() for thread in started_io_threads)
         ):
             raise _OwnedCleanupPending(proc, started_io_threads)
-        raise
+        raise _OwnedCleanupPending(proc, started_io_threads)
 
     timed_out = False
     stopped = False
@@ -10129,41 +13326,52 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
                     budget["stop_reason"] = "timeout"
                     persist_budget_unlocked("timeout")
                 io_cancel.set()
-                terminate_child_once()
-            sleep_deadline = launch_deadline if (timed_out or stopped or io_failed) else runtime_deadline
-            time.sleep(
-                min(
-                    0.01 if (timed_out or stopped or io_failed) else 0.05,
-                    max(0.001, _remaining_deadline(sleep_deadline, 0.05)),
-                )
+                terminate_child_once(timeout_cleanup=True)
+            sleep_deadline = (
+                timeout_cleanup_deadline
+                if timed_out
+                else launch_deadline
+                if stopped or io_failed
+                else runtime_deadline
             )
+            if not _sleep_stream_worker_iteration(
+                sleep_deadline,
+                termination_requested=(timed_out or stopped or io_failed),
+            ):
+                break
         try:
-            remaining = _remaining_deadline(runtime_deadline, 5.0)
+            wait_deadline = (
+                timeout_cleanup_deadline if timed_out else runtime_deadline
+            )
+            remaining = _remaining_deadline(wait_deadline, 5.0)
             if remaining <= 0 and proc.poll() is None:
                 raise subprocess.TimeoutExpired(proc.args, 0)
             exit_code = proc.wait(timeout=max(remaining, 0.001))
         except subprocess.TimeoutExpired:
             io_cancel.set()
-            terminate_child_once()
+            terminate_child_once(timeout_cleanup=timed_out)
             exit_code = proc.poll()
     finally:
+        cleanup_deadline = (
+            timeout_cleanup_deadline if timed_out else launch_deadline
+        )
         if proc.poll() is None:
             io_cancel.set()
-            terminate_child_once()
+            terminate_child_once(timeout_cleanup=timed_out)
         for stream in (proc.stdin, proc.stdout, proc.stderr):
             if stream is not None:
                 try:
                     stream.close()
                 except OSError:
                     pass
-        remaining = _remaining_deadline(launch_deadline, 5.0)
+        remaining = _remaining_deadline(cleanup_deadline, 5.0)
         if remaining > 0:
             stdin_thread.join(timeout=remaining)
         io_pairs = tuple(zip(drain_threads, threads, (stdout_queue, stderr_queue)))
         while any(
             drain.is_alive() or pump_thread.is_alive()
             for drain, pump_thread, _pending in io_pairs
-        ) and time.monotonic() < launch_deadline:
+        ) and time.monotonic() < cleanup_deadline:
             for drain, pump_thread, pending_queue in io_pairs:
                 if not pump_thread.is_alive():
                     while True:
@@ -10171,7 +13379,7 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
                             pending_queue.get_nowait()
                         except queue.Empty:
                             break
-                remaining = _remaining_deadline(launch_deadline, 0.01)
+                remaining = _remaining_deadline(cleanup_deadline, 0.01)
                 if remaining <= 0:
                     break
                 drain.join(timeout=remaining)
@@ -10180,9 +13388,45 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
             thread.name for thread in started_io_threads if thread.is_alive()
         ]
         if alive_threads:
-            raise _OwnedCleanupPending(proc, started_io_threads)
+            raise _OwnedCleanupPending(
+                proc,
+                started_io_threads,
+                response_updates=_worker_cleanup_response_updates(
+                    timed_out=timed_out, stopped=stopped
+                ),
+            )
         if cleanup_pending.is_set() or proc.poll() is None:
-            raise _OwnedCleanupPending(proc, started_io_threads)
+            raise _OwnedCleanupPending(
+                proc,
+                started_io_threads,
+                response_updates=_worker_cleanup_response_updates(
+                    timed_out=timed_out, stopped=stopped
+                ),
+            )
+
+    cleanup_confirmed = _release_owned_containment(
+        proc,
+        terminate_descendants=True,
+        deadline=(timeout_cleanup_deadline if timed_out else launch_deadline),
+        threads=tuple(started_io_threads),
+    )
+    if not cleanup_confirmed:
+        _mark_owned_cleanup_incomplete(
+            proc, "normal_completion_containment_unconfirmed"
+        )
+        raise _OwnedCleanupPending(
+            proc,
+            started_io_threads,
+            response_updates=_worker_cleanup_response_updates(
+                timed_out=timed_out, stopped=stopped
+            ),
+        )
+    metadata = update_metadata(
+        run_dir,
+        cleanup_state="cleanup_confirmed",
+        owned_process_pid=proc.pid,
+        live_cleanup_threads=[],
+    )
 
     while True:
         try:
@@ -10190,23 +13434,26 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
         except queue.Empty:
             break
         io_failed = True
-        safe_append(
-            {
-                "type": "stream_pump_error",
-                "source": io_source,
-                "error": str(io_error),
-            }
-        )
-
-    if io_failed:
-        raise OrchestratorError("Streaming artifact transport failed.")
+        try:
+            safe_append(
+                {
+                    "type": "stream_pump_error",
+                    "source": io_source,
+                    "error": str(io_error),
+                }
+            )
+        except Exception:
+            pass
 
     duration_ms = int((time.monotonic() - started_monotonic) * 1000)
-    latest_metadata = read_metadata(run_dir)
+    try:
+        latest_metadata = read_metadata(run_dir)
+    except Exception:
+        latest_metadata = dict(metadata)
     stopped = stopped or bool(latest_metadata.get("stop_requested_at"))
     if timed_out:
         status = "timed_out"
-        final_exit = 124 if exit_code is None else exit_code
+        final_exit = 124
     elif stopped:
         status = "stopped"
         final_exit = -15 if exit_code is None else exit_code
@@ -10216,66 +13463,147 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
     else:
         final_exit = 0 if exit_code is None else exit_code
         status = "succeeded" if final_exit == 0 else "failed"
-    with budget_lock:
-        budget.update(output_budget_from_metadata({"output_budget": budget}, run_dir))
-        if stopped and not budget.get("stop_reason"):
-            budget["stop_reason"] = "user_requested"
-        terminal_budget = dict(budget)
-    git_after_raw = capture_git_snapshot(
-        run_dir,
-        workspace_root,
-        "after",
-        sensitive_values,
-        deadline=launch_deadline,
+    try:
+        with budget_lock:
+            budget.update(output_budget_from_metadata({"output_budget": budget}, run_dir))
+            if stopped and not budget.get("stop_reason"):
+                budget["stop_reason"] = "user_requested"
+            terminal_budget = dict(budget)
+    except Exception:
+        with budget_lock:
+            terminal_budget = dict(budget)
+    if time.monotonic() >= launch_deadline and not stopped:
+        timed_out = True
+        status = "timed_out"
+        final_exit = 124
+        terminal_budget["stop_reason"] = "timeout"
+    if timed_out:
+        git_after_raw = _failed_git_snapshot(
+            "after",
+            TimeoutError(
+                "Post-run Git evidence was not captured after timeout."
+            ),
+            sensitive_values,
+            is_git_repo=bool(git_before_raw.get("is_git_repo")),
+        )
+    else:
+        try:
+            git_after_raw = capture_git_snapshot(
+                run_dir,
+                workspace_root,
+                "after",
+                sensitive_values,
+                deadline=launch_deadline,
+            )
+        except Exception as exc:
+            git_after_raw = _failed_git_snapshot(
+                "after",
+                exc,
+                sensitive_values,
+                is_git_repo=bool(git_before_raw.get("is_git_repo")),
+            )
+    git_finalization_failed = (
+        git_after_raw.get("ok") is not True
+        or git_after_raw.get("evidence_complete") is not True
+        or git_after_raw.get(
+            "_raw_evidence_complete",
+            git_after_raw.get("evidence_complete"),
+        )
+        is not True
     )
     if time.monotonic() >= launch_deadline and not stopped:
         timed_out = True
         status = "timed_out"
         final_exit = 124
+        terminal_budget["stop_reason"] = "timeout"
     duration_ms = int((time.monotonic() - started_monotonic) * 1000)
-    scope_check_raw = _check_write_scope_with_evidence(
+
+    (
+        scope_check_raw,
+        scope_finalization_failed,
+        scope_deadline_crossed,
+    ) = _terminal_write_scope_evidence(
         run_id,
         workspace_root,
         git_before_raw,
         git_after_raw,
         pinned_scope,
-    )
-    git_after = _git_snapshot_projection(
-        git_after_raw, sensitive_values
-    )
-    scope_check = _scrub_guarded_value(scope_check_raw, sensitive_values)
-    if not scope_check.get("ok", True):
-        safe_append({"type": "write_scope_blocked", "status": "blocked", "violations": scope_check.get("violations", [])})
-    safe_append({"type": "process_exited", "status": status, "exit_code": final_exit, "duration_ms": duration_ms})
-    final_metadata = update_metadata(
-        run_dir,
-        duration_ms=duration_ms,
         timed_out=timed_out,
-        stdout_path=str(run_dir / "stdout.txt"),
-        stderr_path=str(run_dir / "stderr.txt"),
-        events_path=str(run_dir / "events.ndjson"),
-        output_budget=terminal_budget,
-        stop_reason=terminal_budget.get("stop_reason")
-        or ("timeout" if timed_out else "user_requested" if stopped else None),
-        git_after=git_after,
-        write_scope_check=scope_check,
-        acceptance_status=(
-            "blocked_write_scope"
-            if not scope_check.get("ok", True)
-            else "pending_controller_review"
-        ),
-        status="running",
     )
-    _scrub_run_artifacts(run_dir, sensitive_values)
-    _secure_run_artifacts(run_dir)
-    final_metadata = update_metadata(
+    if scope_deadline_crossed:
+        timed_out = True
+        status = "timed_out"
+        final_exit = 124
+        terminal_budget["stop_reason"] = "timeout"
+    if (git_finalization_failed or scope_finalization_failed) and not timed_out:
+        status = "failed"
+        if final_exit in {None, 0}:
+            final_exit = 1
+    git_after = _git_snapshot_projection(git_after_raw, sensitive_values)
+    scope_check = _scrub_guarded_value(scope_check_raw, sensitive_values)
+    acceptance_status = (
+        "pending_controller_review"
+        if scope_check.get("ok") is True
+        else "blocked_write_scope"
+    )
+    stop_reason = terminal_budget.get("stop_reason") or (
+        "timeout" if timed_out else "user_requested" if stopped else None
+    )
+    terminal_updates = {
+        "duration_ms": duration_ms,
+        "timed_out": timed_out,
+        "stdout_path": str(run_dir / "stdout.txt"),
+        "stderr_path": str(run_dir / "stderr.txt"),
+        "events_path": str(run_dir / "events.ndjson"),
+        "output_budget": terminal_budget,
+        "stop_reason": stop_reason,
+        "git_after": git_after,
+        "write_scope_check": scope_check,
+        "acceptance_status": acceptance_status,
+        "cleanup_state": "cleanup_confirmed",
+        "owned_process_pid": proc.pid,
+        "live_cleanup_threads": [],
+        "status": status,
+        "finished_at": utc_now_iso(),
+        "exit_code": final_exit,
+    }
+    if io_failed:
+        terminal_updates.update(
+            {
+                "acceptance_status": "blocked_artifact_finalization",
+                "finalization_state": "failed",
+                "finalization_error": {
+                    "code": "artifact_finalization_failed",
+                    "message": "Streaming execution artifacts could not be finalized safely.",
+                },
+            }
+        )
+    terminal_events: list[Mapping[str, Any]] = []
+    if scope_check.get("ok") is not True:
+        terminal_events.append(
+            {
+                "type": "write_scope_blocked",
+                "status": "blocked",
+                "violations": scope_check.get("violations", []),
+            }
+        )
+    terminal_events.append(
+        {
+            "type": "process_exited",
+            "status": status,
+            "exit_code": final_exit,
+            "duration_ms": duration_ms,
+        }
+    )
+    return _persist_streaming_terminal_state(
         run_dir,
-        status=status,
-        finished_at=utc_now_iso(),
-        exit_code=final_exit,
+        latest_metadata,
+        updates=terminal_updates,
+        events=tuple(terminal_events),
+        sensitive_values=sensitive_values,
+        remove_pid=True,
+        launch_deadline=launch_deadline,
     )
-    _set_private_file(run_dir / "metadata.json")
-    return _scrub_guarded_value(final_metadata, sensitive_values)
 
 
 def stream_worker(run_id: str) -> dict[str, Any]:
@@ -10310,10 +13638,73 @@ def stream_worker(run_id: str) -> dict[str, Any]:
                 run_dir, latest, pending
             )
         except Exception:
+            metadata_read = True
             try:
                 latest = read_metadata(run_dir)
             except Exception:
                 latest = initial
+                metadata_read = False
+            timed_out = _has_timeout_evidence(latest) or (
+                time.monotonic() >= deadline
+            )
+            cleanup_incomplete = (
+                latest.get("status") == "cleanup_incomplete"
+                or latest.get("cleanup_state") == "cleanup_incomplete"
+            )
+            child_pid_absent = metadata_read and latest.get("child_pid") is None
+            post_run = not child_pid_absent
+            if timed_out or cleanup_incomplete or post_run:
+                terminal_status = (
+                    "timed_out"
+                    if timed_out
+                    else "cleanup_incomplete"
+                    if cleanup_incomplete
+                    else "failed"
+                )
+                terminal_updates: dict[str, Any] = {
+                    "status": terminal_status,
+                    "finished_at": utc_now_iso(),
+                    "exit_code": (
+                        124
+                        if timed_out
+                        else None
+                        if cleanup_incomplete
+                        else 1
+                    ),
+                    "acceptance_status": "blocked_artifact_finalization",
+                }
+                if timed_out:
+                    terminal_updates.update(
+                        {"timed_out": True, "stop_reason": "timeout"}
+                    )
+                if cleanup_incomplete:
+                    terminal_updates["cleanup_state"] = "cleanup_incomplete"
+                if post_run and not timed_out and not cleanup_incomplete:
+                    terminal_updates.update(
+                        {
+                            "finalization_state": "failed",
+                            "finalization_error": {
+                                "code": "artifact_finalization_failed",
+                                "message": "Streaming execution artifacts could not be finalized safely.",
+                            },
+                        }
+                    )
+                return _persist_terminal_state(
+                    run_dir,
+                    latest,
+                    updates=terminal_updates,
+                    event={
+                        "type": (
+                            "cleanup_incomplete"
+                            if cleanup_incomplete
+                            else "process_exited"
+                        ),
+                        "status": terminal_status,
+                        "exit_code": terminal_updates["exit_code"],
+                    },
+                    remove_pid=not cleanup_incomplete,
+                    launch_deadline=deadline,
+                )
             try:
                 _unlink_managed_file(run_dir / "pid.txt")
             except Exception:
@@ -10338,9 +13729,21 @@ def single_run_status(run_id: str, include_output_tail: bool = True, tail_chars:
     status = str(metadata.get("status") or "unknown")
     child_pid = metadata.get("child_pid")
     worker_pid = metadata.get("worker_pid")
+    owned_process_pid = metadata.get("owned_process_pid")
     child_alive = pid_alive(int(child_pid)) if child_pid else False
     worker_alive = pid_alive(int(worker_pid)) if worker_pid else False
-    active = status in {"starting", "running", "stop_requested"} and (child_alive or worker_alive)
+    owned_process_alive = (
+        pid_alive(int(owned_process_pid)) if owned_process_pid else False
+    )
+    cleanup_unconfirmed = (
+        status in {"cleanup_pending", "cleanup_incomplete"}
+        or metadata.get("cleanup_state") == "cleanup_incomplete"
+    )
+    active = cleanup_unconfirmed or status in {
+        "starting",
+        "running",
+        "stop_requested",
+    } and (child_alive or worker_alive or owned_process_alive)
     if status in {"starting", "running", "stop_requested"} and not active:
         if metadata.get("finished_at") or metadata.get("exit_code") is not None:
             exit_code = metadata.get("exit_code")
@@ -10392,8 +13795,16 @@ def single_run_status(run_id: str, include_output_tail: bool = True, tail_chars:
         "active": active,
         "worker_pid": worker_pid,
         "child_pid": child_pid,
+        "owned_process_pid": owned_process_pid,
         "worker_alive": worker_alive,
         "child_alive": child_alive,
+        "owned_process_alive": owned_process_alive,
+        "cleanup_state": metadata.get("cleanup_state"),
+        "cleanup_owner": metadata.get("cleanup_owner"),
+        "live_cleanup_threads": list(metadata.get("live_cleanup_threads") or []),
+        "persistence_state": metadata.get("persistence_state"),
+        "finalization_state": metadata.get("finalization_state"),
+        "finalization_error": metadata.get("finalization_error"),
         "started_at": started_at,
         "finished_at": finished_at,
         "elapsed_ms": elapsed_ms,
@@ -10631,6 +14042,17 @@ def _validate_team_authorization_manifest(
         ):
             raise OrchestratorError(
                 f"Team member {run_id} is not ready for authorization."
+            )
+    # A sequential first pass is not a snapshot: a member validated early may
+    # die while a later member is being checked. Recheck every owned handle at
+    # the publication boundary so no dead precommit set can become visible.
+    for item in runs:
+        run_id = str(item["run_id"])
+        with _ACTIVE_WORKER_HANDLES_LOCK:
+            owned = _ACTIVE_WORKER_HANDLES.get(run_id)
+        if owned is None or owned.poll() is not None:
+            raise OrchestratorError(
+                f"Team member {run_id} died during authorization validation."
             )
 
 
@@ -10874,6 +14296,7 @@ def spawn_role_team(
             deadline=team_deadline,
         )
         manifest_path: Path | None = None
+        authorization_attempted = False
 
         def rollback_registered_workers() -> dict[str, Any]:
             stops: list[dict[str, Any]] = []
@@ -11017,15 +14440,37 @@ def spawn_role_team(
             # publication. The precommit callback performs the last liveness
             # and identity check inside the atomic replacement boundary.
             reservation.active = False
+            authorization_attempted = True
             write_team_manifest(team_id, authorized_manifest)
             return response
         except Exception as exc:
             rollback = rollback_registered_workers()
-            status_name = (
-                "rollback_incomplete"
-                if rollback["failed_stop_count"]
-                else "rolled_back_partial_launch"
-            )
+            decision_visible = False
+            decision_payload: dict[str, Any] = {}
+            candidate_manifest = manifest_path or (TEAMS_DIR / f"{team_id}.json")
+            try:
+                decision_payload = json.loads(
+                    _read_bounded_regular_file(
+                        candidate_manifest, MAX_MANAGED_ARTIFACT_BYTES
+                    ).decode("utf-8")
+                )
+                decision_visible = str(
+                    decision_payload.get("decision")
+                    or decision_payload.get("status")
+                    or ""
+                ).upper() in {"COMMIT", "COMMITTED", "AUTHORIZED"}
+            except Exception:
+                decision_visible = False
+            if decision_visible:
+                status_name = "commit_indeterminate"
+            elif authorization_attempted:
+                status_name = "aborted"
+            else:
+                status_name = (
+                    "rollback_incomplete"
+                    if rollback["failed_stop_count"]
+                    else "rolled_back_partial_launch"
+                )
             manifest = {
                 "team_id": team_id,
                 "created_at": utc_now_iso(),
@@ -11039,7 +14484,10 @@ def spawn_role_team(
                 "requested_count": len(selected_roles),
                 "rollback": rollback,
             }
-            path = write_team_manifest(team_id, manifest)
+            if decision_visible:
+                path = candidate_manifest
+            else:
+                path = write_team_manifest(team_id, manifest)
             return {
                 "ok": False,
                 "status": status_name,
@@ -11266,6 +14714,8 @@ def _write_scope_policy_drift(pinned: Mapping[str, Any]) -> str | None:
         payload = _read_bounded_regular_file(path, 1024 * 1024)
     except FileNotFoundError:
         return "deleted" if pinned.get("exists") else None
+    except TimeoutError:
+        raise
     except OSError:
         return "unreadable"
     if not pinned.get("exists"):
@@ -11304,6 +14754,9 @@ def _check_write_scope_with_evidence(
     after: Mapping[str, Any],
     pinned_scope: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    _check_deadline(
+        message="Write-scope evidence exceeded the launch deadline."
+    )
     root = root.resolve()
     if pinned_scope is None:
         scope_path, scope = load_write_scope(root)
@@ -11331,16 +14784,28 @@ def _check_write_scope_with_evidence(
         transition_paths, transition_lines, transition_errors = (
             _git_transition_evidence(root, before, after)
         )
+    evidence_errors = list(transition_errors)
+    for snapshot in (before, after):
+        snapshot_errors = snapshot.get(
+            "_raw_evidence_errors", snapshot.get("evidence_errors", [])
+        )
+        if isinstance(snapshot_errors, (list, tuple, set)):
+            evidence_errors.extend(str(item) for item in snapshot_errors)
+    has_snapshot_evidence = bool(before) or bool(after)
     evidence_incomplete = (
         before_is_git != after_is_git
-        or any(
-            snapshot.get("is_git_repo")
-            and (
-                snapshot.get("ok") is False
-                or snapshot.get("_raw_evidence_complete") is False
-                or snapshot.get("evidence_complete") is False
+        or (
+            has_snapshot_evidence
+            and any(
+                snapshot.get("ok") is not True
+                or snapshot.get("evidence_complete") is not True
+                or snapshot.get(
+                    "_raw_evidence_complete",
+                    snapshot.get("evidence_complete"),
+                )
+                is not True
+                for snapshot in (before, after)
             )
-            for snapshot in (before, after)
         )
         or bool(transition_errors)
     )
@@ -11357,7 +14822,7 @@ def _check_write_scope_with_evidence(
         evidence_violations.append(
             {
                 "type": "git_evidence_incomplete",
-                "errors": sorted(set(transition_errors)),
+                "errors": sorted(set(evidence_errors)),
                 "message": "Complete Git evidence was unavailable; acceptance is blocked.",
             }
         )
@@ -11476,6 +14941,77 @@ def _check_write_scope_with_evidence(
         "max_diff_lines": max_diff_lines,
         "rollback_recommendation": rollback_hint,
     }
+
+
+def _terminal_write_scope_evidence(
+    run_id: str,
+    root: Path,
+    git_before: Mapping[str, Any],
+    git_after: Mapping[str, Any],
+    pinned_scope: Mapping[str, Any],
+    *,
+    timed_out: bool,
+) -> tuple[dict[str, Any], bool, bool]:
+    def unavailable(violation_type: str, message: str) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "status": "blocked",
+            "run_id": run_id,
+            "cwd": str(root),
+            "scope_path": str(pinned_scope.get("path") or ""),
+            "checked_paths": [],
+            "changed_paths": [],
+            "violation_count": 1,
+            "violations": [{"type": violation_type, "message": message}],
+            "diff_lines": 0,
+            "diff_source": "git_transition_evidence",
+            "max_diff_lines": 0,
+            "rollback_recommendation": (
+                "Review the run artifacts before accepting changes."
+            ),
+        }
+
+    deadline_expired = _transaction_deadline_expired(
+        fallback=_effective_deadline()
+    )
+    if timed_out or deadline_expired:
+        return (
+            unavailable(
+                "write_scope_not_evaluated_due_to_timeout",
+                "Write-scope evidence was not evaluated after the launch deadline.",
+            ),
+            False,
+            deadline_expired and not timed_out,
+        )
+    try:
+        _check_deadline(
+            message="Write-scope evidence exceeded the launch deadline."
+        )
+        return (
+            _check_write_scope_with_evidence(
+                run_id, root, git_before, git_after, pinned_scope
+            ),
+            False,
+            False,
+        )
+    except TimeoutError:
+        return (
+            unavailable(
+                "write_scope_not_evaluated_due_to_timeout",
+                "Write-scope evidence exceeded the launch deadline.",
+            ),
+            False,
+            True,
+        )
+    except Exception:
+        return (
+            unavailable(
+                "write_scope_check_failed",
+                "Write-scope evidence could not be evaluated safely.",
+            ),
+            True,
+            False,
+        )
 
 
 def check_write_scope(

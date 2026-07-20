@@ -251,6 +251,52 @@ class GuardedLaunchFixture(unittest.TestCase):
             run_dir / orchestrator.WORKER_START_GATE_FILENAME,
             json.dumps(payload, ensure_ascii=False, indent=2),
         )
+        launch = metadata.get("worker_launch")
+        if not (
+            isinstance(launch, dict)
+            and launch.get("nonce_consumed") is False
+            and launch.get("controller_handoff") == "pending"
+        ):
+            return
+
+        def accept_ready_handoff() -> None:
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                if not run_dir.is_dir():
+                    return
+                try:
+                    with orchestrator.artifact_lock(run_dir):
+                        latest = orchestrator.read_metadata(run_dir)
+                        if str(latest.get("status") or "") not in {
+                            "starting",
+                            "running",
+                        }:
+                            return
+                        latest_launch = latest.get("worker_launch")
+                        if (
+                            isinstance(latest_launch, dict)
+                            and latest_launch.get("nonce_consumed") is True
+                            and latest_launch.get("controller_handoff") == "ready"
+                        ):
+                            accepted = dict(latest_launch)
+                            accepted["controller_handoff"] = "accepted"
+                            latest["worker_launch"] = accepted
+                            orchestrator._atomic_write_bytes(
+                                run_dir / "metadata.json",
+                                orchestrator._metadata_bytes(latest),
+                            )
+                            return
+                except Exception:
+                    return
+                time.sleep(0.01)
+
+        handoff_thread = threading.Thread(
+            target=accept_ready_handoff,
+            name=f"fixture-handoff-{run_dir.name}",
+            daemon=True,
+        )
+        handoff_thread.start()
+        self.addCleanup(handoff_thread.join, 3)
 
     def _arm_worker_gate(self, run_dir: Path, prepared: object) -> None:
         nonce = prepared.launch_spec.launch_nonce
@@ -311,6 +357,7 @@ class GuardedLaunchFixture(unittest.TestCase):
                         "nonce_expires_at": expires_at
                         or "2999-01-01T00:00:00+00:00",
                         "start_gate": "closed",
+                        "controller_handoff": "pending",
                     },
                     "controller_pid": os.getpid(),
                 }
@@ -728,6 +775,7 @@ class GuardedLaunchFailureTests(GuardedLaunchFixture):
                     "nonce_consumed": False,
                     "nonce_expires_at": "2999-01-01T00:00:00+00:00",
                     "start_gate": "closed",
+                    "controller_handoff": "pending",
                 },
                 "controller_pid": worker_identity.parent_pid,
                 "transaction_deadline_monotonic": time.monotonic() + 8,
@@ -770,6 +818,72 @@ class GuardedLaunchFailureTests(GuardedLaunchFixture):
 
 
 class ReviewFixResolverAndEnvironmentTests(GuardedLaunchFixture):
+    def test_official_user_local_target_outside_layout_is_unpinned(self) -> None:
+        home = self.workspace / "resolver-home"
+        official = home / ".local" / "bin" / "claude.exe"
+        outside = self.workspace / "outside-layout" / "claude.exe"
+        official.parent.mkdir(parents=True)
+        outside.parent.mkdir(parents=True)
+        outside.write_bytes(b"outside-target")
+        try:
+            official.symlink_to(outside)
+        except OSError as exc:
+            self.skipTest(f"File links are unavailable: {exc}")
+
+        with patch.object(
+            orchestrator, "user_home", return_value=home
+        ), patch.object(
+            orchestrator.shutil, "which", return_value=None
+        ), patch.dict(
+            os.environ,
+            {"PROGRAMDATA": str(self.workspace / "missing-program-data")},
+            clear=False,
+        ):
+            candidate = orchestrator.discover_claude_candidate(
+                ignore_environment_override=True
+            )
+
+        self.assertEqual(candidate.canonical_path, str(outside.resolve()))
+        self.assertEqual(candidate.trust_class, "discovered_unpinned")
+        self.assertEqual(candidate.source, "enumerated_root")
+
+    def test_official_user_local_package_shaped_escape_is_unpinned(self) -> None:
+        home = self.workspace / "resolver-package-home"
+        official = home / ".local" / "bin" / "claude.exe"
+        outside = (
+            self.workspace
+            / "outside-layout"
+            / "node_modules"
+            / "@anthropic-ai"
+            / "claude-code"
+            / "bin"
+            / "claude.exe"
+        )
+        official.parent.mkdir(parents=True)
+        outside.parent.mkdir(parents=True)
+        outside.write_bytes(b"package-shaped-outside-target")
+        try:
+            official.symlink_to(outside)
+        except OSError as exc:
+            self.skipTest(f"File links are unavailable: {exc}")
+
+        with patch.object(
+            orchestrator, "user_home", return_value=home
+        ), patch.object(
+            orchestrator.shutil, "which", return_value=None
+        ), patch.dict(
+            os.environ,
+            {"PROGRAMDATA": str(self.workspace / "missing-program-data")},
+            clear=False,
+        ):
+            candidate = orchestrator.discover_claude_candidate(
+                ignore_environment_override=True
+            )
+
+        self.assertEqual(candidate.canonical_path, str(outside.resolve()))
+        self.assertEqual(candidate.trust_class, "discovered_unpinned")
+        self.assertEqual(candidate.source, "enumerated_root")
+
     def test_path_package_shape_never_establishes_trust(self) -> None:
         path_runtime = (
             self.workspace
@@ -989,6 +1103,9 @@ class ReviewFixScrubbingTests(GuardedLaunchFixture):
         secret = "arbitrary-secret-value-q7"
         endpoint_password = "userinfo-password-r8"
         endpoint_query = "query-secret-s9"
+        endpoint_path = "tenant-path-t3"
+        endpoint_plain_query = "ordinary-query-u2"
+        endpoint_fragment = "fragment-v4"
         provider = orchestrator.Provider(
             id="echo-provider",
             name="Echo Provider",
@@ -1003,7 +1120,8 @@ class ReviewFixScrubbingTests(GuardedLaunchFixture):
             provider_type=None,
             is_current=True,
             endpoints=[
-                f"https://user:{endpoint_password}@example.invalid/api?token={endpoint_query}&region=test"
+                f"https://user:{endpoint_password}@example.invalid/{endpoint_path}"
+                f"?token={endpoint_query}&region={endpoint_plain_query}#{endpoint_fragment}"
             ],
         )
         self.fake_runtime.write_text(
@@ -1039,6 +1157,9 @@ class ReviewFixScrubbingTests(GuardedLaunchFixture):
             secret,
             endpoint_password,
             endpoint_query,
+            endpoint_path,
+            endpoint_plain_query,
+            endpoint_fragment,
         )
         for value in forbidden:
             self.assertNotIn(value.encode(), self._scan_run(one_dir))
@@ -1106,6 +1227,7 @@ class ReviewFixGateAndOwnershipTests(GuardedLaunchFixture):
                     "nonce_consumed": False,
                     "nonce_expires_at": "2999-01-01T00:00:00+00:00",
                     "start_gate": "closed",
+                    "controller_handoff": "pending",
                 },
             }
         )
@@ -1173,9 +1295,36 @@ class ReviewFixLifecycleTests(GuardedLaunchFixture):
             + "\n",
             encoding="utf-8",
         )
-        result = orchestrator.run_agent(
-            "timeout partial output", cwd=self.workspace, timeout_seconds=2
-        )
+        real_snapshot = orchestrator.capture_git_snapshot
+        snapshot_labels: list[str] = []
+
+        def capture_before_only(
+            *args: object, **kwargs: object
+        ) -> dict[str, object]:
+            label = str(args[2] if len(args) > 2 else kwargs.get("label"))
+            snapshot_labels.append(label)
+            if label == "after":
+                raise AssertionError(
+                    "post-run Git capture must not run after one-shot timeout"
+                )
+            return real_snapshot(*args, **kwargs)
+
+        with patch.object(
+            orchestrator,
+            "_check_write_scope_with_evidence",
+            side_effect=AssertionError(
+                "scope checks must not run after one-shot timeout"
+            ),
+        ) as scope_check, patch.object(
+            orchestrator,
+            "capture_git_snapshot",
+            side_effect=capture_before_only,
+        ):
+            result = orchestrator.run_agent(
+                "timeout partial output", cwd=self.workspace, timeout_seconds=2
+            )
+        scope_check.assert_not_called()
+        self.assertNotIn("after", snapshot_labels)
         run_dir = self.runs_dir / str(result["run_id"])
         self.assertTrue(result["timed_out"])
         self.assertEqual(result["exit_code"], 124)
@@ -1631,7 +1780,16 @@ class SecondReviewScrubAndScannerTests(GuardedLaunchFixture):
                     "untracked_paths": [f"reports/{context_secret}.txt"],
                     "error": f"git error includes {task_secret}",
                 }
-            return {"ok": True, "changed_paths": []}
+            return {
+                "ok": True,
+                "label": "before",
+                "is_git_repo": False,
+                "changed_paths": [],
+                "evidence_complete": True,
+                "evidence_errors": [],
+                "_raw_evidence_complete": True,
+                "_raw_evidence_errors": [],
+            }
 
         scope = {
             "ok": False,
@@ -1702,6 +1860,7 @@ class SecondReviewScrubAndScannerTests(GuardedLaunchFixture):
             )
         stream_dir = self.runs_dir / str(streaming["run_id"])
         self._wait_for_terminal_metadata(stream_dir)
+        self._wait_for_pid_exit(int(streaming["worker_pid"]))
         for run_dir in (
             self.runs_dir / str(one_shot["run_id"]),
             stream_dir,
@@ -2088,6 +2247,7 @@ class ThirdReviewGitEvidenceTests(GuardedLaunchFixture):
                 secret = f"crash-secret-{boundary}"
                 (self.workspace / secret).unlink(missing_ok=True)
                 real_update = orchestrator.update_metadata
+                real_atomic_bytes = orchestrator._atomic_write_bytes
                 real_scope = getattr(
                     orchestrator, "_check_write_scope_with_evidence", None
                 )
@@ -2096,9 +2256,23 @@ class ThirdReviewGitEvidenceTests(GuardedLaunchFixture):
                 scrub_calls = 0
 
                 def update(run_dir: Path, **updates: object) -> dict[str, object]:
-                    if boundary == "metadata" and "git_after" in updates:
-                        raise InjectedCrash()
                     return real_update(run_dir, **updates)
+
+                def atomic_bytes(
+                    path: Path, payload: bytes, *args: object, **kwargs: object
+                ) -> None:
+                    candidate = (
+                        json.loads(payload.decode("utf-8"))
+                        if Path(path).name == "metadata.json"
+                        else {}
+                    )
+                    if (
+                        boundary == "metadata"
+                        and "git_after" in candidate
+                        and candidate.get("terminal_state_count") == 1
+                    ):
+                        raise InjectedCrash()
+                    real_atomic_bytes(path, payload, *args, **kwargs)
 
                 def scope(*args: object, **kwargs: object) -> dict[str, object]:
                     if boundary == "scope":
@@ -2122,6 +2296,8 @@ class ThirdReviewGitEvidenceTests(GuardedLaunchFixture):
                 before = set(self._run_dirs())
                 with patch.object(
                     orchestrator, "update_metadata", side_effect=update
+                ), patch.object(
+                    orchestrator, "_atomic_write_bytes", side_effect=atomic_bytes
                 ), patch.object(
                     orchestrator,
                     "_check_write_scope_with_evidence",
@@ -2588,6 +2764,7 @@ class FourthReviewWriterHandleTests(GuardedLaunchFixture):
                     "nonce_consumed": False,
                     "nonce_expires_at": "2999-01-01T00:00:00+00:00",
                     "start_gate": "closed",
+                    "controller_handoff": "pending",
                 },
             }
         )
@@ -2624,7 +2801,16 @@ class FourthReviewWriterHandleTests(GuardedLaunchFixture):
         ), patch.object(orchestrator, "_open_managed_file", swap_on_append):
             result = orchestrator.stream_worker(original_run_id)
         self.assertTrue(attack_fired)
-        self.assertEqual(result["status"], "blocked_runtime_launch", result)
+        self.assertEqual(result["status"], "failed", result)
+        self.assertEqual(
+            result["acceptance_status"], "blocked_artifact_finalization", result
+        )
+        self.assertEqual(result["finalization_state"], "failed", result)
+        self.assertEqual(
+            result["finalization_error"]["code"],
+            "artifact_finalization_failed",
+            result,
+        )
         self.assertEqual(outside.read_text(encoding="utf-8"), "outside")
 
 
@@ -2855,9 +3041,36 @@ class FourthReviewDeadlineTests(GuardedLaunchFixture):
                 "single deadline", cwd=self.workspace, timeout_seconds=1
             )
         elapsed = time.monotonic() - started
-        self.assertTrue(result["timed_out"], result)
+        if result.get("child_pid") is None:
+            self.assertIn(
+                result["status"],
+                {
+                    "timed_out",
+                    "blocked_runtime_launch",
+                    "cleanup_pending",
+                    "cleanup_incomplete",
+                },
+                result,
+            )
+            if result["status"] == "blocked_runtime_launch":
+                self.assertEqual(
+                    result["security_error"]["code"],
+                    "artifact_write_failed",
+                    result,
+                )
+            elif result["status"] == "timed_out":
+                self.assertTrue(result.get("timed_out"), result)
+                self.assertEqual(result.get("exit_code"), 124, result)
+            else:
+                self.assertEqual(
+                    result.get("cleanup_state"), "cleanup_incomplete", result
+                )
+                self.assertIsNotNone(result.get("owned_process_pid"), result)
+        else:
+            self.assertTrue(result.get("timed_out"), result)
         self.assertLess(elapsed, 1.9)
-        self._wait_for_pid_exit(int(result["child_pid"]))
+        if result.get("child_pid") is not None:
+            self._wait_for_pid_exit(int(result["child_pid"]))
 
     def test_streaming_timeout_uses_monotonic_deadline_after_wall_rollback(self) -> None:
         self.fake_runtime.write_text(
@@ -2914,6 +3127,7 @@ class FourthReviewDeadlineTests(GuardedLaunchFixture):
                     "nonce_consumed": False,
                     "nonce_expires_at": "2999-01-01T00:00:00+00:00",
                     "start_gate": "closed",
+                    "controller_handoff": "pending",
                 },
             }
         )
@@ -2924,8 +3138,10 @@ class FourthReviewDeadlineTests(GuardedLaunchFixture):
         environment = dict(prepared.launch_spec.environment)
         environment[orchestrator.INTERNAL_WORKER_NONCE_ENV] = nonce
         real_popen = subprocess.Popen
+        real_snapshot = orchestrator.capture_git_snapshot
         real_wall = time.time
         child_started = threading.Event()
+        snapshot_labels: list[str] = []
 
         def mark_child(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
             child = real_popen(*args, **kwargs)
@@ -2936,18 +3152,40 @@ class FourthReviewDeadlineTests(GuardedLaunchFixture):
             now = real_wall()
             return now - 3600 if child_started.is_set() else now
 
+        def capture_before_only(
+            *args: object, **kwargs: object
+        ) -> dict[str, object]:
+            label = str(args[2] if len(args) > 2 else kwargs.get("label"))
+            snapshot_labels.append(label)
+            if label == "after":
+                raise AssertionError(
+                    "post-run Git capture must not run after streaming timeout"
+                )
+            return real_snapshot(*args, **kwargs)
+
         started = time.monotonic()
         with patch.dict(os.environ, environment, clear=True), patch.object(
             sys, "stdin", type("FixtureStdin", (), {"buffer": io.BytesIO(protocol)})()
         ), patch.object(orchestrator.subprocess, "Popen", side_effect=mark_child), patch.object(
             orchestrator.time, "time", side_effect=rolled_back_wall
-        ):
+        ), patch.object(
+            orchestrator,
+            "capture_git_snapshot",
+            side_effect=capture_before_only,
+        ), patch.object(
+            orchestrator,
+            "_check_write_scope_with_evidence",
+            side_effect=AssertionError(
+                "scope checks must not run after streaming timeout"
+            ),
+        ) as scope_check:
             result = orchestrator.stream_worker(str(metadata["run_id"]))
         elapsed = time.monotonic() - started
         self.assertEqual(result["status"], "timed_out", result)
+        self.assertNotIn("after", snapshot_labels)
+        scope_check.assert_not_called()
         self.assertLess(elapsed, 1.9)
         self._wait_for_pid_exit(int(result["child_pid"]))
-
 
 class FourthReviewDirectoryHandleTests(GuardedLaunchFixture):
     def test_directory_swap_during_permission_walk_is_rejected(self) -> None:
@@ -3242,6 +3480,7 @@ class FifthReviewLifecycleBoundaryTests(GuardedLaunchFixture):
                 children: list[subprocess.Popen[bytes]] = []
                 real_popen = orchestrator.subprocess.Popen
                 real_atomic = orchestrator._atomic_write_text
+                real_atomic_bytes = orchestrator._atomic_write_bytes
                 real_git = orchestrator.capture_git_snapshot
                 real_update = orchestrator.update_metadata
                 real_event = orchestrator.append_event
@@ -3273,9 +3512,22 @@ class FifthReviewLifecycleBoundaryTests(GuardedLaunchFixture):
                     return real_git(*args, **kwargs)
 
                 def update(run_dir: Path, **updates: object) -> dict[str, object]:
-                    if "finished_at" in updates and should_fail("metadata"):
-                        raise OSError("fixture metadata failure")
                     return real_update(run_dir, **updates)
+
+                def atomic_bytes(
+                    path: Path, payload: bytes, *args: object, **kwargs: object
+                ) -> None:
+                    candidate = (
+                        json.loads(payload.decode("utf-8"))
+                        if Path(path).name == "metadata.json"
+                        else {}
+                    )
+                    if (
+                        candidate.get("terminal_state_count") == 1
+                        and should_fail("metadata")
+                    ):
+                        raise OSError("fixture metadata failure")
+                    real_atomic_bytes(path, payload, *args, **kwargs)
 
                 def event(run_dir: Path, payload: dict[str, object], *args: object, **kwargs: object) -> None:
                     if payload.get("type") == "process_exited" and should_fail("event"):
@@ -3294,6 +3546,8 @@ class FifthReviewLifecycleBoundaryTests(GuardedLaunchFixture):
 
                 with patch.object(orchestrator.subprocess, "Popen", side_effect=mark_popen), patch.object(
                     orchestrator, "_atomic_write_text", side_effect=atomic
+                ), patch.object(
+                    orchestrator, "_atomic_write_bytes", side_effect=atomic_bytes
                 ), patch.object(orchestrator, "capture_git_snapshot", side_effect=git), patch.object(
                     orchestrator, "update_metadata", side_effect=update
                 ), patch.object(orchestrator, "append_event", side_effect=event), patch.object(
@@ -3303,7 +3557,20 @@ class FifthReviewLifecycleBoundaryTests(GuardedLaunchFixture):
                         f"lifecycle {case}", cwd=self.workspace, timeout_seconds=3
                     )
                 self.assertTrue(failed, case)
-                self.assertEqual(result["status"], "blocked_runtime_launch", result)
+                if case == "event":
+                    self.assertEqual(result["status"], "succeeded", result)
+                    self.assertEqual(result["terminal_state_count"], 1, result)
+                else:
+                    self.assertEqual(result["status"], "failed", result)
+                    self.assertEqual(
+                        result["acceptance_status"],
+                        "blocked_artifact_finalization",
+                        result,
+                    )
+                    if case == "metadata":
+                        self.assertEqual(
+                            result["persistence_state"], "degraded", result
+                        )
                 self.assertIn(result["persistence_state"], {"persisted", "degraded"})
                 if result["persistence_state"] == "persisted":
                     self.assertEqual(result["terminal_state_count"], 1)
@@ -3362,9 +3629,28 @@ class FifthReviewLifecycleBoundaryTests(GuardedLaunchFixture):
         ):
             result = orchestrator.stream_worker(str(metadata["run_id"]))
         self.assertTrue(failed)
-        self.assertEqual(result["status"], "blocked_runtime_launch", result)
+        self.assertEqual(result["status"], "failed", result)
+        self.assertEqual(
+            result["acceptance_status"], "blocked_artifact_finalization", result
+        )
+        self.assertEqual(result["finalization_state"], "failed", result)
+        self.assertEqual(
+            result["finalization_error"]["code"],
+            "artifact_finalization_failed",
+            result,
+        )
+        self.assertEqual(result["terminal_state_count"], 1, result)
+        self.assertTrue(result["persisted"], result)
         self.assertIsNotNone(child)
         self._wait_for_pid_exit(child.pid)
+        events = [
+            json.loads(line)
+            for line in (run_dir / "events.ndjson").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertLessEqual(
+            sum(event.get("type") == "process_exited" for event in events), 1, events
+        )
 
 
 class FifthReviewTeamTransactionTests(GuardedLaunchFixture):
@@ -4475,7 +4761,9 @@ class SeventhReviewLifecycleTests(GuardedLaunchFixture):
         self.assertTrue(constructor_failed)
         self.assertEqual(len(children), 1)
         self.assertIn(
-            result["status"], {"blocked_runtime_launch", "cleanup_pending"}, result
+            result["status"],
+            {"timed_out", "blocked_runtime_launch", "cleanup_pending"},
+            result,
         )
         self._wait_for_pid_exit(children[0].pid, timeout=3)
         self.assertFalse((run_dir / "pid.txt").exists())
@@ -4766,7 +5054,12 @@ class SeventhReviewGitAndDeadlineTests(GuardedLaunchFixture):
         self.assertLess(elapsed, 1.3, (elapsed, result))
         self.assertIn(
             result["status"],
-            {"blocked_runtime_launch", "cleanup_pending", "cleanup_incomplete"},
+            {
+                "timed_out",
+                "blocked_runtime_launch",
+                "cleanup_pending",
+                "cleanup_incomplete",
+            },
             result,
         )
         worker_pid = result.get("worker_pid") or result.get("owned_process_pid")
@@ -4985,9 +5278,16 @@ class EighthReviewLifecycleTests(GuardedLaunchFixture):
 
         self.assertTrue(attack_fired)
         self.assertEqual(len(children), 1)
-        self.assertIn(
-            result["status"], {"blocked_runtime_launch", "cleanup_pending"}, result
+        self.assertEqual(result["status"], "failed", result)
+        self.assertEqual(
+            result["acceptance_status"], "blocked_artifact_finalization", result
         )
+        self.assertEqual(
+            result["finalization_error"]["code"],
+            "artifact_finalization_failed",
+            result,
+        )
+        self.assertEqual(result["terminal_state_count"], 1, result)
         self._wait_for_pid_exit(children[0].pid, timeout=4)
         self.assertFalse((run_dir / "pid.txt").exists())
         self.assertFalse(
@@ -4996,6 +5296,54 @@ class EighthReviewLifecycleTests(GuardedLaunchFixture):
                 for thread in threading.enumerate()
             )
         )
+
+    def test_prelaunch_git_failure_never_reaches_runtime_child(self) -> None:
+        failed_snapshot = {
+            "ok": False,
+            "label": "before",
+            "is_git_repo": False,
+            "evidence_complete": False,
+            "evidence_errors": ["git_evidence_capture_failed"],
+            "_raw_evidence_complete": False,
+            "_raw_evidence_errors": ["git_evidence_capture_failed"],
+        }
+        for mode in ("one_shot", "streaming"):
+            with self.subTest(mode=mode):
+                if mode == "one_shot":
+                    prepared = self._prepare(mode, prompt="prelaunch Git failure")
+                    with patch.object(
+                        orchestrator,
+                        "capture_git_snapshot",
+                        return_value=dict(failed_snapshot),
+                    ), patch.object(
+                        orchestrator,
+                        "_owned_process_popen",
+                        side_effect=AssertionError("runtime child launch was reachable"),
+                    ) as runtime_popen:
+                        result = orchestrator.start_prepared_worker_launch(prepared)
+                else:
+                    _prepared, _run_dir, metadata, protocol, environment = (
+                        self._direct_stream_fixture()
+                    )
+                    fixture_stdin = type(
+                        "FixtureStdin", (), {"buffer": io.BytesIO(protocol)}
+                    )()
+                    with patch.dict(os.environ, environment, clear=True), patch.object(
+                        sys, "stdin", fixture_stdin
+                    ), patch.object(
+                        orchestrator,
+                        "capture_git_snapshot",
+                        return_value=dict(failed_snapshot),
+                    ), patch.object(
+                        orchestrator,
+                        "_owned_process_popen",
+                        side_effect=AssertionError("runtime child launch was reachable"),
+                    ) as runtime_popen:
+                        result = orchestrator.stream_worker(str(metadata["run_id"]))
+
+                runtime_popen.assert_not_called()
+                self.assertEqual(result["status"], "blocked_runtime_launch", result)
+                self.assertIsNone(result.get("child_pid"), result)
 
     def test_one_shot_exception_immediately_after_popen_reaps_child(self) -> None:
         prepared = self._prepare("one_shot", prompt="one-shot lifecycle boundary")
@@ -5104,8 +5452,9 @@ class EighthReviewDeadlineTests(GuardedLaunchFixture):
 
         self.assertFalse(popen_called)
         self.assertLess(elapsed, 1.5, (elapsed, result))
-        self.assertEqual(result["status"], "blocked_runtime_launch", result)
+        self.assertEqual(result["status"], "timed_out", result)
         self.assertTrue(result.get("timed_out"), result)
+        self.assertEqual(result["exit_code"], 124, result)
 
     def test_isolated_worker_rejects_missing_or_invalid_inherited_deadline(self) -> None:
         for label, value in (
@@ -6781,7 +7130,10 @@ class TenthReviewCleanupOwnershipTests(TenthReviewFixture):
             except BaseException as exc:
                 errors.append(exc)
 
-        def exact_contained_pids(_job: int) -> list[int]:
+        def exact_contained_pids(
+            _job: int, *, deadline: float | None = None
+        ) -> list[int]:
+            self.assertIsNotNone(deadline)
             if not processes or descendant_pid is None:
                 raise AssertionError(
                     "Job membership queried before descendant PID acknowledgment"
@@ -6907,6 +7259,728 @@ class TenthReviewCleanupOwnershipTests(TenthReviewFixture):
 
 
 class EleventhReviewCleanupOwnershipTests(TenthReviewFixture):
+    def _new_terminal_run(self, suffix: str) -> tuple[Path, dict[str, object]]:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        metadata: dict[str, object] = {
+            "run_id": run_dir.name,
+            "status": "running",
+            "terminal_state_count": 0,
+            "artifact_root": str(self.artifact_root),
+            "test_case": suffix,
+        }
+        orchestrator.write_metadata(run_dir, metadata)
+        orchestrator._atomic_write_text(run_dir / "pid.txt", str(os.getpid()))
+        return run_dir, metadata
+
+    def _process_exited_event_count(self, run_dir: Path) -> int:
+        events_path = run_dir / "events.ndjson"
+        if not events_path.exists():
+            return 0
+        return sum(
+            event.get("type") == "process_exited"
+            for event in orchestrator.read_events(events_path)
+        )
+
+    def test_non_owner_cleanup_uses_shorter_caller_deadline(self) -> None:
+        class NonExitingProcess(self.FakeProcess):
+            def __init__(self) -> None:
+                super().__init__(510400, ignore_terminate=True)
+                self.wait_entered = threading.Event()
+                self.allow_exit = threading.Event()
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.wait_timeouts.append(timeout)
+                self.wait_entered.set()
+                if self.returncode is not None:
+                    return self.returncode
+                if timeout is not None and self.allow_exit.wait(timeout):
+                    self.returncode = -9
+                    return self.returncode
+                raise subprocess.TimeoutExpired(self.args, timeout or 0)
+
+            def terminate(self) -> None:
+                self.terminate_calls += 1
+
+            def kill(self) -> None:
+                self.kill_calls += 1
+
+            def force_exit(self) -> None:
+                self.returncode = -9
+                self.allow_exit.set()
+
+        process = NonExitingProcess()
+        owner_name = "cc-cleanup-owner-eleventh-short-caller"
+        caller_budget = 0.08
+        grace = float(orchestrator.WORKER_FINALIZATION_GRACE_SECONDS)
+        self.assertGreater(grace, caller_budget + 0.1)
+        record = orchestrator._ensure_owned_process_record(
+            process,
+            deadline=time.monotonic() + grace + 0.75,
+        )
+        owner: threading.Thread | None = None
+        cleanup_result: bool | None = None
+        elapsed: float | None = None
+
+        def owner_complete(_record: object) -> None:
+            with orchestrator._ACTIVE_CLEANUP_OWNERS_LOCK:
+                if (
+                    orchestrator._ACTIVE_CLEANUP_OWNERS.get(owner_name)
+                    is threading.current_thread()
+                ):
+                    orchestrator._ACTIVE_CLEANUP_OWNERS.pop(owner_name, None)
+
+        try:
+            transferred = orchestrator._start_owned_process_owner(
+                record,
+                owner_name=owner_name,
+                request_cleanup=False,
+                on_complete=owner_complete,
+            )
+            self.assertTrue(transferred)
+            owner = record.owner
+            self.assertIsNotNone(owner)
+            self.assertTrue(process.wait_entered.wait(1))
+
+            started = time.monotonic()
+            cleanup_result = orchestrator._bounded_process_cleanup(
+                process,
+                deadline=started + caller_budget,
+            )
+            elapsed = time.monotonic() - started
+        finally:
+            process.force_exit()
+            if owner is not None:
+                owner.join(timeout=2)
+            with orchestrator._ACTIVE_CLEANUP_OWNERS_LOCK:
+                if orchestrator._ACTIVE_CLEANUP_OWNERS.get(owner_name) is owner:
+                    orchestrator._ACTIVE_CLEANUP_OWNERS.pop(owner_name, None)
+            if orchestrator._owned_process_record(process) is record:
+                orchestrator._remove_owned_process_record(record)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                stream.close()
+
+        self.assertFalse(cleanup_result)
+        self.assertIsNotNone(elapsed)
+        assert elapsed is not None
+        self.assertLess(elapsed, caller_budget + 0.5, elapsed)
+        self.assertLess(elapsed, grace, elapsed)
+        self.assertIsNotNone(owner)
+        assert owner is not None
+        self.assertFalse(owner.is_alive())
+        with orchestrator._ACTIVE_CLEANUP_OWNERS_LOCK:
+            self.assertNotIn(owner_name, orchestrator._ACTIVE_CLEANUP_OWNERS)
+        self.assertIsNone(orchestrator._owned_process_record(process))
+
+    def test_cleanup_status_stays_active_and_retains_pid_until_confirmation(
+        self,
+    ) -> None:
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        pid_path = run_dir / "pid.txt"
+        metadata = {
+            "run_id": run_dir.name,
+            "status": "cleanup_pending",
+            "child_pid": process.pid,
+            "worker_pid": None,
+            "terminal_state_count": 0,
+        }
+        try:
+            self.assertIsNone(process.poll())
+            orchestrator.write_metadata(run_dir, metadata)
+            orchestrator._atomic_write_text(pid_path, str(process.pid))
+
+            pending_status = orchestrator.single_run_status(run_dir.name)
+            self.assertEqual(pending_status["status"], "cleanup_pending")
+            self.assertTrue(pending_status["child_alive"], pending_status)
+            self.assertTrue(pending_status["active"], pending_status)
+
+            persisted = orchestrator._persist_terminal_state(
+                run_dir,
+                metadata,
+                updates={
+                    "status": "cleanup_incomplete",
+                    "cleanup_state": "cleanup_incomplete",
+                    "child_pid": None,
+                    "worker_pid": process.pid,
+                },
+                remove_pid=False,
+            )
+            incomplete_status = orchestrator.single_run_status(run_dir.name)
+            self.assertEqual(persisted["status"], "cleanup_incomplete")
+            self.assertTrue(persisted["persisted"], persisted)
+            self.assertEqual(
+                incomplete_status["status"], "cleanup_incomplete"
+            )
+            self.assertTrue(
+                incomplete_status["worker_alive"], incomplete_status
+            )
+            self.assertTrue(incomplete_status["active"], incomplete_status)
+            self.assertTrue(pid_path.is_file())
+            self.assertEqual(pid_path.read_text(encoding="utf-8"), str(process.pid))
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+
+    def test_caller_owned_cleanup_clamps_every_wait_to_attempt_deadline(
+        self,
+    ) -> None:
+        class NonExitingProcess(self.FakeProcess):
+            def __init__(self) -> None:
+                super().__init__(510410, ignore_terminate=True)
+                self.exit = threading.Event()
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.wait_timeouts.append(timeout)
+                if self.returncode is not None:
+                    return self.returncode
+                if timeout is not None and self.exit.wait(timeout):
+                    self.returncode = -9
+                    return self.returncode
+                raise subprocess.TimeoutExpired(self.args, timeout or 0)
+
+            def kill(self) -> None:
+                self.kill_calls += 1
+
+            def force_exit(self) -> None:
+                self.returncode = -9
+                self.exit.set()
+
+        class JoinProbe:
+            def __init__(self) -> None:
+                self.name = "cc-runtime-eleventh-caller-owned-reader"
+                self.release = threading.Event()
+                self.join_timeouts: list[float | None] = []
+
+            def is_alive(self) -> bool:
+                return not self.release.is_set()
+
+            def join(self, timeout: float | None = None) -> None:
+                self.join_timeouts.append(timeout)
+                self.release.wait(timeout)
+
+        process = NonExitingProcess()
+        reader = JoinProbe()
+        caller_budget = 0.06
+        grace = float(orchestrator.WORKER_FINALIZATION_GRACE_SECONDS)
+        record = orchestrator._ensure_owned_process_record(
+            process, deadline=time.monotonic() + grace
+        )
+        started = time.monotonic()
+        result: bool | None = None
+        try:
+            result = orchestrator._bounded_process_cleanup(
+                process,
+                (reader,),  # type: ignore[arg-type]
+                deadline=started + caller_budget,
+            )
+            elapsed = time.monotonic() - started
+        finally:
+            process.force_exit()
+            reader.release.set()
+            if orchestrator._owned_process_record(process) is record:
+                orchestrator._remove_owned_process_record(record)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                stream.close()
+
+        tolerance = 0.08
+        self.assertFalse(result)
+        self.assertTrue(process.wait_timeouts, process.wait_timeouts)
+        self.assertTrue(reader.join_timeouts, reader.join_timeouts)
+        self.assertTrue(
+            all(
+                timeout is not None and timeout <= caller_budget + tolerance
+                for timeout in process.wait_timeouts + reader.join_timeouts
+            ),
+            {
+                "process_waits": process.wait_timeouts,
+                "reader_joins": reader.join_timeouts,
+            },
+        )
+        self.assertLess(elapsed, caller_budget + 0.2, elapsed)
+        self.assertLess(elapsed, grace, elapsed)
+
+    def test_expired_owner_handoff_cannot_publish_a_dead_cleanup_owner(
+        self,
+    ) -> None:
+        class SynchronousDeadThread:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                self.name = str(kwargs.get("name") or "eleventh-dead-owner")
+                self.daemon = bool(kwargs.get("daemon", False))
+                self._target = kwargs.get("target")
+                self._args = tuple(kwargs.get("args") or ())
+
+            def start(self) -> None:
+                assert callable(self._target)
+                self._target(*self._args)
+
+            def is_alive(self) -> bool:
+                return False
+
+            def join(self, timeout: float | None = None) -> None:
+                return None
+
+        process = self.FakeProcess(510411, ignore_terminate=True)
+        owner_name = "cc-cleanup-owner-eleventh-expired"
+        record = orchestrator._ensure_owned_process_record(
+            process, deadline=time.monotonic() - 0.01
+        )
+        transferred = False
+        try:
+            with patch.object(
+                orchestrator.threading,
+                "Thread",
+                side_effect=SynchronousDeadThread,
+            ):
+                transferred = orchestrator._start_owned_process_owner(
+                    record,
+                    owner_name=owner_name,
+                    request_cleanup=True,
+                )
+            owner = record.owner
+            details = {
+                "transferred": transferred,
+                "state": record.state,
+                "owner_alive": bool(owner and owner.is_alive()),
+                "cleanup_result": record.cleanup_result,
+            }
+            self.assertFalse(transferred, details)
+            self.assertNotEqual(record.state, "cleanup_owned", details)
+            with orchestrator._ACTIVE_CLEANUP_OWNERS_LOCK:
+                self.assertNotIn(owner_name, orchestrator._ACTIVE_CLEANUP_OWNERS)
+        finally:
+            with orchestrator._ACTIVE_CLEANUP_OWNERS_LOCK:
+                orchestrator._ACTIVE_CLEANUP_OWNERS.pop(owner_name, None)
+            process.force_exit()
+            if orchestrator._owned_process_record(process) is record:
+                orchestrator._remove_owned_process_record(record)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                stream.close()
+
+    def test_normal_completion_requires_containment_proof_in_both_modes(
+        self,
+    ) -> None:
+        real_owned_popen = orchestrator._owned_process_popen
+        real_release = orchestrator._release_owned_containment
+
+        for mode in ("one_shot", "streaming"):
+            with self.subTest(mode=mode):
+                processes: list[subprocess.Popen[bytes]] = []
+
+                def capture_process(
+                    *args: object, **kwargs: object
+                ) -> subprocess.Popen[bytes]:
+                    process = real_owned_popen(*args, **kwargs)
+                    processes.append(process)
+                    return process
+
+                try:
+                    with patch.object(
+                        orchestrator,
+                        "capture_git_snapshot",
+                        return_value=self._non_git_snapshot(mode),
+                    ), patch.object(
+                        orchestrator,
+                        "_pin_write_scope_policy",
+                        return_value=self._absent_scope_pin(),
+                    ), patch.object(
+                        orchestrator,
+                        "_owned_process_popen",
+                        side_effect=capture_process,
+                    ), patch.object(
+                        orchestrator,
+                        "_release_owned_containment",
+                        return_value=False,
+                    ) as release_proof:
+                        if mode == "one_shot":
+                            prepared = self._prepare_with_timeout(
+                                mode, "eleventh containment proof", timeout_seconds=3
+                            )
+                            result = orchestrator.start_prepared_worker_launch(
+                                prepared
+                            )
+                        else:
+                            (
+                                _prepared,
+                                run_dir,
+                                metadata,
+                                protocol,
+                                environment,
+                            ) = SeventhReviewLifecycleTests._direct_stream_fixture(
+                                self
+                            )
+                            metadata = orchestrator.update_metadata(
+                                run_dir,
+                                transaction_deadline_monotonic=time.monotonic() + 4,
+                            )
+                            fixture_stdin = type(
+                                "FixtureStdin",
+                                (),
+                                {"buffer": io.BytesIO(protocol)},
+                            )()
+                            with patch.dict(
+                                os.environ, environment, clear=True
+                            ), patch.object(sys, "stdin", fixture_stdin):
+                                result = orchestrator.stream_worker(
+                                    str(metadata["run_id"])
+                                )
+
+                    self.assertEqual(len(processes), 1, result)
+                    process = processes[0]
+                    run_dir = self.runs_dir / str(result["run_id"])
+                    display = orchestrator.single_run_status(str(result["run_id"]))
+                    persisted = orchestrator.read_metadata(run_dir)
+                    details = {
+                        "result": result,
+                        "display": display,
+                        "persisted": persisted,
+                        "release_calls": release_proof.call_count,
+                    }
+                    self.assertEqual(release_proof.call_count, 1, details)
+                    self.assertNotEqual(display["status"], "succeeded", details)
+                    self.assertEqual(
+                        persisted.get("cleanup_state"),
+                        "cleanup_incomplete",
+                        details,
+                    )
+                    self.assertEqual(
+                        persisted.get("owned_process_pid"), process.pid, details
+                    )
+                    self.assertTrue((run_dir / "pid.txt").is_file(), details)
+                    self.assertIsNotNone(
+                        orchestrator._owned_process_record(process), details
+                    )
+                finally:
+                    for process in processes:
+                        record = orchestrator._owned_process_record(process)
+                        if process.poll() is None:
+                            orchestrator._terminate_owned_process(
+                                process, deadline=time.monotonic() + 2
+                            )
+                        record = orchestrator._owned_process_record(process)
+                        if record is not None:
+                            with record.lock:
+                                record.state = "caller_owned"
+                                record.owner_token = f"caller:{record.generation}"
+                                record.owner = None
+                            try:
+                                real_release(
+                                    process, terminate_descendants=True
+                                )
+                            except Exception:
+                                pass
+                        record = orchestrator._owned_process_record(process)
+                        if record is not None:
+                            orchestrator._remove_owned_process_record(record)
+
+    def test_cleanup_status_uses_owned_process_pid_without_child_or_worker_pid(
+        self,
+    ) -> None:
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import threading; threading.Event().wait()"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            self.assertIsNone(process.poll())
+            for status in ("cleanup_pending", "cleanup_incomplete"):
+                with self.subTest(status=status):
+                    run_dir = self.runs_dir / orchestrator.new_run_id()
+                    orchestrator._set_private_directory(run_dir)
+                    orchestrator.write_metadata(
+                        run_dir,
+                        {
+                            "run_id": run_dir.name,
+                            "status": status,
+                            "cleanup_state": status,
+                            "owned_process_pid": process.pid,
+                            "child_pid": None,
+                            "worker_pid": None,
+                            "terminal_state_count": (
+                                0 if status == "cleanup_pending" else 1
+                            ),
+                        },
+                    )
+                    displayed = orchestrator.single_run_status(run_dir.name)
+                    self.assertFalse(displayed["child_alive"], displayed)
+                    self.assertFalse(displayed["worker_alive"], displayed)
+                    self.assertTrue(displayed["active"], displayed)
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+
+    def test_stream_terminal_precommit_crossing_deadline_commits_timeout(
+        self,
+    ) -> None:
+        run_dir, metadata = self._new_terminal_run("precommit-deadline")
+        real_replace = orchestrator._replace_prepared_atomic_write
+        real_monotonic = time.monotonic
+        clock = {"now": real_monotonic()}
+        launch_deadline = clock["now"] + 0.5
+        crossed = threading.Event()
+
+        def controlled_monotonic() -> float:
+            return float(clock["now"])
+
+        def cross_at_replace(
+            temporary_path: Path,
+            path: Path,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            if path == run_dir / "metadata.json" and not crossed.is_set():
+                clock["now"] = launch_deadline + 0.01
+                crossed.set()
+            real_replace(temporary_path, path, *args, **kwargs)
+
+        with patch.object(
+            orchestrator.time, "monotonic", side_effect=controlled_monotonic
+        ), patch.object(
+            orchestrator,
+            "_replace_prepared_atomic_write",
+            side_effect=cross_at_replace,
+        ):
+            result = orchestrator._persist_streaming_terminal_state(
+                run_dir,
+                metadata,
+                updates={
+                    "status": "succeeded",
+                    "timed_out": False,
+                    "exit_code": 0,
+                    "finished_at": orchestrator.utc_now_iso(),
+                },
+                events=(
+                    {
+                        "type": "process_exited",
+                        "status": "succeeded",
+                        "exit_code": 0,
+                    },
+                ),
+                remove_pid=True,
+                launch_deadline=launch_deadline,
+            )
+
+        persisted = orchestrator.read_metadata(run_dir)
+        self.assertTrue(crossed.is_set())
+        self.assertEqual(result["status"], "timed_out", result)
+        self.assertTrue(result["timed_out"], result)
+        self.assertEqual(result["exit_code"], 124, result)
+        self.assertEqual(persisted["status"], "timed_out", persisted)
+        self.assertTrue(persisted["timed_out"], persisted)
+        self.assertEqual(persisted["exit_code"], 124, persisted)
+
+    def test_stream_terminal_cas_loser_has_no_pid_or_event_side_effects(
+        self,
+    ) -> None:
+        run_dir, metadata = self._new_terminal_run("cas-loser")
+        winner = orchestrator._persist_streaming_terminal_state(
+            run_dir,
+            metadata,
+            updates={
+                "status": "cleanup_incomplete",
+                "cleanup_state": "cleanup_incomplete",
+                "owned_process_pid": os.getpid(),
+                "exit_code": None,
+                "finished_at": orchestrator.utc_now_iso(),
+            },
+            events=(
+                {
+                    "type": "process_exited",
+                    "status": "cleanup_incomplete",
+                    "exit_code": None,
+                },
+            ),
+            remove_pid=False,
+        )
+        loser = orchestrator._persist_streaming_terminal_state(
+            run_dir,
+            metadata,
+            updates={
+                "status": "succeeded",
+                "exit_code": 0,
+                "finished_at": orchestrator.utc_now_iso(),
+            },
+            events=(
+                {
+                    "type": "process_exited",
+                    "status": "succeeded",
+                    "exit_code": 0,
+                },
+            ),
+            remove_pid=True,
+        )
+
+        persisted = orchestrator.read_metadata(run_dir)
+        self.assertEqual(winner["status"], "cleanup_incomplete", winner)
+        self.assertEqual(loser["status"], "cleanup_incomplete", loser)
+        self.assertEqual(persisted["terminal_state_count"], 1, persisted)
+        self.assertTrue((run_dir / "pid.txt").is_file(), persisted)
+        self.assertLessEqual(self._process_exited_event_count(run_dir), 1)
+
+    def test_terminal_persistence_failures_are_honest_and_side_effect_free(
+        self,
+    ) -> None:
+        @contextlib.contextmanager
+        def failed_lock(*args: object, **kwargs: object) -> object:
+            raise PermissionError("eleventh artifact lock failure")
+            yield
+
+        failure_patches = {
+            "lock": lambda: patch.object(
+                orchestrator, "artifact_lock", new=failed_lock
+            ),
+            "prepare": lambda: patch.object(
+                orchestrator,
+                "_prepare_private_atomic_write",
+                side_effect=PermissionError("eleventh prepare failure"),
+            ),
+            "replace": lambda: patch.object(
+                orchestrator,
+                "_replace_prepared_atomic_write",
+                side_effect=PermissionError("eleventh replace failure"),
+            ),
+        }
+        for persistence in ("common", "streaming"):
+            for boundary, patch_factory in failure_patches.items():
+                with self.subTest(persistence=persistence, boundary=boundary):
+                    run_dir, metadata = self._new_terminal_run(
+                        f"{persistence}-{boundary}"
+                    )
+                    with patch_factory():
+                        if persistence == "common":
+                            result = orchestrator._persist_terminal_state(
+                                run_dir,
+                                metadata,
+                                updates={
+                                    "status": "failed",
+                                    "exit_code": 1,
+                                    "finished_at": orchestrator.utc_now_iso(),
+                                },
+                                event={
+                                    "type": "process_exited",
+                                    "status": "failed",
+                                    "exit_code": 1,
+                                },
+                                remove_pid=True,
+                            )
+                        else:
+                            result = orchestrator._persist_streaming_terminal_state(
+                                run_dir,
+                                metadata,
+                                updates={
+                                    "status": "failed",
+                                    "exit_code": 1,
+                                    "finished_at": orchestrator.utc_now_iso(),
+                                },
+                                events=(
+                                    {
+                                        "type": "process_exited",
+                                        "status": "failed",
+                                        "exit_code": 1,
+                                    },
+                                ),
+                                remove_pid=True,
+                            )
+                    persisted = orchestrator.read_metadata(run_dir)
+                    self.assertFalse(result["persisted"], result)
+                    self.assertEqual(
+                        result["persistence_state"], "degraded", result
+                    )
+                    self.assertEqual(result["terminal_state_count"], 0, result)
+                    self.assertEqual(persisted["status"], "running", persisted)
+                    self.assertEqual(persisted["terminal_state_count"], 0, persisted)
+                    self.assertTrue((run_dir / "pid.txt").is_file(), result)
+                    self.assertEqual(self._process_exited_event_count(run_dir), 0)
+
+    def test_cleanup_incomplete_retains_live_threads_and_owned_capability(
+        self,
+    ) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        deadline = time.monotonic() + 0.1
+        process = orchestrator._owned_process_popen(
+            [sys.executable, "-c", "import threading; threading.Event().wait()"],
+            ownership_deadline=deadline,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        record = orchestrator._owned_process_record(process)
+        self.assertIsNotNone(record)
+        release = threading.Event()
+        entered = threading.Event()
+
+        def hold_reader() -> None:
+            entered.set()
+            release.wait()
+
+        reader = threading.Thread(
+            target=hold_reader,
+            name=f"cc-runtime-eleventh-live-reader-{run_dir.name}",
+            daemon=True,
+        )
+        reader.start()
+        self.assertTrue(entered.wait(1))
+        metadata: dict[str, object] = {
+            "run_id": run_dir.name,
+            "status": "running",
+            "artifact_root": str(self.artifact_root),
+            "transaction_deadline_monotonic": deadline,
+            "terminal_state_count": 0,
+        }
+        orchestrator.write_metadata(run_dir, metadata)
+        orchestrator._atomic_write_text(run_dir / "pid.txt", str(process.pid))
+        pending = orchestrator._OwnedCleanupPending(process, (reader,))
+        try:
+            result = orchestrator._complete_isolated_worker_cleanup(
+                run_dir, metadata, pending
+            )
+            persisted = orchestrator.read_metadata(run_dir)
+            details = {"result": result, "persisted": persisted}
+            self.assertEqual(result["status"], "cleanup_incomplete", details)
+            self.assertEqual(
+                persisted.get("cleanup_state"), "cleanup_incomplete", details
+            )
+            self.assertIn(
+                reader.name, persisted.get("live_cleanup_threads", []), details
+            )
+            self.assertEqual(
+                persisted.get("owned_process_pid"), process.pid, details
+            )
+            self.assertTrue((run_dir / "pid.txt").is_file(), details)
+            self.assertIs(orchestrator._owned_process_record(process), record)
+        finally:
+            release.set()
+            reader.join(timeout=2)
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            current = orchestrator._owned_process_record(process)
+            if current is not None:
+                if current.kind == "windows" and not current.job_closed:
+                    try:
+                        orchestrator._close_windows_handle(current.handle)
+                    except Exception:
+                        pass
+                    current.job_closed = True
+                orchestrator._remove_owned_process_record(current)
+
     def test_retain_worker_handle_obeys_owned_deadline_and_exits_boundedly(
         self,
     ) -> None:
@@ -7179,6 +8253,761 @@ class EleventhReviewCleanupOwnershipTests(TenthReviewFixture):
         self.assertEqual(violations, [], "\n".join(violations))
 
 
+class TwelfthReviewLifecycleRegressionTests(TenthReviewFixture):
+    def _new_running_terminal_run(self) -> tuple[Path, dict[str, object]]:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        metadata: dict[str, object] = {
+            "run_id": run_dir.name,
+            "status": "running",
+            "terminal_state_count": 0,
+            "artifact_root": str(self.artifact_root),
+        }
+        orchestrator.write_metadata(run_dir, metadata)
+        orchestrator._atomic_write_text(run_dir / "pid.txt", str(os.getpid()))
+        return run_dir, metadata
+
+    def test_os_replace_adjacent_precommit_crossing_commits_timeout(self) -> None:
+        run_dir, metadata = self._new_running_terminal_run()
+        helper_name = (
+            "_windows_replace_relative"
+            if os.name == "nt"
+            else "_posix_replace_relative"
+        )
+        real_helper = getattr(orchestrator, helper_name)
+        real_monotonic = time.monotonic
+        clock = {"now": real_monotonic()}
+        launch_deadline = clock["now"] + 0.5
+        crossed = threading.Event()
+
+        def controlled_monotonic() -> float:
+            return float(clock["now"])
+
+        def cross_before_os_replace(*args: object, **kwargs: object) -> None:
+            if not crossed.is_set():
+                clock["now"] = launch_deadline + 0.01
+                crossed.set()
+            real_helper(*args, **kwargs)
+
+        with patch.object(
+            orchestrator.time, "monotonic", side_effect=controlled_monotonic
+        ), patch.object(
+            orchestrator, helper_name, side_effect=cross_before_os_replace
+        ):
+            result = orchestrator._persist_streaming_terminal_state(
+                run_dir,
+                metadata,
+                updates={
+                    "status": "succeeded",
+                    "timed_out": False,
+                    "exit_code": 0,
+                    "finished_at": orchestrator.utc_now_iso(),
+                },
+                remove_pid=True,
+                launch_deadline=launch_deadline,
+            )
+
+        persisted = orchestrator.read_metadata(run_dir)
+        self.assertTrue(crossed.is_set())
+        for state in (result, persisted):
+            self.assertEqual(state["status"], "timed_out", state)
+            self.assertTrue(state["timed_out"], state)
+            self.assertEqual(state["exit_code"], 124, state)
+            self.assertEqual(state["terminal_state_count"], 1, state)
+
+    def test_windows_job_capture_receives_current_attempt_deadline(self) -> None:
+        process = self.FakeProcess(510420, ignore_terminate=True)
+        durable_deadline = time.monotonic() + 5
+        attempt_deadline = time.monotonic() + 0.08
+        record = orchestrator._ensure_owned_process_record(
+            process, deadline=durable_deadline
+        )
+        with record.lock:
+            record.kind = "windows"
+            record.handle = 510421
+            record.job_active_zero = False
+        observed: list[float | None] = []
+
+        def query_members(
+            handle: int, *, deadline: float | None = None
+        ) -> list[int]:
+            self.assertEqual(handle, record.handle)
+            observed.append(deadline)
+            return [process.pid]
+
+        started = time.monotonic()
+        try:
+            with patch.object(
+                orchestrator,
+                "_windows_job_process_ids",
+                side_effect=query_members,
+            ), patch.object(orchestrator, "_terminate_windows_job") as terminate_job:
+                orchestrator._terminate_owned_containment(
+                    process, force=True, deadline=attempt_deadline
+                )
+            elapsed = time.monotonic() - started
+            terminate_job.assert_called_once_with(record.handle)
+            self.assertEqual(len(observed), 1, observed)
+            self.assertEqual(observed[0], attempt_deadline)
+            self.assertLess(observed[0], durable_deadline)  # type: ignore[operator]
+            self.assertLess(elapsed, 0.2, elapsed)
+        finally:
+            process.force_exit()
+            if orchestrator._owned_process_record(process) is record:
+                orchestrator._remove_owned_process_record(record)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                stream.close()
+
+    def test_run_dir_active_protects_owned_process_only_cleanup(self) -> None:
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        try:
+            orchestrator.write_metadata(
+                run_dir,
+                {
+                    "run_id": run_dir.name,
+                    "status": "cleanup_incomplete",
+                    "child_pid": None,
+                    "worker_pid": None,
+                    "owned_process_pid": process.pid,
+                },
+            )
+            self.assertIsNone(process.poll())
+            self.assertTrue(orchestrator.run_dir_active(run_dir))
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+
+    def test_single_run_status_exposes_cleanup_and_finalization_diagnostics(
+        self,
+    ) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        finalization_error = {
+            "code": "artifact_finalization_failed",
+            "message": "fixture finalization failure",
+        }
+        orchestrator.write_metadata(
+            run_dir,
+            {
+                "run_id": run_dir.name,
+                "status": "cleanup_incomplete",
+                "cleanup_state": "cleanup_incomplete",
+                "cleanup_owner": "cc-cleanup-owner-fixture",
+                "live_cleanup_threads": ["cc-runtime-fixture-reader"],
+                "persistence_state": "degraded",
+                "finalization_state": "failed",
+                "finalization_error": finalization_error,
+                "terminal_state_count": 1,
+            },
+        )
+
+        displayed = orchestrator.single_run_status(run_dir.name)
+        self.assertEqual(displayed["cleanup_state"], "cleanup_incomplete")
+        self.assertEqual(displayed["cleanup_owner"], "cc-cleanup-owner-fixture")
+        self.assertEqual(
+            displayed["live_cleanup_threads"], ["cc-runtime-fixture-reader"]
+        )
+        self.assertEqual(displayed["persistence_state"], "degraded")
+        self.assertEqual(displayed["finalization_state"], "failed")
+        self.assertEqual(displayed["finalization_error"], finalization_error)
+
+    def test_failed_status_with_unconfirmed_cleanup_remains_active_and_protected(
+        self,
+    ) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        orchestrator.write_metadata(
+            run_dir,
+            {
+                "run_id": run_dir.name,
+                "status": "failed",
+                "cleanup_state": "cleanup_incomplete",
+                "terminal_state_count": 1,
+                "finished_at": orchestrator.utc_now_iso(),
+                "exit_code": 1,
+            },
+        )
+
+        self.assertTrue(orchestrator.run_dir_active(run_dir))
+        displayed = orchestrator.single_run_status(run_dir.name)
+        self.assertEqual(displayed["status"], "failed", displayed)
+        self.assertTrue(displayed["active"], displayed)
+        self.assertEqual(
+            displayed["cleanup_state"], "cleanup_incomplete", displayed
+        )
+
+    def test_completed_owner_after_acceptance_is_not_reported_as_transferred(
+        self,
+    ) -> None:
+        process = self.FakeProcess(510430)
+        record = orchestrator._ensure_owned_process_record(
+            process, deadline=time.monotonic() + 1
+        )
+        owner_done = threading.Event()
+        real_thread = threading.Thread
+
+        class ControlledOwnerThread:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                self.name = str(kwargs.get("name") or "controlled-owner")
+                self.daemon = bool(kwargs.get("daemon", False))
+                self._target = kwargs["target"]
+                self._args = tuple(kwargs.get("args") or ())
+                accepted = self._args[5]
+                accepted_wait = accepted.wait
+
+                def wait_through_owner_exit(timeout: float | None = None) -> bool:
+                    if not accepted_wait(timeout):
+                        return False
+                    return owner_done.wait(timeout)
+
+                accepted.wait = wait_through_owner_exit
+                self._inner = real_thread(
+                    target=self._run,
+                    name=self.name + "-inner",
+                    daemon=self.daemon,
+                )
+
+            def _run(self) -> None:
+                try:
+                    self._target(*self._args)
+                finally:
+                    owner_done.set()
+
+            def start(self) -> None:
+                self._inner.start()
+
+            def is_alive(self) -> bool:
+                return self._inner.is_alive()
+
+            def join(self, timeout: float | None = None) -> None:
+                self._inner.join(timeout)
+
+        def fail_after_acceptance(
+            owned_record: object,
+            owner_token: str,
+            attempt_deadline: float,
+            ready: threading.Event,
+            commit: threading.Event,
+            cancel: threading.Event,
+            accepted: threading.Event,
+            threads: tuple[threading.Thread, ...],
+            on_complete: object,
+        ) -> None:
+            del owner_token, attempt_deadline, cancel, threads
+            ready.set()
+            self.assertTrue(commit.wait(1))
+            accepted.set()
+            with owned_record.lock:
+                owned_record.process.returncode = -9
+                owned_record.cleanup_result = "cleanup_failed"
+                owned_record.state = "cleanup_incomplete"
+                owned_record.completed.set()
+            on_complete(owned_record)
+
+        owner_name = "cc-cleanup-owner-twelfth-completed-after-accept"
+        try:
+            with patch.object(
+                orchestrator.threading,
+                "Thread",
+                ControlledOwnerThread,
+            ), patch.object(
+                orchestrator,
+                "_owned_process_owner_main",
+                side_effect=fail_after_acceptance,
+            ):
+                transferred = orchestrator._start_owned_process_owner(
+                    record,
+                    owner_name=owner_name,
+                    request_cleanup=False,
+                )
+
+            self.assertFalse(transferred)
+            self.assertTrue(owner_done.wait(1))
+            self.assertNotEqual(record.state, "cleanup_owned")
+            with orchestrator._ACTIVE_CLEANUP_OWNERS_LOCK:
+                self.assertNotIn(owner_name, orchestrator._ACTIVE_CLEANUP_OWNERS)
+        finally:
+            with orchestrator._ACTIVE_CLEANUP_OWNERS_LOCK:
+                orchestrator._ACTIVE_CLEANUP_OWNERS.pop(owner_name, None)
+            if orchestrator._owned_process_record(process) is record:
+                orchestrator._remove_owned_process_record(record)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                stream.close()
+
+    def test_reaped_posix_group_never_receives_a_terminating_signal(self) -> None:
+        process = self.FakeProcess(510431)
+        process.returncode = 0
+        record = orchestrator._ensure_owned_process_record(
+            process, deadline=time.monotonic() + 1
+        )
+        with record.lock:
+            record.kind = "posix"
+            record.handle = process.pid
+            record.root_reaped = True
+        try:
+            with patch.object(
+                orchestrator.os, "killpg", create=True
+            ) as killpg, patch.object(
+                orchestrator.signal, "SIGKILL", 9, create=True
+            ):
+                orchestrator._terminate_owned_containment(process, force=False)
+                orchestrator._terminate_owned_containment(process, force=True)
+                confirmed = orchestrator._finalize_owned_process_record(
+                    record,
+                    (),
+                    terminate_descendants=True,
+                    owner_token=None,
+                    attempt_deadline=time.monotonic() + 1,
+                )
+            terminating_signals = [
+                call.args[1]
+                for call in killpg.call_args_list
+                if len(call.args) > 1 and call.args[1] != 0
+            ]
+            self.assertEqual(terminating_signals, [])
+            self.assertFalse(confirmed)
+            self.assertEqual(record.state, "cleanup_incomplete")
+            self.assertEqual(record.cleanup_result, "cleanup_incomplete")
+            self.assertIn(
+                "process_group_alive_after_root_exit", record.proof_failures
+            )
+
+            run_dir = self.runs_dir / orchestrator.new_run_id()
+            orchestrator._set_private_directory(run_dir)
+            orchestrator.write_metadata(
+                run_dir,
+                {
+                    "status": "cleanup_incomplete",
+                    "cleanup_state": "cleanup_incomplete",
+                    "owned_process_pid": process.pid,
+                },
+            )
+            self.assertTrue(orchestrator.run_dir_active(run_dir))
+        finally:
+            if orchestrator._owned_process_record(process) is record:
+                orchestrator._remove_owned_process_record(record)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                stream.close()
+
+    def test_identity_capture_timeout_preserves_primary_timeout_evidence(self) -> None:
+        prepared = self._prepare_with_timeout(
+            "one_shot", "twelfth identity timeout", timeout_seconds=3
+        )
+        real_popen = subprocess.Popen
+        children: list[subprocess.Popen[bytes]] = []
+
+        def capture_child(
+            *args: object, **kwargs: object
+        ) -> subprocess.Popen[bytes]:
+            child = real_popen(*args, **kwargs)
+            children.append(child)
+            return child
+
+        pending_updates: list[dict[str, object]] = []
+
+        def capture_pending(
+            _metadata: object,
+            _process: object,
+            _sensitive_values: object = (),
+            _threads: object = (),
+            *,
+            response_updates: object = None,
+            attempt_deadline: object = None,
+        ) -> dict[str, object]:
+            del attempt_deadline
+            updates = dict(response_updates or {})
+            pending_updates.append(updates)
+            return {
+                "status": "cleanup_pending",
+                "cleanup_state": "cleanup_incomplete",
+                **updates,
+            }
+        try:
+            with patch.object(
+                orchestrator,
+                "capture_git_snapshot",
+                side_effect=lambda *_args, **_kwargs: self._non_git_snapshot(),
+            ), patch.object(
+                orchestrator,
+                "_pin_write_scope_policy",
+                return_value=self._absent_scope_pin(),
+            ), patch.object(
+                orchestrator.subprocess,
+                "Popen",
+                side_effect=capture_child,
+            ), patch.object(
+                orchestrator,
+                "capture_process_identity",
+                side_effect=TimeoutError("fixture identity timeout"),
+            ), patch.object(
+                orchestrator, "_terminate_owned_process", return_value=False
+            ), patch.object(
+                orchestrator,
+                "_cleanup_pending_response",
+                side_effect=capture_pending,
+            ):
+                result = orchestrator.start_prepared_worker_launch(prepared)
+
+            self.assertEqual(result["status"], "cleanup_pending", result)
+            self.assertEqual(len(pending_updates), 1, pending_updates)
+            self.assertTrue(result["timed_out"], result)
+            self.assertEqual(result["stop_reason"], "timeout", result)
+            self.assertEqual(result["exit_code"], 124, result)
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.terminate()
+                    try:
+                        child.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        child.kill()
+                        child.wait(timeout=5)
+                record = orchestrator._owned_process_record(child)
+                if record is not None:
+                    orchestrator._remove_owned_process_record(record)
+                for stream in (child.stdin, child.stdout, child.stderr):
+                    if stream is not None:
+                        stream.close()
+
+    def test_one_shot_finalization_failure_preserves_timeout_precedence(
+        self,
+    ) -> None:
+        self.fake_runtime.write_text(
+            "import sys, time\nsys.stdin.buffer.read()\ntime.sleep(5)\n",
+            encoding="utf-8",
+        )
+        with patch.object(
+            orchestrator,
+            "_publish_latest_run",
+            side_effect=OSError("fixture latest publication failure"),
+        ):
+            result = orchestrator.run_agent(
+                "twelfth timeout finalization",
+                cwd=self.workspace,
+                timeout_seconds=1,
+            )
+
+        self.assertEqual(result["status"], "timed_out", result)
+        self.assertTrue(result["timed_out"], result)
+        self.assertEqual(result["exit_code"], 124, result)
+        self.assertEqual(
+            result["acceptance_status"],
+            "blocked_artifact_finalization",
+            result,
+        )
+
+    def test_stream_finalization_failure_uses_nested_timeout_evidence(
+        self,
+    ) -> None:
+        run_dir, metadata = self._new_running_terminal_run()
+        metadata.update(
+            {
+                "cleanup_state": "cleanup_confirmed",
+                "output_budget": {
+                    "state": "truncated",
+                    "stop_reason": "timeout",
+                },
+            }
+        )
+        orchestrator.write_metadata(run_dir, metadata)
+
+        with patch.object(
+            orchestrator,
+            "_scrub_run_artifacts",
+            side_effect=OSError("fixture final scrub failure"),
+        ):
+            result = orchestrator._persist_streaming_terminal_state(
+                run_dir,
+                metadata,
+                updates={
+                    "status": "failed",
+                    "cleanup_state": "cleanup_confirmed",
+                    "finished_at": orchestrator.utc_now_iso(),
+                    "exit_code": 1,
+                },
+                launch_deadline=time.monotonic() + 1,
+            )
+
+        persisted = orchestrator.read_metadata(run_dir)
+        for state in (result, persisted):
+            self.assertEqual(state["status"], "timed_out", state)
+            self.assertTrue(state["timed_out"], state)
+            self.assertEqual(state["exit_code"], 124, state)
+            self.assertEqual(state["terminal_state_count"], 1, state)
+
+    def test_successful_stream_launch_does_not_retain_cleanup_owner(self) -> None:
+        workers: list[subprocess.Popen[bytes]] = []
+        real_spawn = orchestrator._spawn_detached_internal_worker
+
+        def capture_worker(
+            *args: object, **kwargs: object
+        ) -> subprocess.Popen[bytes]:
+            worker = real_spawn(*args, **kwargs)
+            workers.append(worker)
+            return worker
+
+        with patch.object(
+            orchestrator,
+            "_retain_worker_handle",
+            side_effect=AssertionError(
+                "successful detached workers must not use cleanup ownership"
+            ),
+        ), patch.object(
+            orchestrator,
+            "_spawn_detached_internal_worker",
+            side_effect=capture_worker,
+        ):
+            launch = orchestrator.run_streaming_agent(
+                "twelfth detached success",
+                cwd=self.workspace,
+                timeout_seconds=3,
+            )
+
+        self.assertEqual(launch["status"], "starting", launch)
+        self.assertEqual(len(workers), 1, workers)
+        self.assertIsNone(orchestrator._owned_process_record(workers[0]))
+        terminal = self._wait_for_terminal_metadata(
+            self.runs_dir / str(launch["run_id"]), timeout=8
+        )
+        self.assertEqual(terminal["status"], "succeeded", terminal)
+
+    def test_streaming_controller_process_exits_while_worker_runs(self) -> None:
+        controller_workspace = self.workspace / "detached-controller"
+        controller_workspace.mkdir()
+        runtime = controller_workspace / "detached-runtime.py"
+        runtime.write_text(
+            "import sys, time\nsys.stdin.buffer.read()\ntime.sleep(5)\n",
+            encoding="utf-8",
+        )
+        artifact_root = (
+            controller_workspace
+            / orchestrator.AGENT_WORKSPACE_DIRNAME
+            / orchestrator.ARTIFACT_NAMESPACE
+        )
+        controller = controller_workspace / "controller.py"
+        module_root = Path(orchestrator.__file__).resolve().parent
+        controller.write_text(
+            "\n".join(
+                [
+                    "import json, pathlib, sys",
+                    f"sys.path.insert(0, {str(module_root)!r})",
+                    "import cc_orchestrator as o",
+                    "from runtime_security import RuntimeExecutableCandidate, RuntimeSecurityPolicy",
+                    f"workspace = pathlib.Path({str(controller_workspace)!r})",
+                    f"artifact_root = pathlib.Path({str(artifact_root)!r})",
+                    "o.RUNS_DIR = artifact_root / 'runs'",
+                    "o.RUN_INDEX_DIR = o.RUNS_DIR / 'index'",
+                    "o.ARTIFACT_ROOT = artifact_root",
+                    "o.WORKSPACE_ROOT = workspace",
+                    "provider = o.Provider(id='detached-fixture', name='Detached Fixture', app_type='claude', settings={'env': {'ANTHROPIC_API_KEY': 'fixture-detached-key', 'ANTHROPIC_MODEL': 'fixture-model'}}, category=None, provider_type=None, is_current=True, endpoints=[])",
+                    "o.resolve_route = lambda **_kwargs: {'profile': provider.id, 'permission_mode': 'plan', 'timeout_seconds': 8, 'task_type': 'code', 'model_override': None, 'reason': 'fixture'}",
+                    "o.get_provider = lambda _profile: provider",
+                    "o.load_runtime_security_policy = lambda: RuntimeSecurityPolicy.default()",
+                    f"o.resolve_runtime_candidate = lambda _policy: RuntimeExecutableCandidate(canonical_path={str(runtime)!r}, source='fixture', trust_class='trusted_default')",
+                    "o.enforce_cost_guard = lambda _model, timeout: timeout",
+                    "result = o.run_streaming_agent('detached controller probe', cwd=workspace, timeout_seconds=8)",
+                    "print(json.dumps(result), flush=True)",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        controller_process = subprocess.Popen(
+            [sys.executable, str(controller)],
+            cwd=controller_workspace,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+        )
+        started = time.monotonic()
+        try:
+            try:
+                stdout, stderr = controller_process.communicate(timeout=2)
+            except subprocess.TimeoutExpired as exc:
+                controller_process.terminate()
+                try:
+                    controller_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    controller_process.kill()
+                    controller_process.wait(timeout=5)
+                self.fail(f"streaming controller did not exit promptly: {exc}")
+            elapsed = time.monotonic() - started
+            self.assertEqual(controller_process.returncode, 0, stderr)
+            launch = json.loads(stdout.strip().splitlines()[-1])
+            self.assertEqual(launch["status"], "starting", launch)
+            self.assertLess(elapsed, 2.0, elapsed)
+            self.assertTrue(
+                orchestrator.pid_alive(int(launch["worker_pid"])), launch
+            )
+            deadline = time.monotonic() + 12
+            while (
+                time.monotonic() < deadline
+                and orchestrator.pid_alive(int(launch["worker_pid"]))
+            ):
+                time.sleep(0.05)
+            self.assertFalse(
+                orchestrator.pid_alive(int(launch["worker_pid"])), launch
+            )
+            persisted = json.loads(
+                (
+                    artifact_root
+                    / "runs"
+                    / str(launch["run_id"])
+                    / "metadata.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(persisted["status"], "succeeded", persisted)
+            self.assertEqual(
+                persisted["worker_launch"]["controller_handoff"],
+                "accepted",
+                persisted,
+            )
+        finally:
+            if controller_process.poll() is None:
+                controller_process.terminate()
+                try:
+                    controller_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    controller_process.kill()
+                    controller_process.wait(timeout=5)
+
+    def test_background_watcher_failure_never_opens_gate_or_returns_starting(
+        self,
+    ) -> None:
+        real_thread = threading.Thread
+        real_detached_popen = orchestrator._spawn_detached_internal_worker
+
+        for boundary in ("constructor", "start"):
+            with self.subTest(boundary=boundary):
+                prepared = self._prepare_with_timeout(
+                    "streaming", f"twelfth handoff {boundary}", timeout_seconds=3
+                )
+                workers: list[subprocess.Popen[bytes]] = []
+
+                def capture_worker(
+                    *args: object, **kwargs: object
+                ) -> subprocess.Popen[bytes]:
+                    worker = real_detached_popen(*args, **kwargs)
+                    workers.append(worker)
+                    return worker
+
+                def construct_thread(
+                    *args: object, **kwargs: object
+                ) -> threading.Thread | TenthReviewFixture.StartFailingThread:
+                    name = str(kwargs.get("name") or "")
+                    if name.startswith("cc-worker-watcher-"):
+                        if boundary == "constructor":
+                            raise RuntimeError("fixture watcher constructor failure")
+                        return self.StartFailingThread(*args, **kwargs)
+                    return real_thread(*args, **kwargs)
+
+                result: dict[str, object] = {}
+                try:
+                    with patch.object(
+                        orchestrator,
+                        "_spawn_detached_internal_worker",
+                        side_effect=capture_worker,
+                    ), patch.object(
+                        orchestrator.threading,
+                        "Thread",
+                        side_effect=construct_thread,
+                    ):
+                        result = orchestrator.start_prepared_worker_launch(prepared)
+
+                    self.assertEqual(len(workers), 1, result)
+                    run_dir = self.runs_dir / str(result["run_id"])
+                    persisted = orchestrator.read_metadata(run_dir)
+                    self.assertNotEqual(result.get("status"), "starting", result)
+                    self.assertIn(
+                        result.get("status"),
+                        {
+                            "timed_out",
+                            "blocked_runtime_launch",
+                            "cleanup_pending",
+                            "cleanup_incomplete",
+                        },
+                        result,
+                    )
+                    self.assertNotEqual(persisted.get("status"), "starting", persisted)
+                    self.assertFalse(
+                        (run_dir / orchestrator.WORKER_START_GATE_FILENAME).exists()
+                    )
+                    self.assertIsNotNone(workers[0].poll(), result)
+                finally:
+                    for worker in workers:
+                        if worker.poll() is None:
+                            orchestrator._terminate_owned_process(
+                                worker, deadline=time.monotonic() + 2
+                            )
+
+    def test_one_shot_persists_complete_lifecycle_for_all_exit_modes(self) -> None:
+        cases = (
+            (
+                "succeeded",
+                "import sys\nsys.stdin.buffer.read()\nprint('ok', flush=True)\n",
+                3,
+                0,
+            ),
+            (
+                "failed",
+                "import sys\nsys.stdin.buffer.read()\nraise SystemExit(7)\n",
+                3,
+                7,
+            ),
+            (
+                "timed_out",
+                "import sys, time\nsys.stdin.buffer.read()\ntime.sleep(5)\n",
+                1,
+                124,
+            ),
+        )
+        for expected_status, source, timeout_seconds, expected_code in cases:
+            with self.subTest(status=expected_status):
+                self.fake_runtime.write_text(source, encoding="utf-8")
+                prepared = self._prepare_with_timeout(
+                    "one_shot",
+                    f"twelfth one-shot {expected_status}",
+                    timeout_seconds=timeout_seconds,
+                )
+                with patch.object(
+                    orchestrator,
+                    "capture_git_snapshot",
+                    side_effect=lambda *_args, **_kwargs: self._non_git_snapshot(),
+                ), patch.object(
+                    orchestrator,
+                    "_pin_write_scope_policy",
+                    return_value=self._absent_scope_pin(),
+                ):
+                    result = orchestrator.start_prepared_worker_launch(prepared)
+
+                run_dir = self.runs_dir / str(result["run_id"])
+                persisted = orchestrator.read_metadata(run_dir)
+                for state in (result, persisted):
+                    self.assertEqual(state["status"], expected_status, state)
+                    self.assertEqual(state["exit_code"], expected_code, state)
+                    self.assertEqual(state["terminal_state_count"], 1, state)
+                    self.assertEqual(
+                        state["cleanup_state"], "cleanup_confirmed", state
+                    )
+                self.assertEqual(
+                    bool(result.get("timed_out")), expected_status == "timed_out"
+                )
+                self.assertFalse((run_dir / "pid.txt").exists(), persisted)
+
+
 @unittest.skipUnless(os.name == "nt", "Windows tenth-cycle publication regression")
 class TenthReviewWindowsPublicationTests(TenthReviewFixture):
     def test_initial_source_fstat_failure_deletes_retained_source_not_successor(self) -> None:
@@ -7273,7 +9102,7 @@ class TenthReviewWindowsPublicationTests(TenthReviewFixture):
     "requires native unprivileged Ubuntu or macOS",
 )
 class TenthReviewNativePublicationTests(TenthReviewFixture):
-    def test_atomic_replacement_uses_named_source_without_at_empty_path(self) -> None:
+    def test_atomic_replacement_publishes_from_retained_handle(self) -> None:
         run_dir = self.runs_dir / orchestrator.new_run_id()
         orchestrator._set_private_directory(run_dir)
         target = run_dir / "tenth-native-state.json"
@@ -7299,14 +9128,220 @@ class TenthReviewNativePublicationTests(TenthReviewFixture):
                 failure = exc
         self.assertIsNone(failure)
         self.assertEqual(target.read_text(encoding="utf-8"), '{"state":"after"}')
-        self.assertTrue(flags_seen)
-        self.assertTrue(all(flags == 0 for flags in flags_seen), flags_seen)
+        if sys.platform.startswith("linux"):
+            self.assertTrue(flags_seen)
+            self.assertTrue(
+                all(flags in {0x1000, 0x400} for flags in flags_seen),
+                flags_seen,
+            )
+            self.assertNotIn(0, flags_seen)
+        else:
+            self.assertEqual(flags_seen, [])
         leftovers = [
             path.name
             for path in run_dir.iterdir()
             if path.name != target.name
         ]
         self.assertEqual(leftovers, [])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux FD publication")
+    def test_atomic_replacement_ignores_named_source_swap_during_linkat(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        target = run_dir / "native-stat-link-race.json"
+        target.write_text('{"state":"before"}', encoding="utf-8")
+        target.chmod(0o600)
+        real_cdll = ctypes.CDLL
+        libc = real_cdll(None, use_errno=True)
+        swapped = False
+        backup: Path | None = None
+
+        class LibcProxy:
+            def __getattr__(self, name: str) -> object:
+                return getattr(libc, name)
+
+            def linkat(self, *args: object) -> int:
+                nonlocal swapped, backup
+                if not swapped:
+                    sources = [
+                        candidate
+                        for candidate in run_dir.iterdir()
+                        if candidate.name.endswith(".tmp")
+                    ]
+                    if len(sources) != 1:
+                        raise AssertionError(sources)
+                    source = sources[0]
+                    backup = source.with_name(source.name + ".retained")
+                    source.replace(backup)
+                    source.write_text('{"state":"attacker"}', encoding="utf-8")
+                    source.chmod(0o600)
+                    swapped = True
+                return int(libc.linkat(*args))
+
+        try:
+            with patch.object(ctypes, "CDLL", return_value=LibcProxy()):
+                orchestrator._atomic_write_text(target, '{"state":"after"}')
+            self.assertTrue(swapped)
+            self.assertEqual(
+                target.read_text(encoding="utf-8"), '{"state":"after"}'
+            )
+        finally:
+            for path in run_dir.iterdir():
+                if path != target:
+                    path.unlink(missing_ok=True)
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS FD publication")
+    def test_macos_clone_unavailable_fails_closed_without_staging(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        target = run_dir / "native-macos-no-clone.json"
+        real_cdll = ctypes.CDLL
+        libc = real_cdll(None, use_errno=True)
+
+        class LibcProxy:
+            def __getattr__(self, name: str) -> object:
+                return getattr(libc, name)
+
+            def fclonefileat(self, *_args: object) -> int:
+                ctypes.set_errno(errno.ENOTSUP)
+                return -1
+
+        with patch.object(ctypes, "CDLL", return_value=LibcProxy()):
+            with self.assertRaises(orchestrator.OrchestratorError):
+                orchestrator._atomic_write_text(target, '{"state":"after"}')
+
+        self.assertFalse(target.exists())
+        self.assertEqual(list(run_dir.glob("*.staging")), [])
+
+    def test_bound_swap_is_detected_and_previous_target_is_restored(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        target = run_dir / "native-bound-race.json"
+        target.write_text('{"state":"before"}', encoding="utf-8")
+        target.chmod(0o600)
+        real_exchange = orchestrator._exchange_posix_names
+        real_fsync = orchestrator.os.fsync
+        swapped = False
+        events: list[str] = []
+
+        def swap_bound_before_exchange(
+            directory_fd: int, first_name: str, second_name: str
+        ) -> None:
+            nonlocal swapped
+            events.append("exchange")
+            if first_name.endswith(".bound") and not swapped:
+                backup_name = first_name + ".approved"
+                os.replace(
+                    first_name,
+                    backup_name,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                )
+                attacker_fd = os.open(
+                    first_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+                try:
+                    os.write(attacker_fd, b'{"state":"attacker"}')
+                    os.fsync(attacker_fd)
+                finally:
+                    os.close(attacker_fd)
+                swapped = True
+            real_exchange(directory_fd, first_name, second_name)
+
+        def observed_fsync(fd: int) -> None:
+            events.append("fsync")
+            real_fsync(fd)
+
+        try:
+            with patch.object(
+                orchestrator,
+                "_exchange_posix_names",
+                side_effect=swap_bound_before_exchange,
+            ), patch.object(
+                orchestrator.os, "fsync", side_effect=observed_fsync
+            ):
+                with self.assertRaises(orchestrator.OrchestratorError):
+                    orchestrator._atomic_write_text(
+                        target, '{"state":"after"}'
+                    )
+            self.assertTrue(swapped)
+            self.assertEqual(
+                target.read_text(encoding="utf-8"), '{"state":"before"}'
+            )
+            exchange_positions = [
+                index for index, event in enumerate(events) if event == "exchange"
+            ]
+            self.assertEqual(len(exchange_positions), 2, events)
+            self.assertIn("fsync", events[exchange_positions[-1] + 1 :], events)
+        finally:
+            for path in run_dir.iterdir():
+                if path != target:
+                    path.unlink(missing_ok=True)
+
+    def test_exchange_failure_restores_target_and_cleans_bound_generation(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        target = run_dir / "native-exchange-unavailable.json"
+        target.write_text('{"state":"before"}', encoding="utf-8")
+        target.chmod(0o600)
+
+        with patch.object(
+            orchestrator,
+            "_exchange_posix_names",
+            side_effect=orchestrator.OrchestratorError(
+                "fixture exchange unavailable"
+            ),
+        ):
+            with self.assertRaises(orchestrator.OrchestratorError):
+                orchestrator._atomic_write_text(target, '{"state":"after"}')
+
+        self.assertEqual(target.read_text(encoding="utf-8"), '{"state":"before"}')
+        self.assertEqual(list(run_dir.glob("*.bound")), [])
+
+    def test_successor_target_is_restored_when_exchange_detects_generation_drift(
+        self,
+    ) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        target = run_dir / "native-successor-race.json"
+        target.write_text('{"state":"before"}', encoding="utf-8")
+        target.chmod(0o600)
+        successor = run_dir / "native-successor-ready.json"
+        successor.write_text('{"state":"successor"}', encoding="utf-8")
+        successor.chmod(0o600)
+        real_exchange = orchestrator._exchange_posix_names
+        replaced = False
+
+        def install_successor_before_exchange(
+            directory_fd: int, first_name: str, second_name: str
+        ) -> None:
+            nonlocal replaced
+            if not replaced:
+                os.replace(
+                    successor.name,
+                    second_name,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                )
+                replaced = True
+            real_exchange(directory_fd, first_name, second_name)
+
+        with patch.object(
+            orchestrator,
+            "_exchange_posix_names",
+            side_effect=install_successor_before_exchange,
+        ):
+            with self.assertRaises(orchestrator.OrchestratorError):
+                orchestrator._atomic_write_text(target, '{"state":"after"}')
+
+        self.assertTrue(replaced)
+        self.assertEqual(
+            target.read_text(encoding="utf-8"), '{"state":"successor"}'
+        )
+        self.assertEqual(list(run_dir.glob("*.bound")), [])
 
     def test_launch_lock_publication_is_exclusive_and_cleans_named_sources(self) -> None:
         contexts = [
@@ -7532,7 +9567,11 @@ class TenthReviewDeadlineChannelTests(TenthReviewFixture):
                 self.assertTrue(results)
                 self.assertIn(
                     results[0].get("status"),
-                    {"blocked_runtime_security", "blocked_runtime_launch"},
+                    {
+                        "timed_out",
+                        "blocked_runtime_security",
+                        "blocked_runtime_launch",
+                    },
                     results[0],
                 )
         finally:
@@ -7598,6 +9637,7 @@ class TenthReviewDeadlineChannelTests(TenthReviewFixture):
                 self.assertIn(
                     results[0].get("status"),
                     {
+                        "timed_out",
                         "blocked_runtime_launch",
                         "blocked_runtime_security",
                         "cleanup_incomplete",
@@ -8070,6 +10110,904 @@ class ReviewFixWrapperChecks(GuardedLaunchFixture):
                     result = orchestrator.start_prepared_worker_launch(prepared)
                 self.assertEqual(result["status"], "blocked_runtime_identity")
                 self.assertFalse(orchestrator.pid_alive(int(result["child_pid"])))
+
+
+class ThirteenthReviewTerminalAndScrubTests(GuardedLaunchFixture):
+    def _scope_pin(self) -> dict[str, object]:
+        return {
+            "path": str(
+                self.workspace
+                / ".claude-code-orchestrator"
+                / "write-scope.json"
+            ),
+            "exists": False,
+            "sha256": None,
+            "scope": None,
+        }
+
+    def test_blocked_launch_keeps_timeout_primary_when_persistence_fails(
+        self,
+    ) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        metadata = {"run_id": run_dir.name, "terminal_state_count": 0}
+        with patch.object(
+            orchestrator,
+            "artifact_lock",
+            side_effect=OSError("fixture persistence failure"),
+        ):
+            result = orchestrator._record_blocked_launch(
+                run_dir,
+                metadata,
+                status="blocked_runtime_launch",
+                error=orchestrator._launch_failure_error(
+                    "fixture_timeout", "Fixture timeout."
+                ),
+                timed_out=True,
+                stop_reason="timeout",
+            )
+        self.assertEqual(result["status"], "timed_out", result)
+        self.assertTrue(result["timed_out"], result)
+        self.assertEqual(result["exit_code"], 124, result)
+        self.assertFalse(result["persisted"], result)
+
+    def test_terminal_scope_is_not_called_after_timeout(self) -> None:
+        with patch.object(
+            orchestrator,
+            "_check_write_scope_with_evidence",
+            side_effect=AssertionError(
+                "scope business checks must not run after timeout"
+            ),
+        ) as scope_check:
+            evidence, failed, crossed = (
+                orchestrator._terminal_write_scope_evidence(
+                    "scope-timeout-fixture",
+                    self.workspace,
+                    {},
+                    {},
+                    self._scope_pin(),
+                    timed_out=True,
+                )
+            )
+        scope_check.assert_not_called()
+        self.assertFalse(failed)
+        self.assertFalse(crossed)
+        self.assertEqual(
+            evidence["violations"][0]["type"],
+            "write_scope_not_evaluated_due_to_timeout",
+        )
+
+    def test_terminal_scope_timeout_error_is_not_downgraded(self) -> None:
+        with patch.object(
+            orchestrator,
+            "_check_write_scope_with_evidence",
+            side_effect=TimeoutError("fixture scope deadline"),
+        ):
+            evidence, failed, crossed = (
+                orchestrator._terminal_write_scope_evidence(
+                    "scope-crossed-fixture",
+                    self.workspace,
+                    {},
+                    {},
+                    self._scope_pin(),
+                    timed_out=False,
+                )
+            )
+        self.assertFalse(failed)
+        self.assertTrue(crossed)
+        self.assertEqual(
+            evidence["violations"][0]["type"],
+            "write_scope_not_evaluated_due_to_timeout",
+        )
+
+    def test_terminal_scope_checks_current_deadline_before_call(self) -> None:
+        token = orchestrator._OPERATION_DEADLINE.set(
+            time.monotonic() - 0.01
+        )
+        try:
+            with patch.object(
+                orchestrator,
+                "_check_write_scope_with_evidence",
+                side_effect=AssertionError(
+                    "expired context must block scope checker"
+                ),
+            ) as scope_check:
+                evidence, failed, crossed = (
+                    orchestrator._terminal_write_scope_evidence(
+                        "scope-context-expired",
+                        self.workspace,
+                        {},
+                        {},
+                        self._scope_pin(),
+                        timed_out=False,
+                    )
+                )
+            scope_check.assert_not_called()
+            self.assertFalse(failed)
+            self.assertTrue(crossed)
+            self.assertEqual(
+                evidence["violations"][0]["type"],
+                "write_scope_not_evaluated_due_to_timeout",
+            )
+        finally:
+            orchestrator._OPERATION_DEADLINE.reset(token)
+
+    def test_worker_security_failure_persists_expired_gate_as_timeout(
+        self,
+    ) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        orchestrator.write_metadata(
+            run_dir,
+            {
+                "run_id": run_dir.name,
+                "status": "starting",
+                "worker_pid": os.getpid(),
+                "transaction_deadline_monotonic": time.monotonic() - 0.01,
+                "terminal_state_count": 0,
+            },
+        )
+        token = orchestrator._OPERATION_DEADLINE.set(
+            time.monotonic() - 0.01
+        )
+        try:
+            result = orchestrator._worker_security_failure(
+                run_dir,
+                orchestrator._runtime_not_trusted(
+                    "Fixture authorization gate expired."
+                ),
+            )
+        finally:
+            orchestrator._OPERATION_DEADLINE.reset(token)
+        persisted = orchestrator.read_metadata(run_dir)
+        for state in (result, persisted):
+            self.assertEqual(state["status"], "timed_out", state)
+            self.assertTrue(state["timed_out"], state)
+            self.assertEqual(state["stop_reason"], "timeout", state)
+            self.assertEqual(state["exit_code"], 124, state)
+        self.assertEqual(persisted["terminal_state_count"], 1, persisted)
+
+    def test_scope_policy_drift_does_not_swallow_timeout(self) -> None:
+        pinned = self._scope_pin()
+        with patch.object(
+            orchestrator,
+            "_read_bounded_regular_file",
+            side_effect=TimeoutError("fixture policy deadline"),
+        ):
+            with self.assertRaises(TimeoutError):
+                orchestrator._write_scope_policy_drift(pinned)
+
+    def test_controller_pipe_timeout_reaches_cleanup_pending_evidence(
+        self,
+    ) -> None:
+        prepared = self._prepare("streaming")
+        workers: list[subprocess.Popen[bytes]] = []
+        pending_updates: list[dict[str, object]] = []
+        real_spawn = orchestrator._spawn_detached_internal_worker
+
+        def capture_worker(
+            *args: object, **kwargs: object
+        ) -> subprocess.Popen[bytes]:
+            worker = real_spawn(*args, **kwargs)
+            workers.append(worker)
+            return worker
+
+        def capture_pending(
+            _metadata: object,
+            _process: object,
+            _sensitive_values: object = (),
+            _threads: object = (),
+            *,
+            response_updates: object = None,
+            attempt_deadline: object = None,
+        ) -> dict[str, object]:
+            del attempt_deadline
+            updates = dict(response_updates or {})
+            pending_updates.append(updates)
+            return {"status": "cleanup_pending", **updates}
+
+        try:
+            with patch.object(
+                orchestrator,
+                "_spawn_detached_internal_worker",
+                side_effect=capture_worker,
+            ), patch.object(
+                orchestrator,
+                "_write_pipe_chunk",
+                side_effect=TimeoutError("fixture controller pipe timeout"),
+            ), patch.object(
+                orchestrator, "_terminate_owned_process", return_value=False
+            ), patch.object(
+                orchestrator,
+                "_cleanup_pending_response",
+                side_effect=capture_pending,
+            ):
+                result = orchestrator.start_prepared_worker_launch(prepared)
+            self.assertEqual(len(workers), 1, workers)
+            self.assertEqual(len(pending_updates), 1, pending_updates)
+            self.assertTrue(result["timed_out"], result)
+            self.assertEqual(result["stop_reason"], "timeout", result)
+            self.assertEqual(result["exit_code"], 124, result)
+        finally:
+            for worker in workers:
+                if worker.stdin is not None:
+                    worker.stdin.close()
+                if worker.poll() is None:
+                    worker.terminate()
+                    try:
+                        worker.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        worker.kill()
+                        worker.wait(timeout=5)
+                record = orchestrator._owned_process_record(worker)
+                if record is not None:
+                    orchestrator._remove_owned_process_record(record)
+
+    def test_stream_child_identity_timeout_is_terminal_timeout(self) -> None:
+        prepared = self._prepare("streaming", prompt="")
+        metadata = prepared.metadata()
+        run_dir = self.runs_dir / str(metadata["run_id"])
+        orchestrator._set_private_directory(run_dir)
+        for name in ("stdout.txt", "stderr.txt", "events.ndjson"):
+            orchestrator._atomic_write_text(run_dir / name, "")
+        nonce = prepared.launch_spec.launch_nonce
+        worker_identity = capture_process_identity(
+            os.getpid(), launch_nonce=nonce
+        )
+        metadata.update(
+            {
+                "status": "starting",
+                "runtime_launch": prepared.launch_spec.public_metadata(),
+                "worker_pid": os.getpid(),
+                "worker_process_identity": worker_identity.to_dict(),
+                "controller_pid": worker_identity.parent_pid,
+                "transaction_deadline_monotonic": time.monotonic() + 3,
+                "worker_launch": {
+                    "nonce_consumed": False,
+                    "nonce_expires_at": "2999-01-01T00:00:00+00:00",
+                    "start_gate": "closed",
+                    "controller_handoff": "pending",
+                },
+            }
+        )
+        orchestrator.write_metadata(run_dir, metadata)
+        self._publish_worker_gate(run_dir, metadata)
+        frame = prepared.launch_spec.private_frame()
+        protocol = (
+            len(frame).to_bytes(8, "big")
+            + frame
+            + len(prepared.prompt_bytes).to_bytes(8, "big")
+            + prepared.prompt_bytes
+        )
+        environment = dict(prepared.launch_spec.environment)
+        environment[orchestrator.INTERNAL_WORKER_NONCE_ENV] = nonce
+        real_capture = orchestrator.capture_process_identity
+        real_popen = subprocess.Popen
+        children: list[subprocess.Popen[bytes]] = []
+
+        def capture_child(
+            *args: object, **kwargs: object
+        ) -> subprocess.Popen[bytes]:
+            child = real_popen(*args, **kwargs)
+            children.append(child)
+            return child
+
+        def timeout_child_identity(
+            pid: int, *, launch_nonce: str
+        ) -> ProcessIdentity:
+            if pid != os.getpid():
+                raise TimeoutError("fixture child identity deadline")
+            return real_capture(pid, launch_nonce=launch_nonce)
+
+        try:
+            with patch.dict(os.environ, environment, clear=True), patch.object(
+                sys,
+                "stdin",
+                type("FixtureStdin", (), {"buffer": io.BytesIO(protocol)})(),
+            ), patch.object(
+                orchestrator.subprocess,
+                "Popen",
+                side_effect=capture_child,
+            ), patch.object(
+                orchestrator,
+                "capture_process_identity",
+                side_effect=timeout_child_identity,
+            ):
+                result = orchestrator.stream_worker(run_dir.name)
+            self.assertEqual(result["status"], "timed_out", result)
+            self.assertTrue(result["timed_out"], result)
+            self.assertEqual(result["stop_reason"], "timeout", result)
+            self.assertEqual(result["exit_code"], 124, result)
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.terminate()
+                    try:
+                        child.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        child.kill()
+                        child.wait(timeout=5)
+                record = orchestrator._owned_process_record(child)
+                if record is not None:
+                    orchestrator._remove_owned_process_record(record)
+
+    def test_cleanup_pending_forwards_caller_attempt_deadline(self) -> None:
+        process = TenthReviewFixture.FakeProcess(912999)
+        durable_deadline = time.monotonic() + 10
+        caller_deadline = time.monotonic() + 1
+        record = orchestrator._ensure_owned_process_record(
+            process, deadline=durable_deadline
+        )
+        captured: list[float | None] = []
+
+        def capture_owner(
+            _record: object, **kwargs: object
+        ) -> bool:
+            captured.append(kwargs.get("attempt_deadline"))
+            return True
+
+        token = orchestrator._OPERATION_DEADLINE.set(caller_deadline)
+        try:
+            with patch.object(
+                orchestrator,
+                "_start_owned_process_owner",
+                side_effect=capture_owner,
+            ):
+                result = orchestrator._cleanup_pending_response({}, process)
+            self.assertEqual(result["status"], "cleanup_pending", result)
+            self.assertEqual(captured, [caller_deadline])
+            self.assertLess(captured[0], durable_deadline)
+        finally:
+            orchestrator._OPERATION_DEADLINE.reset(token)
+            orchestrator._remove_owned_process_record(record)
+
+    def test_cleanup_pending_infers_expired_transaction_timeout(self) -> None:
+        process = TenthReviewFixture.FakeProcess(912998)
+        record = orchestrator._ensure_owned_process_record(
+            process, deadline=time.monotonic() + 2
+        )
+        try:
+            record.cleanup_result = "cleanup_incomplete"
+            record.state = "cleanup_incomplete"
+            record.completed.set()
+            result = orchestrator._cleanup_pending_response(
+                {
+                    "run_id": "",
+                    "transaction_deadline_monotonic": (
+                        time.monotonic() - 0.01
+                    ),
+                },
+                process,
+                attempt_deadline=time.monotonic() + 1,
+            )
+            self.assertEqual(result["status"], "timed_out", result)
+            self.assertTrue(result["timed_out"], result)
+            self.assertEqual(result["stop_reason"], "timeout", result)
+            self.assertEqual(result["exit_code"], 124, result)
+        finally:
+            orchestrator._remove_owned_process_record(record)
+
+    def test_cleanup_owner_receives_shorter_attempt_deadline(self) -> None:
+        process = TenthReviewFixture.FakeProcess(913000)
+        durable_deadline = time.monotonic() + 10
+        attempt_deadline = time.monotonic() + 2
+        record = orchestrator._ensure_owned_process_record(
+            process, deadline=durable_deadline
+        )
+        captured_deadlines: list[float] = []
+        release_owner = threading.Event()
+
+        def owner_probe(
+            probe_record: object,
+            owner_token: str,
+            deadline: float,
+            ready: threading.Event,
+            commit: threading.Event,
+            cancel: threading.Event,
+            accepted: threading.Event,
+            threads: tuple[threading.Thread, ...],
+            on_complete: object,
+        ) -> None:
+            del owner_token, threads
+            captured_deadlines.append(deadline)
+            ready.set()
+            commit.wait(timeout=1)
+            if cancel.is_set():
+                return
+            accepted.set()
+            release_owner.wait(timeout=2)
+            assert probe_record is record
+            with record.lock:
+                record.cleanup_result = "cleanup_confirmed"
+                record.state = "cleanup_complete"
+                record.completed.set()
+            assert callable(on_complete)
+            on_complete(record)
+
+        try:
+            with patch.object(
+                orchestrator,
+                "_owned_process_owner_main",
+                side_effect=owner_probe,
+            ):
+                transferred = orchestrator._start_owned_process_owner(
+                    record,
+                    owner_name="cc-owner-short-deadline-fixture",
+                    request_cleanup=True,
+                    attempt_deadline=attempt_deadline,
+                )
+                self.assertTrue(transferred)
+                self.assertEqual(captured_deadlines, [attempt_deadline])
+                self.assertLess(captured_deadlines[0], durable_deadline)
+                release_owner.set()
+                assert record.owner is not None
+                record.owner.join(timeout=2)
+                self.assertFalse(record.owner.is_alive())
+        finally:
+            release_owner.set()
+            if record.owner is not None and record.owner.is_alive():
+                record.owner.join(timeout=2)
+            orchestrator._remove_owned_process_record(record)
+
+    def test_real_cleanup_owner_exits_at_shorter_attempt_deadline(self) -> None:
+        process = TenthReviewFixture.FakeProcess(
+            913003, ignore_terminate=True
+        )
+        durable_deadline = time.monotonic() + 5
+        attempt_deadline = time.monotonic() + 0.15
+        record = orchestrator._ensure_owned_process_record(
+            process, deadline=durable_deadline
+        )
+        owner: threading.Thread | None = None
+        started = time.monotonic()
+        try:
+            transferred = orchestrator._start_owned_process_owner(
+                record,
+                owner_name="cc-real-owner-short-deadline-fixture",
+                request_cleanup=False,
+                attempt_deadline=attempt_deadline,
+            )
+            self.assertTrue(transferred)
+            owner = record.owner
+            self.assertIsNotNone(owner)
+            assert owner is not None
+            owner.join(timeout=0.6)
+            elapsed = time.monotonic() - started
+            self.assertFalse(owner.is_alive(), elapsed)
+            self.assertLess(elapsed, 0.6)
+            self.assertTrue(process.wait_timeouts)
+            self.assertTrue(
+                all(
+                    timeout is not None and 0 <= timeout <= 0.051
+                    for timeout in process.wait_timeouts
+                ),
+                process.wait_timeouts[-10:],
+            )
+            self.assertLess(attempt_deadline, durable_deadline)
+        finally:
+            record.request_termination()
+            if owner is not None and owner.is_alive():
+                owner.join(timeout=1)
+            if orchestrator._owned_process_record(process) is record:
+                orchestrator._remove_owned_process_record(record)
+
+    def test_detached_worker_gets_fixed_provisional_ownership(self) -> None:
+        ownership_deadline = time.monotonic() + 3
+        worker = orchestrator._spawn_detached_internal_worker(
+            [
+                str(Path(sys.executable).resolve()),
+                "-c",
+                "import time; time.sleep(30)",
+            ],
+            ownership_deadline=ownership_deadline,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            record = orchestrator._owned_process_record(worker)
+            self.assertIsNotNone(record)
+            assert record is not None
+            self.assertEqual(record.deadline, ownership_deadline)
+            self.assertEqual(record.state, "caller_owned")
+            self.assertTrue(orchestrator._detach_owned_process_record(worker))
+            self.assertIsNone(orchestrator._owned_process_record(worker))
+            self.assertIsNone(worker.poll())
+        finally:
+            if worker.poll() is None:
+                worker.terminate()
+                try:
+                    worker.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    worker.kill()
+                    worker.wait(timeout=5)
+            record = orchestrator._owned_process_record(worker)
+            if record is not None:
+                orchestrator._remove_owned_process_record(record)
+
+    def test_timeout_cleanup_response_updates_are_primary_evidence(self) -> None:
+        self.assertEqual(
+            orchestrator._worker_cleanup_response_updates(
+                timed_out=True, stopped=True
+            ),
+            {
+                "timed_out": True,
+                "stop_reason": "timeout",
+                "exit_code": 124,
+            },
+        )
+
+    def test_stream_cleanup_loop_stops_at_fixed_deadline(self) -> None:
+        with patch.object(
+            orchestrator.time,
+            "sleep",
+            side_effect=AssertionError("expired cleanup must not sleep"),
+        ):
+            self.assertFalse(
+                orchestrator._sleep_stream_worker_iteration(
+                    time.monotonic() - 0.001,
+                    termination_requested=True,
+                )
+            )
+
+    def test_timeout_cleanup_uses_fixed_durable_ownership_deadline(self) -> None:
+        process = TenthReviewFixture.FakeProcess(913001)
+        requested = time.monotonic() - 1.0
+        durable = time.monotonic() + 1.0
+        record = orchestrator._ensure_owned_process_record(
+            process, deadline=durable
+        )
+        try:
+            self.assertEqual(
+                orchestrator._owned_process_cleanup_deadline(
+                    process, requested, timeout_evidence=True
+                ),
+                durable,
+            )
+            self.assertEqual(
+                orchestrator._owned_process_cleanup_deadline(
+                    process,
+                    time.monotonic() + 30.0,
+                    timeout_evidence=True,
+                ),
+                durable,
+            )
+            self.assertEqual(
+                orchestrator._owned_process_cleanup_deadline(
+                    process, requested, timeout_evidence=False
+                ),
+                requested,
+            )
+        finally:
+            orchestrator._remove_owned_process_record(record)
+
+    def test_timeout_status_survives_unconfirmed_cleanup(self) -> None:
+        process = TenthReviewFixture.FakeProcess(913002)
+        record = orchestrator._ensure_owned_process_record(
+            process, deadline=time.monotonic() + 1.0
+        )
+        try:
+            record.cleanup_result = "cleanup_incomplete"
+            record.state = "cleanup_incomplete"
+            record.completed.set()
+            result = orchestrator._cleanup_pending_response(
+                {
+                    "run_id": "",
+                    "timed_out": True,
+                    "stop_reason": "timeout",
+                },
+                process,
+                response_updates={"exit_code": 124},
+            )
+            self.assertEqual(result["status"], "timed_out", result)
+            self.assertEqual(result["exit_code"], 124, result)
+            self.assertTrue(result["timed_out"], result)
+            self.assertEqual(
+                result["cleanup_state"], "cleanup_incomplete", result
+            )
+        finally:
+            orchestrator._remove_owned_process_record(record)
+
+    def test_malformed_http_endpoint_is_fail_closed(self) -> None:
+        malformed_values = (
+            "https://user:plainpass@[bad/path?token=plainquery",
+            "https:/user:plainpass@example.invalid/path?token=plainquery",
+        )
+        for malformed in malformed_values:
+            with self.subTest(endpoint=malformed):
+                sensitive = orchestrator._endpoint_sensitive_values(malformed)
+                projected = orchestrator._scrub_guarded_value(
+                    {"endpoint": malformed, "message": f"route={malformed}"},
+                    sensitive,
+                )
+
+                self.assertEqual(
+                    orchestrator._sanitize_endpoint(malformed),
+                    orchestrator.SCRUBBED_VALUE,
+                )
+                self.assertNotIn("plainpass", json.dumps(projected))
+                self.assertNotIn("plainquery", json.dumps(projected))
+
+    def test_endpoint_path_never_rewrites_terminal_field_names(self) -> None:
+        endpoint = "https://example.invalid/status"
+        sensitive = orchestrator._endpoint_sensitive_values(endpoint)
+        projected = orchestrator._scrub_guarded_value(
+            {
+                "status": "succeeded",
+                "nested": {"status": "running"},
+                "workspace_root": "/home/user/project",
+            },
+            sensitive,
+        )
+
+        self.assertEqual(
+            set(projected), {"status", "nested", "workspace_root"}
+        )
+        self.assertIn("status", projected["nested"])
+        self.assertEqual(projected["status"], "succeeded")
+        self.assertEqual(projected["workspace_root"], "/home/user/project")
+
+        root_sensitive = orchestrator._endpoint_sensitive_values(
+            "https://example.invalid/"
+        )
+        root_projected = orchestrator._scrub_guarded_value(
+            {"workspace_root": "/home/user/project"}, root_sensitive
+        )
+        self.assertEqual(root_projected["workspace_root"], "/home/user/project")
+
+    def test_one_shot_terminal_precommit_promotes_crossed_deadline_to_timeout(
+        self,
+    ) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        metadata = {
+            "run_id": run_dir.name,
+            "status": "running",
+            "cleanup_state": "cleanup_confirmed",
+            "terminal_state_count": 0,
+        }
+        orchestrator.write_metadata(run_dir, metadata)
+        launch_deadline = time.monotonic() + 10
+        real_replace = orchestrator._replace_prepared_atomic_write
+        crossed = False
+
+        def cross_at_precommit(
+            prepared_path: Path,
+            path: Path,
+            *,
+            deadline: float | None = None,
+            precommit: object | None = None,
+        ) -> None:
+            nonlocal crossed
+            if precommit is not None and not crossed:
+                crossed = True
+                with patch.object(
+                    orchestrator.time,
+                    "monotonic",
+                    return_value=launch_deadline + 0.01,
+                ):
+                    precommit()
+            real_replace(
+                prepared_path,
+                path,
+                deadline=deadline,
+                precommit=precommit,
+            )
+
+        with patch.object(
+            orchestrator,
+            "_replace_prepared_atomic_write",
+            side_effect=cross_at_precommit,
+        ):
+            result = orchestrator._persist_terminal_state(
+                run_dir,
+                metadata,
+                updates={"status": "succeeded", "exit_code": 0},
+                launch_deadline=launch_deadline,
+            )
+
+        persisted = orchestrator.read_metadata(run_dir)
+        self.assertTrue(crossed)
+        for state in (result, persisted):
+            self.assertEqual(state["status"], "timed_out", state)
+            self.assertTrue(state["timed_out"], state)
+            self.assertEqual(state["exit_code"], 124, state)
+            self.assertEqual(state["terminal_state_count"], 1, state)
+
+    def test_terminal_timeout_promotion_rewrites_process_exit_event(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        metadata = {
+            "run_id": run_dir.name,
+            "status": "running",
+            "cleanup_state": "cleanup_confirmed",
+            "terminal_state_count": 0,
+        }
+        orchestrator.write_metadata(run_dir, metadata)
+        (run_dir / "events.ndjson").write_text("", encoding="utf-8")
+
+        result = orchestrator._persist_terminal_state(
+            run_dir,
+            metadata,
+            updates={"status": "succeeded", "exit_code": 0},
+            event={"type": "process_exited", "status": "succeeded", "exit_code": 0},
+            launch_deadline=time.monotonic() - 0.01,
+        )
+
+        events = orchestrator.read_events(run_dir / "events.ndjson")
+        self.assertEqual(result["status"], "timed_out", result)
+        self.assertEqual(events[-1]["status"], "timed_out", events)
+        self.assertEqual(events[-1]["exit_code"], 124, events)
+
+    def test_team_worker_waits_for_controller_registration_before_nonce(self) -> None:
+        prepared = self._prepare("streaming")
+        run_dir, metadata = orchestrator._initialize_prepared_run(prepared)
+        nonce = prepared.launch_spec.launch_nonce
+        identity = capture_process_identity(os.getpid(), launch_nonce=nonce)
+        launch = dict(metadata["worker_launch"])
+        launch["controller_handoff"] = "team_managed"
+        orchestrator.update_metadata(
+            run_dir,
+            team_id="team-registration-race",
+            controller_pid=identity.parent_pid,
+            worker_launch=launch,
+        )
+
+        def register_worker() -> None:
+            time.sleep(0.05)
+            orchestrator.update_metadata(
+                run_dir,
+                worker_pid=os.getpid(),
+                worker_process_identity=identity.to_dict(),
+            )
+
+        registration = threading.Thread(target=register_worker, daemon=True)
+        registration.start()
+        try:
+            consumed = orchestrator._consume_worker_nonce(run_dir, nonce)
+        finally:
+            registration.join(timeout=2)
+
+        self.assertTrue(consumed["worker_launch"]["nonce_consumed"])
+        self.assertEqual(
+            consumed["worker_launch"]["controller_handoff"], "team_managed"
+        )
+
+    def test_handoff_acceptance_rechecks_worker_at_atomic_precommit(self) -> None:
+        worker = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        nonce = "handoff-precommit-nonce"
+        identity = capture_process_identity(worker.pid, launch_nonce=nonce)
+        metadata = {
+            "run_id": run_dir.name,
+            "status": "starting",
+            "worker_pid": worker.pid,
+            "worker_process_identity": identity.to_dict(),
+            "terminal_state_count": 0,
+            "worker_launch": {
+                "nonce_consumed": True,
+                "controller_handoff": "ready",
+            },
+        }
+        orchestrator.write_metadata(run_dir, metadata)
+        real_replace = orchestrator._replace_prepared_atomic_write
+        stopped = False
+
+        def stop_before_commit(
+            prepared_path: Path,
+            path: Path,
+            *,
+            deadline: float | None = None,
+            precommit: object | None = None,
+        ) -> None:
+            nonlocal stopped
+            if precommit is not None and not stopped:
+                stopped = True
+                worker.terminate()
+                worker.wait(timeout=5)
+            real_replace(
+                prepared_path,
+                path,
+                deadline=deadline,
+                precommit=precommit,
+            )
+
+        try:
+            with patch.object(
+                orchestrator,
+                "_replace_prepared_atomic_write",
+                side_effect=stop_before_commit,
+            ):
+                with self.assertRaises(orchestrator.OrchestratorError):
+                    orchestrator._accept_worker_handoff(
+                        run_dir, worker, launch_nonce=nonce
+                    )
+            persisted = orchestrator.read_metadata(run_dir)
+            self.assertTrue(stopped)
+            self.assertEqual(
+                persisted["worker_launch"]["controller_handoff"], "ready"
+            )
+        finally:
+            if worker.poll() is None:
+                worker.kill()
+                worker.wait(timeout=5)
+
+    def test_handoff_rejects_live_identity_from_a_different_process(self) -> None:
+        worker = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        other = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        nonce = "handoff-wrong-live-identity"
+        other_identity = capture_process_identity(other.pid, launch_nonce=nonce)
+        metadata = {
+            "run_id": run_dir.name,
+            "status": "starting",
+            "worker_pid": worker.pid,
+            "worker_process_identity": other_identity.to_dict(),
+            "terminal_state_count": 0,
+            "worker_launch": {
+                "nonce_consumed": True,
+                "controller_handoff": "ready",
+            },
+        }
+        orchestrator.write_metadata(run_dir, metadata)
+        try:
+            with self.assertRaises(orchestrator.OrchestratorError):
+                orchestrator._accept_worker_handoff(
+                    run_dir, worker, launch_nonce=nonce
+                )
+            persisted = orchestrator.read_metadata(run_dir)
+            self.assertEqual(
+                persisted["worker_launch"]["controller_handoff"], "ready"
+            )
+        finally:
+            for process in (worker, other):
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+
+    def test_stream_worker_fallback_preserves_crossed_deadline(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        metadata = {
+            "run_id": run_dir.name,
+            "status": "running",
+            "child_pid": os.getpid(),
+            "cleanup_state": "cleanup_confirmed",
+            "terminal_state_count": 0,
+            "transaction_deadline_monotonic": time.monotonic() - 0.01,
+        }
+        orchestrator.write_metadata(run_dir, metadata)
+        (run_dir / "events.ndjson").write_text("", encoding="utf-8")
+
+        with patch.object(
+            orchestrator,
+            "_stream_worker_inner",
+            side_effect=OSError("fixture post-run finalization failure"),
+        ):
+            result = orchestrator.stream_worker(run_dir.name)
+
+        persisted = orchestrator.read_metadata(run_dir)
+        for state in (result, persisted):
+            self.assertEqual(state["status"], "timed_out", state)
+            self.assertTrue(state["timed_out"], state)
+            self.assertEqual(state["exit_code"], 124, state)
 
 
 if __name__ == "__main__":
