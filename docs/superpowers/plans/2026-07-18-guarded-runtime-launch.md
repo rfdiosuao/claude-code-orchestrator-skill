@@ -868,6 +868,14 @@ def terminate_process_tree(
     force: bool = False,
     wait_seconds: int = 5,
 ) -> dict[str, Any]:
+    if sys.platform != "win32":
+        return {
+            "pid": expected_identity.pid,
+            "attempted": False,
+            "alive": True,
+            "identity_state": "unverified",
+            "differing_fields": ["process_tree_containment"],
+        }
     capability = open_stable_process_capability(expected_identity)
     if capability.state != "match":
         return {
@@ -880,9 +888,9 @@ def terminate_process_tree(
     return capability.terminate(force=force, wait_seconds=wait_seconds)
 ```
 
-Do not retain a public overload that accepts an integer PID. `open_stable_process_capability` returns only a Windows process handle whose creation/image evidence was queried from that same handle, or a Linux pidfd opened before identity comparison. macOS and other platforms return `unverified` for controller-originated emergency termination. `taskkill`, controller-side `kill(pid)`, and controller-side `killpg` are removed.
+Do not retain a public overload that accepts an integer PID. `open_stable_process_capability` can represent a Windows process handle whose creation/image evidence was queried from that same handle or a Linux pidfd opened before identity comparison, but a Linux pidfd proves only one process and therefore cannot authorize process-tree termination. Every POSIX platform returns `unverified` for controller-originated emergency tree termination. `taskkill`, controller-side `kill(pid)`, and controller-side `killpg` are removed.
 
-Normal background stop is cooperative and capability-oriented: the controller writes a nonce-bound stop request, and the still-running worker uses its owned `Popen` handle plus Windows Job Object or live POSIX process group to stop the child tree. Windows workers assign the runtime to a Job Object with kill-on-worker-close. Linux children set a parent-death signal before exec. If cooperative stop fails, emergency termination targets only the verified worker capability; unsupported platforms fail closed and report the child tree as still requiring manual review.
+Normal background stop is cooperative and capability-oriented: the controller writes a nonce-bound stop request, and the still-running worker uses its owned `Popen` handle plus the Windows Job Object to stop the child tree. Windows workers assign the runtime to a Job Object with kill-on-worker-close. Review established that Linux parent-death signals and process groups do not contain escaped or orphaned descendants, so production POSIX launch fails closed until a cgroup-v2 `cgroup.kill` guardian or equivalent kernel-enforced whole-tree backend is available. The built-in fake runtime retains a test-only process-group path. If cooperative stop fails, emergency termination targets only the verified Windows worker capability; unsupported platforms fail closed and report the containment repair action.
 
 - [ ] **Step 4: Make status identity-aware**
 
@@ -890,7 +898,7 @@ Normal background stop is cooperative and capability-oriented: the controller wr
 
 - [ ] **Step 5: Guard explicit and indirect stops**
 
-Update `stop_run`, streaming timeout/output budget, queue timeout/cancel, workflow stop, team rollback, and follow-up pre-stop to verify the worker identity, write a nonce-bound cooperative request, and let the worker terminate its owned child tree. Only the stable-capability emergency helper may signal from the controller. Identity mismatch emits `process_identity_mismatch`; missing capability/evidence emits `process_identity_unverified`. Verify identity before writing `stop-requested.json` or changing status to `stop_requested`. A failed stop blocks a follow-up restart unless the previous process is proven exited, and aggregate operations do not mark a node/team/job cancelled when any required stop is unverified.
+Update `stop_run`, streaming timeout/output budget, queue timeout/cancel, workflow stop, team rollback, and follow-up pre-stop to verify the worker identity, write a nonce-bound cooperative request, and let the worker terminate its owned child tree. Only the Windows stable-capability emergency helper may signal from the controller, and only because the worker tree is Job-contained. POSIX cooperative timeout returns `cleanup_incomplete` without signaling a single PID. Identity mismatch emits `process_identity_mismatch`; missing capability/evidence emits `process_identity_unverified`. Verify identity before writing `stop-requested.json` or changing status to `stop_requested`. A failed stop blocks a follow-up restart unless the previous process is proven exited, and aggregate operations do not mark a node/team/job cancelled when any required stop is unverified.
 
 - [ ] **Step 6: Add harmless real PID-reuse simulation**
 

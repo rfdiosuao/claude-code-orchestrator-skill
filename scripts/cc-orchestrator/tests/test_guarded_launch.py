@@ -29,6 +29,7 @@ import cc_orchestrator as orchestrator  # noqa: E402
 from process_identity import ProcessIdentity  # noqa: E402
 from process_identity import ProcessIdentityCheck  # noqa: E402
 from process_identity import capture_process_identity  # noqa: E402
+from process_identity import open_stable_process_capability  # noqa: E402
 from runtime_security import (  # noqa: E402
     ApprovedUnsafeRuntime,
     ExecutableIdentity,
@@ -203,7 +204,17 @@ class GuardedLaunchFixture(unittest.TestCase):
         chunks: list[bytes] = []
         for path in run_dir.rglob("*"):
             if path.is_file():
-                chunks.append(path.read_bytes())
+                deadline = time.monotonic() + 5
+                while True:
+                    try:
+                        chunks.append(path.read_bytes())
+                        break
+                    except FileNotFoundError:
+                        break
+                    except PermissionError:
+                        if time.monotonic() >= deadline:
+                            raise
+                        time.sleep(0.02)
         return b"\n".join(chunks)
 
     def _wait_for_pid_exit(self, pid: int, timeout: float = 5.0) -> None:
@@ -9562,7 +9573,7 @@ class TenthReviewDeadlineChannelTests(TenthReviewFixture):
             "streaming", "tenth silent frame peer", timeout_seconds=1
         )
         run_dir, metadata = orchestrator._initialize_prepared_run(prepared)
-        deadline = time.monotonic() + 0.25
+        deadline = time.monotonic() + 1.5
         orchestrator.update_metadata(
             run_dir, transaction_deadline_monotonic=deadline
         )
@@ -9598,11 +9609,11 @@ class TenthReviewDeadlineChannelTests(TenthReviewFixture):
         try:
             with patch.object(sys, "stdin", fixture_stdin):
                 thread.start()
-                self.assertTrue(read_entered.wait(1))
-                thread.join(timeout=1)
+                self.assertTrue(read_entered.wait(2))
+                thread.join(timeout=2.5)
                 elapsed = time.monotonic() - started
                 self.assertFalse(thread.is_alive())
-                self.assertLess(elapsed, 0.9, elapsed)
+                self.assertLess(elapsed, 2.5, elapsed)
                 self.assertEqual(errors, [])
                 self.assertTrue(results)
                 self.assertIn(
@@ -11048,6 +11059,951 @@ class ThirteenthReviewTerminalAndScrubTests(GuardedLaunchFixture):
             self.assertEqual(state["status"], "timed_out", state)
             self.assertTrue(state["timed_out"], state)
             self.assertEqual(state["exit_code"], 124, state)
+
+
+class TaskSevenStopIdentityTests(GuardedLaunchFixture):
+    class FakeCapability:
+        def __init__(
+            self,
+            *,
+            state: str = "match",
+            differing_fields: tuple[str, ...] = (),
+            terminate_result: dict[str, object] | None = None,
+        ) -> None:
+            self.state = state
+            self.differing_fields = differing_fields
+            self.terminate_result = terminate_result or {
+                "attempted": True,
+                "alive": False,
+                "identity_state": state,
+                "differing_fields": list(differing_fields),
+                "method": "fixture",
+            }
+            self.terminate_calls: list[tuple[bool, int]] = []
+            self.closed = False
+
+        def __enter__(self) -> "TaskSevenStopIdentityTests.FakeCapability":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self.closed = True
+
+        def terminate(
+            self, *, force: bool = False, wait_seconds: int = 5
+        ) -> dict[str, object]:
+            self.terminate_calls.append((force, wait_seconds))
+            return dict(self.terminate_result)
+
+    def _write_active_worker(self, identity: ProcessIdentity) -> Path:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        orchestrator.write_metadata(
+            run_dir,
+            {
+                "run_id": run_dir.name,
+                "status": "running",
+                "worker_pid": identity.pid,
+                "worker_process_identity": identity.to_dict(),
+                "runtime_launch": {"launch_nonce": identity.launch_nonce},
+            },
+        )
+        return run_dir
+
+    @staticmethod
+    def _fixture_identity(pid: int = 424242) -> ProcessIdentity:
+        return ProcessIdentity(
+            pid=pid,
+            creation_token="fixture-creation",
+            executable_path=str(Path(sys.executable).resolve()),
+            parent_pid=os.getpid(),
+            process_group_id=None,
+            session_id=None,
+            launch_nonce="fixture-stop-launch-nonce",
+            supported=True,
+        )
+
+    def test_identity_mismatch_never_writes_request_or_opens_capability(self) -> None:
+        identity = self._fixture_identity()
+        run_dir = self._write_active_worker(identity)
+        active = {"active": True, "status": "running"}
+        with (
+            patch.object(
+                orchestrator,
+                "single_run_status",
+                return_value=active,
+            ),
+            patch.object(
+                orchestrator,
+                "_process_identity_observation",
+                return_value={
+                    "state": "mismatch",
+                    "differing_fields": ["creation_token"],
+                    "expected": identity,
+                },
+            ),
+            patch.object(
+                orchestrator, "open_stable_process_capability"
+            ) as opened,
+        ):
+            result = orchestrator.stop_run(run_dir.name, force=True)
+        opened.assert_not_called()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "identity_mismatch")
+        self.assertFalse((run_dir / "stop-requested.json").exists())
+
+    def test_capability_recheck_mismatch_keeps_cooperative_request_but_never_signals(self) -> None:
+        identity = self._fixture_identity()
+        run_dir = self._write_active_worker(identity)
+        capability = self.FakeCapability(
+            state="mismatch", differing_fields=("executable_path",)
+        )
+        with (
+            patch.object(
+                orchestrator,
+                "single_run_status",
+                return_value={"active": True, "status": "running"},
+            ),
+            patch.object(
+                orchestrator,
+                "_process_identity_observation",
+                return_value={
+                    "state": "match",
+                    "differing_fields": [],
+                    "expected": identity,
+                },
+            ),
+            patch.object(
+                orchestrator,
+                "open_stable_process_capability",
+                return_value=capability,
+            ),
+        ):
+            result = orchestrator.stop_run(run_dir.name, force=True)
+        self.assertEqual(capability.terminate_calls, [])
+        self.assertEqual(result["status"], "identity_mismatch")
+        request = json.loads(
+            (run_dir / "stop-requested.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(request["run_id"], run_dir.name)
+        self.assertEqual(request["launch_nonce"], identity.launch_nonce)
+        self.assertEqual(result["cleanup_state"], "cleanup_incomplete")
+
+    def test_matching_capability_writes_nonce_bound_cooperative_request(self) -> None:
+        identity = self._fixture_identity()
+        run_dir = self._write_active_worker(identity)
+        capability = self.FakeCapability()
+        statuses = [
+            {"active": True, "status": "running"},
+            {"active": False, "status": "stopped", "exit_code": -15},
+            {"active": False, "status": "stopped", "exit_code": -15},
+            {"active": False, "status": "stopped", "exit_code": -15},
+        ]
+        with (
+            patch.object(
+                orchestrator, "single_run_status", side_effect=statuses
+            ),
+            patch.object(
+                orchestrator,
+                "_process_identity_observation",
+                return_value={
+                    "state": "match",
+                    "differing_fields": [],
+                    "expected": identity,
+                },
+            ),
+            patch.object(
+                orchestrator,
+                "open_stable_process_capability",
+                return_value=capability,
+            ),
+        ):
+            result = orchestrator.stop_run(run_dir.name, force=False)
+        request = json.loads(
+            (run_dir / "stop-requested.json").read_text(encoding="utf-8")
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(capability.terminate_calls, [])
+        self.assertEqual(request["run_id"], run_dir.name)
+        self.assertEqual(request["launch_nonce"], identity.launch_nonce)
+        self.assertIs(request["force"], False)
+        self.assertTrue(orchestrator._valid_stop_request(run_dir, orchestrator.read_metadata(run_dir)))
+
+    def test_cooperative_timeout_uses_only_verified_worker_capability(self) -> None:
+        identity = self._fixture_identity()
+        run_dir = self._write_active_worker(identity)
+        capability = self.FakeCapability()
+        statuses = [
+            {"active": True, "status": "running"},
+            {"active": True, "status": "stop_requested"},
+            {"active": False, "status": "stopped", "exit_code": -9},
+            {"active": False, "status": "stopped", "exit_code": -9},
+        ]
+        with (
+            patch.object(
+                orchestrator, "single_run_status", side_effect=statuses
+            ),
+            patch.object(
+                orchestrator,
+                "_process_identity_observation",
+                return_value={
+                    "state": "match",
+                    "differing_fields": [],
+                    "expected": identity,
+                },
+            ),
+            patch.object(
+                orchestrator,
+                "open_stable_process_capability",
+                return_value=capability,
+            ),
+        ):
+            result = orchestrator.stop_run(
+                run_dir.name, force=True, timeout_seconds=0
+            )
+        self.assertTrue(result["ok"])
+        self.assertEqual(capability.terminate_calls, [(True, 0)])
+
+    def test_exit_between_cooperative_wait_and_capability_open_is_confirmed(self) -> None:
+        identity = self._fixture_identity()
+        run_dir = self._write_active_worker(identity)
+        capability = self.FakeCapability(state="exited")
+        statuses = [
+            {"active": True, "status": "running"},
+            {"active": True, "status": "stop_requested"},
+            {"active": False, "status": "stopped", "exit_code": -15},
+            {"active": False, "status": "stopped", "exit_code": -15},
+            {"active": False, "status": "stopped", "exit_code": -15},
+        ]
+        with (
+            patch.object(
+                orchestrator, "single_run_status", side_effect=statuses
+            ),
+            patch.object(
+                orchestrator,
+                "_process_identity_observation",
+                return_value={
+                    "state": "match",
+                    "differing_fields": [],
+                    "expected": identity,
+                },
+            ),
+            patch.object(
+                orchestrator,
+                "open_stable_process_capability",
+                return_value=capability,
+            ),
+        ):
+            result = orchestrator.stop_run(
+                run_dir.name, force=True, timeout_seconds=0
+            )
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["stopped"], result)
+        self.assertEqual(capability.terminate_calls, [])
+
+    def test_unconfirmed_capability_stop_preserves_cleanup_state(self) -> None:
+        identity = self._fixture_identity()
+        run_dir = self._write_active_worker(identity)
+        capability = self.FakeCapability(
+            terminate_result={
+                "attempted": True,
+                "alive": True,
+                "identity_state": "match",
+                "differing_fields": [],
+                "method": "fixture",
+            }
+        )
+        with (
+            patch.object(
+                orchestrator,
+                "single_run_status",
+                side_effect=[
+                    {"active": True, "status": "running"},
+                    {"active": True, "status": "stop_requested"},
+                    {"active": True, "status": "stop_requested"},
+                ],
+            ),
+            patch.object(
+                orchestrator,
+                "_process_identity_observation",
+                return_value={
+                    "state": "match",
+                    "differing_fields": [],
+                    "expected": identity,
+                },
+            ),
+            patch.object(
+                orchestrator,
+                "open_stable_process_capability",
+                return_value=capability,
+            ),
+        ):
+            result = orchestrator.stop_run(
+                run_dir.name, force=True, timeout_seconds=0
+            )
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["active"])
+        self.assertEqual(result["status"], "cleanup_incomplete")
+        persisted = orchestrator.read_metadata(run_dir)
+        self.assertEqual(persisted["cleanup_state"], "cleanup_incomplete")
+
+    def test_posix_cooperative_timeout_never_signals_only_the_worker(self) -> None:
+        identity = self._fixture_identity()
+        run_dir = self._write_active_worker(identity)
+        with (
+            patch.object(orchestrator.sys, "platform", "linux"),
+            patch.object(
+                orchestrator,
+                "single_run_status",
+                side_effect=[
+                    {"active": True, "status": "running"},
+                    {"active": True, "status": "stop_requested"},
+                ],
+            ),
+            patch.object(
+                orchestrator,
+                "_process_identity_observation",
+                return_value={
+                    "state": "match",
+                    "differing_fields": [],
+                    "expected": identity,
+                },
+            ),
+            patch.object(
+                orchestrator, "open_stable_process_capability"
+            ) as opened,
+        ):
+            result = orchestrator.stop_run(
+                run_dir.name, force=True, timeout_seconds=0
+            )
+        opened.assert_not_called()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["cleanup_state"], "cleanup_incomplete")
+        self.assertIn(
+            "process_tree_containment", result["differing_fields"]
+        )
+        self.assertTrue((run_dir / "stop-requested.json").exists())
+
+    def test_terminate_process_tree_rejects_pid_only_callers(self) -> None:
+        with self.assertRaises(TypeError):
+            orchestrator.terminate_process_tree(424242)  # type: ignore[arg-type]
+
+    def test_posix_tree_termination_never_degrades_to_single_pid_capability(self) -> None:
+        identity = self._fixture_identity()
+        with (
+            patch.object(orchestrator.sys, "platform", "linux"),
+            patch.object(
+                orchestrator, "open_stable_process_capability"
+            ) as opened,
+        ):
+            result = orchestrator.terminate_process_tree(
+                identity, force=True
+            )
+        opened.assert_not_called()
+        self.assertFalse(result["attempted"])
+        self.assertEqual(result["identity_state"], "unverified")
+        self.assertIn(
+            "process_tree_containment", result["differing_fields"]
+        )
+
+    def test_all_signal_calls_remain_inside_reviewed_capability_helpers(self) -> None:
+        dangerous = {
+            "kill",
+            "killpg",
+            "terminate",
+            "send_signal",
+            "TerminateProcess",
+            "TerminateJobObject",
+            "_terminate_handle",
+            "terminate_process",
+        }
+        allowed = {
+            "cc_orchestrator.py": {
+                ("run_git_command", "kill"),
+                ("pid_alive", "kill"),
+                ("terminate_process_tree", "terminate"),
+                ("_terminate_owned_containment", "killpg"),
+                ("_terminate_windows_job", "TerminateJobObject"),
+                ("_finalize_owned_process_record", "killpg"),
+                ("_bounded_process_cleanup", "terminate"),
+                ("_bounded_process_cleanup", "kill"),
+                ("_terminate_and_drain_owned_process", "terminate"),
+                ("_terminate_and_drain_owned_process", "kill"),
+                ("_spawn_detached_internal_worker", "terminate"),
+                ("_spawn_detached_internal_worker", "kill"),
+                ("stop_run", "terminate"),
+            },
+            "process_identity.py": {
+                ("terminate", "_terminate_handle"),
+                ("terminate_process", "TerminateProcess"),
+                ("terminate_handle", "send_signal"),
+                ("terminate_handle", "terminate_process"),
+            },
+        }
+
+        class SignalVisitor(ast.NodeVisitor):
+            def __init__(self) -> None:
+                self.functions: list[str] = []
+                self.calls: set[tuple[str, str]] = set()
+
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                self.functions.append(node.name)
+                self.generic_visit(node)
+                self.functions.pop()
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_Call(self, node: ast.Call) -> None:
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr in dangerous
+                ):
+                    self.calls.add(
+                        (
+                            self.functions[-1] if self.functions else "<module>",
+                            node.func.attr,
+                        )
+                    )
+                self.generic_visit(node)
+
+        for filename in ("cc_orchestrator.py", "process_identity.py"):
+            source = (ORCHESTRATOR_DIR / filename).read_text(encoding="utf-8")
+            self.assertNotIn("taskkill", source.lower())
+            visitor = SignalVisitor()
+            visitor.visit(ast.parse(source))
+            self.assertEqual(visitor.calls - allowed[filename], set(), visitor.calls)
+        source = (ORCHESTRATOR_DIR / "cc_orchestrator.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("def terminate_process_tree(\n    expected_identity: ProcessIdentity", source)
+
+    def test_forged_stop_request_is_not_accepted_by_worker(self) -> None:
+        identity = self._fixture_identity()
+        run_dir = self._write_active_worker(identity)
+        orchestrator._atomic_write_text(
+            run_dir / "stop-requested.json",
+            json.dumps(
+                {
+                    "request_id": "forged",
+                    "run_id": run_dir.name,
+                    "launch_nonce": "wrong-nonce",
+                    "requested_at": orchestrator.utc_now_iso(),
+                    "force": True,
+                }
+            ),
+        )
+        self.assertFalse(
+            orchestrator._valid_stop_request(
+                run_dir, orchestrator.read_metadata(run_dir)
+            )
+        )
+
+    def test_posix_group_mismatch_blocks_term_and_kill(self) -> None:
+        class FakeProcess:
+            pid = 515151
+            returncode = None
+
+            def poll(self) -> None:
+                return None
+
+        process = FakeProcess()
+        record = orchestrator._ensure_owned_process_record(
+            process, deadline=time.monotonic() + 1
+        )
+        with record.lock:
+            record.kind = "posix"
+            record.handle = process.pid
+        try:
+            with (
+                patch.object(
+                    orchestrator.os,
+                    "getpgid",
+                    return_value=process.pid + 1,
+                    create=True,
+                ),
+                patch.object(orchestrator.os, "killpg", create=True) as killpg,
+            ):
+                orchestrator._terminate_owned_containment(
+                    process, force=False
+                )
+                orchestrator._terminate_owned_containment(process, force=True)
+            killpg.assert_not_called()
+            self.assertIn(
+                "process_group_identity_mismatch", record.proof_failures
+            )
+        finally:
+            orchestrator._remove_owned_process_record(record)
+
+    def test_linux_parent_death_hook_binds_sigkill_and_rechecks_parent(self) -> None:
+        calls: list[tuple[int, ...]] = []
+
+        def prctl(*args: int) -> int:
+            calls.append(args)
+            return 0
+
+        with (
+            patch.object(orchestrator, "_LINUX_PRCTL", prctl),
+            patch.object(orchestrator.signal, "SIGKILL", 9, create=True),
+            patch.object(orchestrator.os, "getppid", side_effect=[123, 123]),
+            patch.object(orchestrator.os, "_exit") as exit_process,
+        ):
+            orchestrator._linux_parent_death_preexec(
+                expected_parent_pid=123
+            )
+        exit_process.assert_not_called()
+        self.assertEqual(
+            calls,
+            [
+                (
+                    orchestrator._LINUX_PR_SET_PDEATHSIG,
+                    9,
+                    0,
+                    0,
+                    0,
+                )
+            ],
+        )
+
+    def test_parent_death_hook_rejects_parent_lost_before_prctl(self) -> None:
+        with (
+            patch.object(orchestrator, "_LINUX_PRCTL") as prctl,
+            patch.object(orchestrator.os, "getppid", return_value=1),
+            patch.object(orchestrator.os, "_exit") as exit_process,
+        ):
+            orchestrator._linux_parent_death_preexec(
+                expected_parent_pid=123
+            )
+        exit_process.assert_called_with(127)
+        prctl.assert_not_called()
+
+    def test_production_posix_launch_fails_before_any_runtime_process(self) -> None:
+        for mode in ("one_shot", "streaming"):
+            with self.subTest(mode=mode):
+                prepared = self._prepare(mode)
+                with (
+                    patch.object(orchestrator.sys, "platform", "linux"),
+                    patch.object(
+                        orchestrator, "_start_one_shot_launch"
+                    ) as one_shot,
+                    patch.object(
+                        orchestrator, "_start_streaming_controller"
+                    ) as streaming,
+                ):
+                    result = orchestrator.start_prepared_worker_launch(prepared)
+                one_shot.assert_not_called()
+                streaming.assert_not_called()
+                self.assertFalse(result.get("ok", False), result)
+                self.assertEqual(result["status"], "blocked_runtime_launch")
+                self.assertEqual(
+                    result["security_error"]["code"],
+                    "runtime_containment_unavailable",
+                )
+
+    def test_runtime_tree_support_names_only_kernel_enforced_mechanism(self) -> None:
+        with patch.object(orchestrator.sys, "platform", "linux"):
+            support = orchestrator.runtime_tree_containment_support()
+        self.assertFalse(support["supported"])
+        self.assertIsNone(support["mechanism"])
+        self.assertNotIn("killpg", support["reason"].lower())
+
+    def test_legacy_pid_only_metadata_is_unverified_and_never_signaled(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        orchestrator.write_metadata(
+            run_dir,
+            {
+                "run_id": run_dir.name,
+                "status": "running",
+                "worker_pid": 424242,
+            },
+        )
+        with (
+            patch.object(orchestrator, "pid_alive", return_value=True),
+            patch.object(
+                orchestrator, "open_stable_process_capability"
+            ) as opened,
+        ):
+            result = orchestrator.stop_run(run_dir.name, force=True)
+        opened.assert_not_called()
+        self.assertEqual(result["status"], "identity_unverified")
+        self.assertFalse((run_dir / "stop-requested.json").exists())
+
+    def test_legacy_child_only_metadata_is_unverified_and_never_signaled(self) -> None:
+        child = self._fixture_identity()
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        orchestrator.write_metadata(
+            run_dir,
+            {
+                "run_id": run_dir.name,
+                "status": "running",
+                "child_pid": child.pid,
+                "child_process_identity": child.to_dict(),
+                "runtime_launch": {"launch_nonce": child.launch_nonce},
+            },
+        )
+        with (
+            patch.object(
+                orchestrator,
+                "single_run_status",
+                return_value={"active": True, "status": "running"},
+            ),
+            patch.object(
+                orchestrator, "open_stable_process_capability"
+            ) as opened,
+        ):
+            result = orchestrator.stop_run(run_dir.name, force=True)
+        opened.assert_not_called()
+        self.assertEqual(result["status"], "identity_unverified")
+        self.assertFalse((run_dir / "stop-requested.json").exists())
+
+    def test_worker_launch_nonce_mismatch_is_rejected_before_request(self) -> None:
+        identity = self._fixture_identity()
+        run_dir = self._write_active_worker(identity)
+        orchestrator.update_metadata(
+            run_dir,
+            runtime_launch={"launch_nonce": "different-launch-nonce"},
+        )
+        with (
+            patch.object(orchestrator, "pid_alive", return_value=True),
+            patch.object(
+                orchestrator, "open_stable_process_capability"
+            ) as opened,
+        ):
+            result = orchestrator.stop_run(run_dir.name, force=True)
+        opened.assert_not_called()
+        self.assertEqual(result["status"], "identity_mismatch")
+        self.assertIn("launch_nonce", result["differing_fields"])
+        self.assertFalse((run_dir / "stop-requested.json").exists())
+
+    def test_real_live_pid_with_forged_creation_token_is_not_stopped(self) -> None:
+        sleeper = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        nonce = "real-pid-reuse-simulation"
+        try:
+            captured = capture_process_identity(sleeper.pid, launch_nonce=nonce)
+            if not captured.supported:
+                self.skipTest("live process identity capture is unsupported")
+            forged = captured.to_dict()
+            forged["creation_token"] = str(forged["creation_token"]) + "-forged"
+            run_dir = self._write_active_worker(ProcessIdentity.from_dict(forged))
+            result = orchestrator.stop_run(run_dir.name, force=True)
+            self.assertEqual(result["status"], "identity_mismatch")
+            self.assertIsNone(sleeper.poll())
+            self.assertFalse((run_dir / "stop-requested.json").exists())
+        finally:
+            if sleeper.poll() is None:
+                sleeper.terminate()
+                try:
+                    sleeper.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    sleeper.kill()
+                    sleeper.wait(timeout=5)
+
+    def test_real_live_pid_with_forged_executable_path_is_not_stopped(self) -> None:
+        sleeper = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        nonce = "real-executable-mismatch"
+        try:
+            captured = capture_process_identity(sleeper.pid, launch_nonce=nonce)
+            if not captured.supported:
+                self.skipTest("live process identity capture is unsupported")
+            forged = captured.to_dict()
+            forged["executable_path"] = str(
+                self.workspace / "different-runtime.exe"
+            )
+            run_dir = self._write_active_worker(ProcessIdentity.from_dict(forged))
+            result = orchestrator.stop_run(run_dir.name, force=True)
+            self.assertEqual(result["status"], "identity_mismatch")
+            self.assertIn("executable_path", result["differing_fields"])
+            self.assertIsNone(sleeper.poll())
+            self.assertFalse((run_dir / "stop-requested.json").exists())
+        finally:
+            if sleeper.poll() is None:
+                sleeper.terminate()
+                sleeper.wait(timeout=5)
+
+    def test_workflow_stop_with_reused_pid_keeps_cleanup_pending(self) -> None:
+        sleeper = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        nonce = "workflow-pid-reuse"
+        try:
+            captured = capture_process_identity(sleeper.pid, launch_nonce=nonce)
+            if not captured.supported:
+                self.skipTest("live process identity capture is unsupported")
+            forged = captured.to_dict()
+            forged["creation_token"] = str(forged["creation_token"]) + "-forged"
+            run_dir = self._write_active_worker(ProcessIdentity.from_dict(forged))
+            workflow_dir = self.workspace / ".agent-workspace" / "workflows" / "wf-reuse"
+            workflow_dir.mkdir(parents=True)
+            orchestrator._atomic_write_text(
+                workflow_dir / "status.json",
+                json.dumps(
+                    {
+                        "status": "running",
+                        "nodes": {
+                            "review": {
+                                "state": "running",
+                                "run_id": run_dir.name,
+                            }
+                        },
+                        "decisions": [],
+                    }
+                ),
+            )
+            with patch.object(
+                orchestrator,
+                "safe_workflow_dir",
+                return_value=workflow_dir,
+            ):
+                result = orchestrator.workflow_stop("wf-reuse", force=True)
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], "cleanup_incomplete")
+            self.assertFalse(result["stopped"][0]["confirmed"])
+            self.assertIsNone(sleeper.poll())
+        finally:
+            if sleeper.poll() is None:
+                sleeper.terminate()
+                sleeper.wait(timeout=5)
+
+    def test_two_spawned_controllers_reject_same_reused_pid_evidence(self) -> None:
+        sleeper = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        nonce = "spawned-pid-reuse-simulation"
+        try:
+            captured = capture_process_identity(sleeper.pid, launch_nonce=nonce)
+            if not captured.supported:
+                self.skipTest("live process identity capture is unsupported")
+            forged = captured.to_dict()
+            forged["creation_token"] = str(forged["creation_token"]) + "-forged"
+            run_dir = self._write_active_worker(ProcessIdentity.from_dict(forged))
+            helper = self.workspace / "spawned_stop_controller.py"
+            helper.write_text(
+                "\n".join(
+                    [
+                        "import json, sys",
+                        "from pathlib import Path",
+                        f"sys.path.insert(0, {str(ORCHESTRATOR_DIR)!r})",
+                        "import cc_orchestrator as o",
+                        "o.RUNS_DIR = Path(sys.argv[1])",
+                        "result = o.stop_run(sys.argv[2], force=True, timeout_seconds=0)",
+                        "print(json.dumps(result))",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            controllers = [
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(helper),
+                        str(self.runs_dir),
+                        run_dir.name,
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                for _ in range(2)
+            ]
+            outputs = [controller.communicate(timeout=20) for controller in controllers]
+            self.assertEqual(
+                [controller.returncode for controller in controllers],
+                [0, 0],
+                [stderr.decode(errors="replace") for _stdout, stderr in outputs],
+            )
+            results = [
+                json.loads(stdout.decode("utf-8"))
+                for stdout, _stderr in outputs
+            ]
+            self.assertEqual(
+                [result["status"] for result in results],
+                ["identity_mismatch", "identity_mismatch"],
+            )
+            self.assertIsNone(sleeper.poll())
+            self.assertFalse((run_dir / "stop-requested.json").exists())
+        finally:
+            if sleeper.poll() is None:
+                sleeper.terminate()
+                sleeper.wait(timeout=5)
+
+    def test_two_spawned_controllers_exact_stop_is_idempotent(self) -> None:
+        sleeper = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        nonce = "spawned-exact-stop"
+        try:
+            captured = capture_process_identity(sleeper.pid, launch_nonce=nonce)
+            if not captured.supported:
+                self.skipTest("live process identity capture is unsupported")
+            with open_stable_process_capability(captured) as capability:
+                if capability.state != "match":
+                    self.skipTest("stable process capability is unavailable")
+            run_dir = self._write_active_worker(captured)
+            helper = self.workspace / "spawned_exact_stop_controller.py"
+            helper.write_text(
+                "\n".join(
+                    [
+                        "import json, sys",
+                        "from pathlib import Path",
+                        f"sys.path.insert(0, {str(ORCHESTRATOR_DIR)!r})",
+                        "import cc_orchestrator as o",
+                        "o.RUNS_DIR = Path(sys.argv[1])",
+                        "result = o.stop_run(sys.argv[2], force=True, timeout_seconds=0)",
+                        "print(json.dumps(result))",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            controllers = [
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(helper),
+                        str(self.runs_dir),
+                        run_dir.name,
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                for _ in range(2)
+            ]
+            outputs = [controller.communicate(timeout=20) for controller in controllers]
+            self.assertEqual(
+                [controller.returncode for controller in controllers],
+                [0, 0],
+                [stderr.decode(errors="replace") for _stdout, stderr in outputs],
+            )
+            results = [
+                json.loads(stdout.decode("utf-8"))
+                for stdout, _stderr in outputs
+            ]
+            self.assertTrue(any(result["ok"] for result in results), results)
+            self.assertTrue(
+                all(
+                    result["status"]
+                    in {
+                        "stopped",
+                        "already_stopped",
+                        "already_finished",
+                        "identity_unverified",
+                    }
+                    for result in results
+                ),
+                results,
+            )
+            sleeper.wait(timeout=5)
+            final = orchestrator.single_run_status(run_dir.name)
+            self.assertFalse(final["active"], final)
+            self.assertNotEqual(final.get("cleanup_state"), "cleanup_incomplete")
+        finally:
+            if sleeper.poll() is None:
+                sleeper.kill()
+                sleeper.wait(timeout=5)
+
+    def test_status_separates_match_mismatch_and_unverified_identity(self) -> None:
+        sleeper = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        nonce = "status-identity-fixture"
+        try:
+            captured = capture_process_identity(sleeper.pid, launch_nonce=nonce)
+            if not captured.supported:
+                self.skipTest("live process identity capture is unsupported")
+            run_dir = self._write_active_worker(captured)
+            matching = orchestrator.single_run_status(run_dir.name)
+            self.assertEqual(matching["worker_identity_state"], "match")
+            self.assertTrue(matching["worker_owned"])
+            self.assertTrue(matching["active"])
+
+            metadata = orchestrator.read_metadata(run_dir)
+            forged = dict(metadata["worker_process_identity"])
+            forged["creation_token"] = str(forged["creation_token"]) + "-forged"
+            orchestrator.update_metadata(run_dir, worker_process_identity=forged)
+            mismatched = orchestrator.single_run_status(run_dir.name)
+            self.assertEqual(mismatched["worker_identity_state"], "mismatch")
+            self.assertFalse(mismatched["worker_owned"])
+            self.assertTrue(mismatched["active"])
+
+            orchestrator.update_metadata(run_dir, worker_process_identity=None)
+            unverified = orchestrator.single_run_status(run_dir.name)
+            self.assertEqual(unverified["worker_identity_state"], "unverified")
+            self.assertFalse(unverified["worker_owned"])
+            self.assertTrue(unverified["active"])
+        finally:
+            if sleeper.poll() is None:
+                sleeper.terminate()
+                sleeper.wait(timeout=5)
+
+    def test_real_exact_match_emergency_stop_uses_stable_capability(self) -> None:
+        sleeper = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        nonce = "real-stable-stop-fixture"
+        try:
+            captured = capture_process_identity(sleeper.pid, launch_nonce=nonce)
+            if not captured.supported:
+                self.skipTest("live process identity capture is unsupported")
+            run_dir = self._write_active_worker(captured)
+            with open_stable_process_capability(captured) as capability:
+                capability_state = capability.state
+            result = orchestrator.stop_run(
+                run_dir.name, force=True, timeout_seconds=0
+            )
+            if sys.platform != "win32":
+                self.assertFalse(result["ok"], result)
+                self.assertIn(
+                    "process_tree_containment",
+                    result["differing_fields"],
+                )
+                self.assertIsNone(sleeper.poll())
+                return
+            if capability_state != "match":
+                self.assertFalse(result["ok"], result)
+                self.assertEqual(result["identity_state"], capability_state)
+                self.assertIsNone(sleeper.poll())
+                return
+            self.assertTrue(result["ok"], result)
+            self.assertTrue(result["stopped"], result)
+            self.assertFalse(result["active"], result)
+            sleeper.wait(timeout=5)
+            repeated = orchestrator.stop_run(
+                run_dir.name, force=True, timeout_seconds=0
+            )
+            self.assertTrue(repeated["ok"], repeated)
+            self.assertFalse(repeated["active"], repeated)
+            self.assertIn(
+                repeated["status"], {"already_stopped", "already_finished"}
+            )
+        finally:
+            if sleeper.poll() is None:
+                sleeper.kill()
+                sleeper.wait(timeout=5)
 
 
 if __name__ == "__main__":

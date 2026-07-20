@@ -5,11 +5,24 @@ import errno
 import ntpath
 import os
 import posixpath
+import select
+import signal
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
+
+
+__all__ = (
+    "ProcessIdentity",
+    "ProcessIdentityCheck",
+    "StableProcessCapability",
+    "capture_process_identity",
+    "compare_process_identity",
+    "open_stable_process_capability",
+    "process_identity_support",
+)
 
 
 _IDENTITY_FIELDS = (
@@ -28,6 +41,8 @@ _ACCESS_DENIED_REASON = "access denied"
 _QUERY_FAILED_REASON = "process query failed"
 _MALFORMED_REASON = "process information malformed"
 _UNSTABLE_REASON = "process identity changed during capture"
+_SIGTERM = int(getattr(signal, "SIGTERM", 15))
+_SIGKILL = int(getattr(signal, "SIGKILL", 9))
 
 
 def _is_int(value: object) -> bool:
@@ -134,6 +149,166 @@ class ProcessIdentityCheck:
     live: ProcessIdentity | None = None
 
 
+class StableProcessCapability:
+    """An identity-checked, non-reusable process reference."""
+
+    def __init__(
+        self,
+        expected: ProcessIdentity,
+        *,
+        state: str,
+        differing_fields: tuple[str, ...] = (),
+        resource: int | None = None,
+        close_handle: Callable[[int], None] | None = None,
+        wait_for_exit: Callable[[int, int], bool] | None = None,
+        terminate_handle: Callable[[int, bool], None] | None = None,
+        method: str | None = None,
+    ) -> None:
+        if state not in {"match", "mismatch", "exited", "unverified"}:
+            raise ValueError("invalid stable process capability state")
+        if state == "match" and (
+            resource is None
+            or close_handle is None
+            or wait_for_exit is None
+            or terminate_handle is None
+            or method is None
+        ):
+            raise ValueError("matching capability requires an owned process resource")
+        if state != "match" and resource is not None:
+            raise ValueError("non-matching capability must not retain a process resource")
+        self.expected = expected
+        self.state = state
+        self.differing_fields = differing_fields
+        self._resource = resource
+        self._close_handle = close_handle
+        self._wait_for_exit = wait_for_exit
+        self._terminate_handle = terminate_handle
+        self._method = method
+
+    def __enter__(self) -> "StableProcessCapability":
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        resource = self._resource
+        self._resource = None
+        if resource is None or self._close_handle is None:
+            return
+        try:
+            self._close_handle(resource)
+        except OSError:
+            pass
+
+    def _result(
+        self,
+        *,
+        attempted: bool,
+        alive: bool,
+        identity_state: str | None = None,
+        method: str | None = None,
+        error: OSError | None = None,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "pid": self.expected.pid,
+            "attempted": attempted,
+            "alive": alive,
+            "identity_state": identity_state or self.state,
+            "differing_fields": list(self.differing_fields),
+            "method": method,
+        }
+        if error is not None:
+            result["error"] = str(error)
+        return result
+
+    def terminate(self, force: bool = False, wait_seconds: int = 5) -> dict[str, Any]:
+        if not isinstance(force, bool):
+            raise TypeError("force must be a boolean")
+        if not _is_int(wait_seconds):
+            raise TypeError("wait_seconds must be an integer")
+        if wait_seconds < 0:
+            raise ValueError("wait_seconds must not be negative")
+
+        if self.state != "match":
+            return self._result(
+                attempted=False,
+                alive=self.state != "exited",
+                method=None,
+            )
+        resource = self._resource
+        if (
+            resource is None
+            or self._wait_for_exit is None
+            or self._terminate_handle is None
+            or self._method is None
+        ):
+            return self._result(
+                attempted=False,
+                alive=True,
+                identity_state="unverified",
+                method=None,
+            )
+
+        try:
+            if self._wait_for_exit(resource, 0):
+                return self._result(
+                    attempted=False,
+                    alive=False,
+                    identity_state="exited",
+                    method=None,
+                )
+        except OSError:
+            return self._result(
+                attempted=False,
+                alive=True,
+                identity_state="unverified",
+                method=None,
+            )
+
+        try:
+            self._terminate_handle(resource, force)
+        except ProcessLookupError:
+            return self._result(
+                attempted=True,
+                alive=False,
+                method=self._method,
+            )
+        except OSError as exc:
+            alive = True
+            try:
+                alive = not self._wait_for_exit(resource, 0)
+            except OSError:
+                pass
+            return self._result(
+                attempted=True,
+                alive=alive,
+                method=self._method,
+                error=exc,
+            )
+
+        try:
+            alive = not self._wait_for_exit(resource, wait_seconds)
+        except OSError as exc:
+            return self._result(
+                attempted=True,
+                alive=True,
+                method=self._method,
+                error=exc,
+            )
+        return self._result(
+            attempted=True,
+            alive=alive,
+            method=self._method,
+        )
+
+
 def _unsupported(pid: int, launch_nonce: str, reason: str) -> ProcessIdentity:
     return ProcessIdentity(
         pid=pid,
@@ -180,6 +355,44 @@ def _path_for_comparison(path: str) -> str:
     return posixpath.normpath(path)
 
 
+def _compare_captured_identity(
+    expected: ProcessIdentity,
+    live: ProcessIdentity,
+) -> ProcessIdentityCheck:
+    if not isinstance(live, ProcessIdentity):
+        return ProcessIdentityCheck(state="unverified")
+    if not live.supported:
+        state = "exited" if live.unsupported_reason == _EXITED_REASON else "unverified"
+        return ProcessIdentityCheck(state=state, live=live)
+    if not live.creation_token or not live.executable_path:
+        return ProcessIdentityCheck(state="unverified", live=live)
+
+    differing: list[str] = []
+    if expected.pid != live.pid:
+        differing.append("pid")
+    if expected.creation_token != live.creation_token:
+        differing.append("creation_token")
+    if _path_for_comparison(expected.executable_path or "") != _path_for_comparison(
+        live.executable_path
+    ):
+        differing.append("executable_path")
+    for field_name in ("parent_pid", "process_group_id", "session_id"):
+        expected_value = getattr(expected, field_name)
+        live_value = getattr(live, field_name)
+        if (
+            expected_value is not None
+            and live_value is not None
+            and expected_value != live_value
+        ):
+            differing.append(field_name)
+    differing_fields = tuple(sorted(differing))
+    return ProcessIdentityCheck(
+        state="mismatch" if differing_fields else "match",
+        differing_fields=differing_fields,
+        live=live,
+    )
+
+
 def compare_process_identity(
     expected: ProcessIdentity,
     *,
@@ -211,38 +424,7 @@ def compare_process_identity(
         )
     except (OSError, ValueError, TypeError):
         return ProcessIdentityCheck(state="unverified")
-    if not isinstance(live, ProcessIdentity):
-        return ProcessIdentityCheck(state="unverified")
-    if not live.supported:
-        state = "exited" if live.unsupported_reason == _EXITED_REASON else "unverified"
-        return ProcessIdentityCheck(state=state, live=live)
-    if not live.creation_token or not live.executable_path:
-        return ProcessIdentityCheck(state="unverified", live=live)
-
-    differing: list[str] = []
-    if expected.pid != live.pid:
-        differing.append("pid")
-    if expected.creation_token != live.creation_token:
-        differing.append("creation_token")
-    if _path_for_comparison(expected.executable_path) != _path_for_comparison(
-        live.executable_path
-    ):
-        differing.append("executable_path")
-    for field_name in ("parent_pid", "process_group_id", "session_id"):
-        expected_value = getattr(expected, field_name)
-        live_value = getattr(live, field_name)
-        if (
-            expected_value is not None
-            and live_value is not None
-            and expected_value != live_value
-        ):
-            differing.append(field_name)
-    differing_fields = tuple(sorted(differing))
-    return ProcessIdentityCheck(
-        state="mismatch" if differing_fields else "match",
-        differing_fields=differing_fields,
-        live=live,
-    )
+    return _compare_captured_identity(expected, live)
 
 
 def _parse_linux_stat(stat_text: str, *, expected_pid: int) -> tuple[int, int, int, str]:
@@ -353,6 +535,35 @@ def _capture_linux(
     )
 
 
+class _LinuxPidfdApi:
+    def __init__(self) -> None:
+        pidfd_open = getattr(os, "pidfd_open", None)
+        pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+        poll_factory = getattr(select, "poll", None)
+        if not callable(pidfd_open) or not callable(pidfd_send_signal):
+            raise OSError(errno.ENOSYS, "pidfd signaling unavailable")
+        if not callable(poll_factory):
+            raise OSError(errno.ENOSYS, "pidfd polling unavailable")
+        self._pidfd_open = pidfd_open
+        self._pidfd_send_signal = pidfd_send_signal
+        self._poll_factory = poll_factory
+
+    def open_process(self, pid: int) -> int:
+        return int(self._pidfd_open(pid, 0))
+
+    def close_handle(self, pidfd: int) -> None:
+        os.close(pidfd)
+
+    def wait_for_exit(self, pidfd: int, wait_seconds: int) -> bool:
+        poller = self._poll_factory()
+        poller.register(pidfd, select.POLLIN | select.POLLERR | select.POLLHUP)
+        timeout_milliseconds = min(wait_seconds * 1000, 2_147_483_647)
+        return bool(poller.poll(timeout_milliseconds))
+
+    def send_signal(self, pidfd: int, signum: int) -> None:
+        self._pidfd_send_signal(pidfd, signum, None, 0)
+
+
 def _strip_windows_extended_prefix(path: str) -> str:
     if path.startswith("\\\\?\\UNC\\"):
         return "\\\\" + path[8:]
@@ -381,6 +592,7 @@ class _PROCESSENTRY32W(ctypes.Structure):
 
 
 class _WindowsApi:
+    PROCESS_TERMINATE = 0x0001
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     SYNCHRONIZE = 0x00100000
     TH32CS_SNAPPROCESS = 0x00000002
@@ -443,6 +655,13 @@ class _WindowsApi:
             wintypes.DWORD,
         )
         self._kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        self._kernel32.GetProcessId.argtypes = (wintypes.HANDLE,)
+        self._kernel32.GetProcessId.restype = wintypes.DWORD
+        self._kernel32.TerminateProcess.argtypes = (
+            wintypes.HANDLE,
+            wintypes.UINT,
+        )
+        self._kernel32.TerminateProcess.restype = wintypes.BOOL
 
     @staticmethod
     def _error(code: int | None = None) -> OSError:
@@ -463,18 +682,45 @@ class _WindowsApi:
             raise self._error()
         return handle
 
+    def open_process_for_termination(self, pid: int) -> int:
+        handle = self._kernel32.OpenProcess(
+            self.PROCESS_QUERY_LIMITED_INFORMATION
+            | self.SYNCHRONIZE
+            | self.PROCESS_TERMINATE,
+            False,
+            pid,
+        )
+        if not handle:
+            raise self._error()
+        return handle
+
     def close_handle(self, handle: int) -> None:
         self._kernel32.CloseHandle(handle)
 
     def assert_running(self, handle: int) -> None:
-        result = self._kernel32.WaitForSingleObject(handle, 0)
-        if result == self.WAIT_TIMEOUT:
-            return
-        if result == self.WAIT_OBJECT_0:
+        if self.wait_for_exit(handle, 0):
             raise ProcessLookupError(errno.ESRCH, "process unavailable")
+
+    def wait_for_exit(self, handle: int, wait_seconds: int) -> bool:
+        timeout_milliseconds = min(wait_seconds * 1000, 0xFFFFFFFE)
+        result = self._kernel32.WaitForSingleObject(handle, timeout_milliseconds)
+        if result == self.WAIT_TIMEOUT:
+            return False
+        if result == self.WAIT_OBJECT_0:
+            return True
         if result == self.WAIT_FAILED:
             raise self._error()
         raise OSError(errno.EIO, "unexpected process wait result")
+
+    def process_id(self, handle: int) -> int:
+        pid = self._kernel32.GetProcessId(handle)
+        if not pid:
+            raise self._error()
+        return int(pid)
+
+    def terminate_process(self, handle: int, exit_code: int) -> None:
+        if not self._kernel32.TerminateProcess(handle, exit_code):
+            raise self._error()
 
     def creation_filetime(self, handle: int) -> tuple[int, int]:
         creation = _FILETIME()
@@ -713,6 +959,161 @@ def _capture_macos(
         launch_nonce=launch_nonce,
         supported=True,
     )
+
+
+def _closed_capability(
+    expected: ProcessIdentity,
+    state: str,
+    differing_fields: tuple[str, ...] = (),
+) -> StableProcessCapability:
+    return StableProcessCapability(
+        expected,
+        state=state,
+        differing_fields=differing_fields,
+    )
+
+
+def _close_native_handle(native: Any, handle: int) -> None:
+    try:
+        native.close_handle(handle)
+    except OSError:
+        pass
+
+
+def _open_linux_stable_process_capability(
+    expected: ProcessIdentity,
+    *,
+    api: Any | None = None,
+) -> StableProcessCapability:
+    try:
+        native = api if api is not None else _LinuxPidfdApi()
+    except (AttributeError, OSError):
+        return _closed_capability(expected, "unverified")
+    try:
+        pidfd = native.open_process(expected.pid)
+    except ProcessLookupError:
+        return _closed_capability(expected, "exited")
+    except (AttributeError, OSError, TypeError, ValueError, OverflowError):
+        return _closed_capability(expected, "unverified")
+
+    try:
+        if native.wait_for_exit(pidfd, 0):
+            _close_native_handle(native, pidfd)
+            return _closed_capability(expected, "exited")
+        live = capture_process_identity(
+            expected.pid,
+            launch_nonce=expected.launch_nonce,
+        )
+        check = _compare_captured_identity(expected, live)
+        if native.wait_for_exit(pidfd, 0):
+            _close_native_handle(native, pidfd)
+            return _closed_capability(expected, "exited")
+    except (AttributeError, OSError, TypeError, ValueError, OverflowError):
+        _close_native_handle(native, pidfd)
+        return _closed_capability(expected, "unverified")
+
+    if check.state != "match":
+        _close_native_handle(native, pidfd)
+        state = "unverified" if check.state == "exited" else check.state
+        return _closed_capability(expected, state, check.differing_fields)
+
+    def terminate_handle(resource: int, force: bool) -> None:
+        signum = _SIGKILL if force else _SIGTERM
+        native.send_signal(resource, signum)
+
+    return StableProcessCapability(
+        expected,
+        state="match",
+        resource=pidfd,
+        close_handle=native.close_handle,
+        wait_for_exit=native.wait_for_exit,
+        terminate_handle=terminate_handle,
+        method="pidfd_send_signal",
+    )
+
+
+def _open_windows_stable_process_capability(
+    expected: ProcessIdentity,
+    *,
+    api: Any | None = None,
+) -> StableProcessCapability:
+    try:
+        native = api if api is not None else _WindowsApi()
+    except (AttributeError, OSError):
+        return _closed_capability(expected, "unverified")
+    try:
+        handle = native.open_process_for_termination(expected.pid)
+    except ProcessLookupError:
+        return _closed_capability(expected, "exited")
+    except (AttributeError, OSError, TypeError, ValueError, OverflowError):
+        return _closed_capability(expected, "unverified")
+
+    try:
+        if native.wait_for_exit(handle, 0):
+            _close_native_handle(native, handle)
+            return _closed_capability(expected, "exited")
+        pid = native.process_id(handle)
+        high, low = native.creation_filetime(handle)
+        executable_path = native.executable_path(handle)
+        if not executable_path:
+            raise ValueError("empty executable path")
+        live = ProcessIdentity(
+            pid=int(pid),
+            creation_token=str((int(high) << 32) | int(low)),
+            executable_path=ntpath.normpath(
+                _strip_windows_extended_prefix(executable_path)
+            ),
+            parent_pid=None,
+            process_group_id=None,
+            session_id=None,
+            launch_nonce=expected.launch_nonce,
+            supported=True,
+        )
+        check = _compare_captured_identity(expected, live)
+        if native.wait_for_exit(handle, 0):
+            _close_native_handle(native, handle)
+            return _closed_capability(expected, "exited")
+    except ProcessLookupError:
+        _close_native_handle(native, handle)
+        return _closed_capability(expected, "exited")
+    except (AttributeError, OSError, TypeError, ValueError, OverflowError):
+        _close_native_handle(native, handle)
+        return _closed_capability(expected, "unverified")
+
+    if check.state != "match":
+        _close_native_handle(native, handle)
+        return _closed_capability(expected, check.state, check.differing_fields)
+
+    def terminate_handle(resource: int, force: bool) -> None:
+        native.terminate_process(resource, 1 if force else 0)
+
+    return StableProcessCapability(
+        expected,
+        state="match",
+        resource=handle,
+        close_handle=native.close_handle,
+        wait_for_exit=native.wait_for_exit,
+        terminate_handle=terminate_handle,
+        method="TerminateProcess",
+    )
+
+
+def open_stable_process_capability(
+    expected_identity: ProcessIdentity,
+) -> StableProcessCapability:
+    if not isinstance(expected_identity, ProcessIdentity):
+        raise TypeError("expected_identity must be a ProcessIdentity")
+    if (
+        not expected_identity.supported
+        or not expected_identity.creation_token
+        or not expected_identity.executable_path
+    ):
+        return _closed_capability(expected_identity, "unverified")
+    if sys.platform.startswith("linux"):
+        return _open_linux_stable_process_capability(expected_identity)
+    if sys.platform == "win32":
+        return _open_windows_stable_process_capability(expected_identity)
+    return _closed_capability(expected_identity, "unverified")
 
 
 def process_identity_support() -> dict[str, Any]:

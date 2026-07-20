@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import os
+import signal
 import struct
 import subprocess
 import sys
@@ -22,6 +23,7 @@ from process_identity import (
     ProcessIdentity,
     capture_process_identity,
     compare_process_identity,
+    open_stable_process_capability,
     process_identity_support,
 )
 
@@ -273,6 +275,286 @@ class ProcessIdentityComparisonTests(unittest.TestCase):
             check = compare_process_identity(linux_expected)
             self.assertEqual(check.state, "mismatch")
             self.assertEqual(check.differing_fields, ("executable_path",))
+
+
+class FakePidfdApi:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+        self.open_error: BaseException | None = None
+        self.wait_results: list[bool | BaseException] = []
+        self.signals: list[tuple[int, int]] = []
+        self.closed: list[int] = []
+
+    def open_process(self, pid: int) -> int:
+        self.events.append(("open", pid))
+        if self.open_error is not None:
+            raise self.open_error
+        return 71
+
+    def wait_for_exit(self, pidfd: int, wait_seconds: int) -> bool:
+        self.events.append(("wait", pidfd, wait_seconds))
+        result = self.wait_results.pop(0) if self.wait_results else False
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    def send_signal(self, pidfd: int, signum: int) -> None:
+        self.events.append(("signal", pidfd, signum))
+        self.signals.append((pidfd, signum))
+
+    def close_handle(self, pidfd: int) -> None:
+        self.events.append(("close", pidfd))
+        self.closed.append(pidfd)
+
+
+class FakeStableWindowsApi:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+        self.open_error: BaseException | None = None
+        self.wait_results: list[bool | BaseException] = []
+        self.pid = 42
+        self.creation = (0x12345678, 0x9ABCDEF0)
+        self.image = r"\\?\C:\Python\python.exe"
+        self.terminated: list[tuple[int, int]] = []
+        self.closed: list[int] = []
+
+    def open_process_for_termination(self, pid: int) -> int:
+        self.events.append(("open", pid))
+        if self.open_error is not None:
+            raise self.open_error
+        return 91
+
+    def wait_for_exit(self, handle: int, wait_seconds: int) -> bool:
+        self.events.append(("wait", handle, wait_seconds))
+        result = self.wait_results.pop(0) if self.wait_results else False
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    def process_id(self, handle: int) -> int:
+        self.events.append(("pid", handle))
+        return self.pid
+
+    def creation_filetime(self, handle: int) -> tuple[int, int]:
+        self.events.append(("creation", handle))
+        return self.creation
+
+    def executable_path(self, handle: int) -> str:
+        self.events.append(("image", handle))
+        return self.image
+
+    def terminate_process(self, handle: int, exit_code: int) -> None:
+        self.events.append(("terminate", handle, exit_code))
+        self.terminated.append((handle, exit_code))
+
+    def close_handle(self, handle: int) -> None:
+        self.events.append(("close", handle))
+        self.closed.append(handle)
+
+
+class StableProcessCapabilityTests(unittest.TestCase):
+    def test_public_exports_include_stable_capability_interface(self) -> None:
+        self.assertEqual(
+            set(process_identity.__all__),
+            {
+                "ProcessIdentity",
+                "ProcessIdentityCheck",
+                "StableProcessCapability",
+                "capture_process_identity",
+                "compare_process_identity",
+                "open_stable_process_capability",
+                "process_identity_support",
+            },
+        )
+
+    def test_linux_opens_pidfd_before_capture_and_signals_that_pidfd(self) -> None:
+        api = FakePidfdApi()
+        api.wait_results = [False, False, False, True]
+        expected = supported_identity(executable_path="/usr/bin/python3")
+
+        def capture(pid: int, *, launch_nonce: str) -> ProcessIdentity:
+            api.events.append(("capture", pid, launch_nonce))
+            return expected
+
+        with patch.object(process_identity.sys, "platform", "linux"), patch.object(
+            process_identity, "_LinuxPidfdApi", return_value=api
+        ), patch.object(
+            process_identity, "capture_process_identity", side_effect=capture
+        ):
+            with open_stable_process_capability(expected) as capability:
+                self.assertEqual(capability.state, "match")
+                result = capability.terminate(force=False, wait_seconds=3)
+
+        self.assertLess(api.events.index(("open", expected.pid)), api.events.index(
+            ("capture", expected.pid, expected.launch_nonce)
+        ))
+        self.assertEqual(api.signals, [(71, signal.SIGTERM)])
+        self.assertEqual(api.closed, [71])
+        self.assertEqual(
+            result,
+            {
+                "pid": expected.pid,
+                "attempted": True,
+                "alive": False,
+                "identity_state": "match",
+                "differing_fields": [],
+                "method": "pidfd_send_signal",
+            },
+        )
+
+    def test_linux_force_uses_sigkill(self) -> None:
+        api = FakePidfdApi()
+        expected = supported_identity(executable_path="/usr/bin/python3")
+        with patch.object(process_identity.sys, "platform", "linux"), patch.object(
+            process_identity, "_LinuxPidfdApi", return_value=api
+        ), patch.object(
+            process_identity, "capture_process_identity", return_value=expected
+        ):
+            capability = open_stable_process_capability(expected)
+            result = capability.terminate(force=True, wait_seconds=0)
+            capability.close()
+
+        self.assertTrue(result["attempted"])
+        self.assertEqual(api.signals, [(71, int(getattr(signal, "SIGKILL", 9)))])
+
+    def test_linux_mismatch_closes_pidfd_and_never_signals(self) -> None:
+        api = FakePidfdApi()
+        expected = supported_identity(executable_path="/usr/bin/python3")
+        live = replace(expected, creation_token="other-creation")
+        with patch.object(process_identity.sys, "platform", "linux"), patch.object(
+            process_identity, "_LinuxPidfdApi", return_value=api
+        ), patch.object(
+            process_identity, "capture_process_identity", return_value=live
+        ):
+            capability = open_stable_process_capability(expected)
+            result = capability.terminate(force=True, wait_seconds=0)
+
+        self.assertEqual(capability.state, "mismatch")
+        self.assertEqual(capability.differing_fields, ("creation_token",))
+        self.assertEqual(api.closed, [71])
+        self.assertEqual(api.signals, [])
+        self.assertEqual(result["attempted"], False)
+        self.assertEqual(result["alive"], True)
+        self.assertEqual(result["identity_state"], "mismatch")
+        self.assertEqual(result["differing_fields"], ["creation_token"])
+        self.assertIsNone(result["method"])
+
+    def test_linux_exit_between_verification_and_signal_is_not_signaled(self) -> None:
+        api = FakePidfdApi()
+        api.wait_results = [False, False, True]
+        expected = supported_identity(executable_path="/usr/bin/python3")
+        with patch.object(process_identity.sys, "platform", "linux"), patch.object(
+            process_identity, "_LinuxPidfdApi", return_value=api
+        ), patch.object(
+            process_identity, "capture_process_identity", return_value=expected
+        ):
+            capability = open_stable_process_capability(expected)
+            result = capability.terminate(force=True, wait_seconds=0)
+            capability.close()
+
+        self.assertEqual(api.signals, [])
+        self.assertFalse(result["attempted"])
+        self.assertFalse(result["alive"])
+        self.assertEqual(result["identity_state"], "exited")
+
+    def test_missing_evidence_or_pidfd_support_is_unverified_without_open(self) -> None:
+        unsupported = supported_identity(
+            creation_token=None,
+            executable_path=None,
+            parent_pid=None,
+            process_group_id=None,
+            session_id=None,
+            supported=False,
+            unsupported_reason="missing evidence",
+        )
+        with patch.object(process_identity.sys, "platform", "linux"), patch.object(
+            process_identity, "_LinuxPidfdApi"
+        ) as native:
+            capability = open_stable_process_capability(unsupported)
+        native.assert_not_called()
+        self.assertEqual(capability.state, "unverified")
+        self.assertFalse(capability.terminate(force=True, wait_seconds=0)["attempted"])
+
+        with patch.object(process_identity.sys, "platform", "linux"), patch.object(
+            process_identity,
+            "_LinuxPidfdApi",
+            side_effect=OSError(errno.ENOSYS, "pidfd signaling unavailable"),
+        ):
+            capability = open_stable_process_capability(
+                supported_identity(executable_path="/usr/bin/python3")
+            )
+        self.assertEqual(capability.state, "unverified")
+
+    def test_windows_queries_and_terminates_through_one_persistent_handle(self) -> None:
+        api = FakeStableWindowsApi()
+        api.wait_results = [False, False, False, True]
+        expected = supported_identity(
+            pid=42,
+            creation_token=str((0x12345678 << 32) | 0x9ABCDEF0),
+            executable_path=r"C:\Python\python.exe",
+        )
+        with patch.object(process_identity.sys, "platform", "win32"), patch.object(
+            process_identity, "_WindowsApi", return_value=api
+        ):
+            with open_stable_process_capability(expected) as capability:
+                self.assertEqual(capability.state, "match")
+                result = capability.terminate(force=True, wait_seconds=2)
+
+        self.assertEqual(api.terminated, [(91, 1)])
+        self.assertEqual(api.closed, [91])
+        self.assertEqual(result["method"], "TerminateProcess")
+        for event in (("pid", 91), ("creation", 91), ("image", 91), ("terminate", 91, 1)):
+            self.assertIn(event, api.events)
+
+    def test_windows_image_mismatch_closes_handle_and_never_terminates(self) -> None:
+        api = FakeStableWindowsApi()
+        expected = supported_identity(
+            pid=42,
+            creation_token=str((0x12345678 << 32) | 0x9ABCDEF0),
+            executable_path=r"C:\Other\python.exe",
+        )
+        with patch.object(process_identity.sys, "platform", "win32"), patch.object(
+            process_identity, "_WindowsApi", return_value=api
+        ):
+            capability = open_stable_process_capability(expected)
+            result = capability.terminate(force=True, wait_seconds=0)
+
+        self.assertEqual(capability.state, "mismatch")
+        self.assertEqual(capability.differing_fields, ("executable_path",))
+        self.assertEqual(api.closed, [91])
+        self.assertEqual(api.terminated, [])
+        self.assertFalse(result["attempted"])
+
+    def test_closed_or_unsupported_capability_never_terminates(self) -> None:
+        api = FakeStableWindowsApi()
+        expected = supported_identity(
+            pid=42,
+            creation_token=str((0x12345678 << 32) | 0x9ABCDEF0),
+            executable_path=r"C:\Python\python.exe",
+        )
+        with patch.object(process_identity.sys, "platform", "win32"), patch.object(
+            process_identity, "_WindowsApi", return_value=api
+        ):
+            capability = open_stable_process_capability(expected)
+            capability.close()
+            capability.close()
+            result = capability.terminate(force=True, wait_seconds=0)
+        self.assertEqual(api.closed, [91])
+        self.assertEqual(api.terminated, [])
+        self.assertEqual(result["identity_state"], "unverified")
+
+        with patch.object(process_identity.sys, "platform", "darwin"), patch.object(
+            process_identity, "_WindowsApi"
+        ) as windows_api, patch.object(
+            process_identity, "_LinuxPidfdApi"
+        ) as linux_api:
+            capability = open_stable_process_capability(expected)
+            result = capability.terminate(force=True, wait_seconds=0)
+        windows_api.assert_not_called()
+        linux_api.assert_not_called()
+        self.assertEqual(capability.state, "unverified")
+        self.assertFalse(result["attempted"])
+        self.assertTrue(result["alive"])
 
 
 class LinuxProcessReaderTests(unittest.TestCase):

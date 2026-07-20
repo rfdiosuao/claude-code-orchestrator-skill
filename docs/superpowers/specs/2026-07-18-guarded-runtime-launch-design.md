@@ -169,13 +169,13 @@ The Windows visible helper is the absolute isolated Python worker itself, starte
 
 `stop_run` loads the recorded worker and child identities and compares them with live process evidence.
 
-- Exact match: terminate the child tree, then the worker if needed.
+- Exact match: send the nonce-bound cooperative request. On Windows, a cooperative timeout may terminate the verified Job-contained worker tree; on POSIX it remains `cleanup_incomplete` without a controller signal.
 - Process already exited: return `already_finished` without signaling any PID.
 - PID exists but identity differs: return `identity_mismatch`, emit a critical security event, and do not signal it.
 - Identity evidence is missing or unsupported: return `identity_unverified` and do not signal it.
-- `force=true`: use stronger termination only after an exact identity match.
+- `force=true`: use stronger controller termination only after an exact identity match and only where Windows Job containment proves the whole tree is owned.
 
-Normal background termination is worker-owned. After controller verification, a nonce-bound cooperative request tells the live worker to stop its child through the worker's `Popen` handle, Windows Job Object, or still-owned POSIX process group. Controller emergency termination is allowed only through a Windows process handle verified from that same handle or a Linux pidfd opened before identity comparison. Controller-side `taskkill`, raw PID signals, and process-group signals are prohibited; platforms without a non-reusable capability fail closed. A stop request artifact or cancelled aggregate status is written only after verification, and unverified/incomplete child stops keep the parent operation blocked.
+Normal background termination is worker-owned. After controller verification, a nonce-bound cooperative request tells the live worker to stop its child through the worker's `Popen` handle and Windows Job Object. Controller emergency termination is allowed only through a Windows process handle verified from that same handle. Controller-side `taskkill`, raw PID signals, and process-group signals are prohibited. POSIX parent-death signals and process groups do not contain descendants that change group/session or outlive their direct parent, so production POSIX runtime launch fails closed until a delegated cgroup-v2 `cgroup.kill` backend or equivalent kernel-enforced whole-tree capability is implemented. The built-in fake runtime may use a test-only process group for self-tests. A stop request artifact or cancelled aggregate status is written only after verification, and unverified/incomplete child stops keep the parent operation blocked.
 
 Legacy runs without `ProcessIdentity` remain readable and reportable. They cannot authorize `stop_run` or rollback behavior that sends process signals.
 
@@ -189,6 +189,7 @@ Security failures return structured error data with a stable code, message, safe
 - `unsafe_runtime_policy_missing`
 - `unsafe_runtime_request_missing`
 - `runtime_identity_changed`
+- `runtime_containment_unavailable`
 - `process_identity_mismatch`
 - `process_identity_unverified`
 - `secure_payload_store_unavailable`

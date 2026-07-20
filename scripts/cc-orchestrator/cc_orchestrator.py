@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import contextlib
 import contextvars
 import errno
@@ -75,6 +76,7 @@ from process_identity import (
     ProcessIdentity,
     capture_process_identity,
     compare_process_identity,
+    open_stable_process_capability,
 )
 from runtime_security import (
     ExecutableIdentity,
@@ -151,6 +153,22 @@ _ACTIVE_CLEANUP_OWNERS: dict[str, threading.Thread] = {}
 _ACTIVE_CLEANUP_OWNERS_LOCK = threading.Lock()
 TERMINALIZATION_TIMEOUT_SECONDS = 1.0
 WORKER_FINALIZATION_GRACE_SECONDS = TERMINALIZATION_TIMEOUT_SECONDS + 0.25
+
+_LINUX_PR_SET_PDEATHSIG = 1
+_LINUX_PRCTL = None
+if sys.platform.startswith("linux"):
+    try:
+        _LINUX_PRCTL = ctypes.CDLL(None, use_errno=True).prctl
+        _LINUX_PRCTL.argtypes = (
+            ctypes.c_int,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+        )
+        _LINUX_PRCTL.restype = ctypes.c_int
+    except (AttributeError, OSError):
+        _LINUX_PRCTL = None
 
 
 def _effective_deadline(deadline: float | None = None) -> float | None:
@@ -1359,9 +1377,20 @@ def run_dir_active(run_dir: Path) -> bool:
             or metadata.get("cleanup_state") == "cleanup_incomplete"
         ):
             return True
-        return any(
-            pid_alive(int(metadata.get(field) or 0))
-            for field in ("child_pid", "worker_pid", "owned_process_pid")
+        worker = _process_identity_observation(
+            metadata,
+            pid_field="worker_pid",
+            identity_field="worker_process_identity",
+        )
+        child = _process_identity_observation(
+            metadata,
+            pid_field="child_pid",
+            identity_field="child_process_identity",
+        )
+        return (
+            bool(worker["alive"])
+            or bool(child["alive"])
+            or pid_alive(int(metadata.get("owned_process_pid") or 0))
         )
     except Exception:
         return True
@@ -5401,42 +5430,26 @@ def pid_alive(pid: int | None) -> bool:
         return False
 
 
-def terminate_process_tree(pid: int, force: bool = False, wait_seconds: int = 5) -> dict[str, Any]:
-    """Terminate a process and its children where the platform supports it."""
-    if pid <= 0:
-        return {"pid": pid, "attempted": False, "alive": False, "method": "invalid-pid"}
-    if not pid_alive(pid):
-        return {"pid": pid, "attempted": False, "alive": False, "method": "already-exited"}
-    method = "os.kill"
-    if os.name == "nt":
-        cmd = ["taskkill", "/PID", str(pid), "/T"]
-        if force:
-            cmd.append("/F")
-        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=max(wait_seconds, 1) + 5)
-        time.sleep(min(max(wait_seconds, 1), 5))
-        alive = pid_alive(pid)
+def terminate_process_tree(
+    expected_identity: ProcessIdentity,
+    *,
+    force: bool = False,
+    wait_seconds: int = 5,
+) -> dict[str, Any]:
+    """Terminate only through an identity-bound stable process capability."""
+    if not isinstance(expected_identity, ProcessIdentity):
+        raise TypeError("expected_identity must be a ProcessIdentity")
+    if sys.platform != "win32":
         return {
-            "pid": pid,
-            "attempted": True,
-            "alive": alive,
-            "method": "taskkill",
-            "exit_code": proc.returncode,
-            "stdout": str(redact(proc.stdout or ""))[-1000:],
-            "stderr": str(redact(proc.stderr or ""))[-1000:],
+            "pid": expected_identity.pid,
+            "attempted": False,
+            "alive": True,
+            "identity_state": "unverified",
+            "differing_fields": ["process_tree_containment"],
+            "method": None,
         }
-    sig = signal.SIGKILL if force else signal.SIGTERM
-    try:
-        try:
-            os.killpg(os.getpgid(pid), sig)
-            method = "os.killpg"
-        except Exception:
-            os.kill(pid, sig)
-        deadline = time.time() + max(wait_seconds, 1)
-        while time.time() < deadline and pid_alive(pid):
-            time.sleep(0.1)
-        return {"pid": pid, "attempted": True, "alive": pid_alive(pid), "method": method, "signal": int(sig)}
-    except OSError as exc:
-        return {"pid": pid, "attempted": True, "alive": pid_alive(pid), "method": method, "error": str(exc)}
+    with open_stable_process_capability(expected_identity) as capability:
+        return capability.terminate(force=force, wait_seconds=wait_seconds)
 
 
 def read_file_delta(path: Path, offset: int = 0, max_bytes: int = 20000) -> dict[str, Any]:
@@ -8703,6 +8716,58 @@ def _resume_windows_process(process: subprocess.Popen[Any]) -> None:
         raise OSError(status, "Owned Windows process could not be resumed.")
 
 
+def _linux_parent_death_preexec(*, expected_parent_pid: int | None = None) -> None:
+    parent_pid = (
+        int(expected_parent_pid)
+        if expected_parent_pid is not None
+        else os.getppid()
+    )
+    if os.getppid() != parent_pid:
+        os._exit(127)
+        return
+    if _LINUX_PRCTL is None or _LINUX_PRCTL(
+        _LINUX_PR_SET_PDEATHSIG,
+        int(signal.SIGKILL),
+        0,
+        0,
+        0,
+    ) != 0:
+        os._exit(127)
+        return
+    if os.getppid() != parent_pid:
+        os._exit(127)
+
+
+def runtime_tree_containment_support() -> dict[str, Any]:
+    if sys.platform == "win32":
+        return {
+            "supported": True,
+            "mechanism": "windows_job_object_kill_on_close",
+            "reason": None,
+            "test_only": False,
+        }
+    fixture = _TEST_ONLY_RUNTIME_CANDIDATE.get()
+    if (
+        fixture is not None
+        and fixture.source == "explicit_mock_stream_test_fixture"
+    ):
+        return {
+            "supported": True,
+            "mechanism": "test_fixture_process_group",
+            "reason": None,
+            "test_only": True,
+        }
+    return {
+        "supported": False,
+        "mechanism": None,
+        "reason": (
+            "Kernel-enforced whole-tree containment is unavailable; parent-death "
+            "signals and process groups do not cover escaped descendants."
+        ),
+        "test_only": False,
+    }
+
+
 def _owned_process_popen(
     command: list[str],
     *,
@@ -8739,6 +8804,15 @@ def _owned_process_popen(
         kwargs["creationflags"] = creationflags
     else:
         kwargs["start_new_session"] = True
+        if sys.platform.startswith("linux"):
+            if _LINUX_PRCTL is None:
+                raise OrchestratorError(
+                    "Linux parent-death process containment is unavailable."
+                )
+            kwargs["preexec_fn"] = functools.partial(
+                _linux_parent_death_preexec,
+                expected_parent_pid=os.getpid(),
+            )
     if final_identity is not None and not final_identity.matches_current_file():
         if job is not None:
             _close_windows_handle(job)
@@ -8866,6 +8940,14 @@ def _terminate_owned_containment(
                 raise
             return
         if record.root_reaped or record.process.poll() is not None:
+            return
+        try:
+            live_group = os.getpgid(int(record.process.pid))
+        except (ProcessLookupError, PermissionError, OSError):
+            record.proof_failures.append("process_group_identity_unverified")
+            return
+        if live_group != int(record.handle):
+            record.proof_failures.append("process_group_identity_mismatch")
             return
         if not force:
             try:
@@ -10979,6 +11061,26 @@ def _start_prepared_worker_launch_inner(
             status="blocked_runtime_launch",
             error=_launch_failure_error(
                 "artifact_write_failed", "Run artifacts could not be initialized atomically."
+            ),
+        )
+    containment = runtime_tree_containment_support()
+    if not containment["supported"]:
+        return _record_blocked_launch(
+            run_dir,
+            metadata,
+            sensitive_values=prepared.sensitive_values,
+            status="blocked_runtime_launch",
+            error=_security_error(
+                "runtime_containment_unavailable",
+                "The runtime was not started because whole-process-tree containment is unavailable.",
+                safe_details={
+                    "platform": sys.platform,
+                    "required_mechanism": "kernel_enforced_process_tree",
+                },
+                suggested_action=(
+                    "Run on Windows with Job Object support or install a future "
+                    "guarded cgroup-v2 runtime backend before retrying."
+                ),
             ),
         )
     if prepared.mode == "one_shot":
@@ -13399,7 +13501,7 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
             exit_code = proc.poll()
             if exit_code is not None:
                 break
-            if (run_dir / "stop-requested.json").exists():
+            if _valid_stop_request(run_dir, metadata):
                 stopped = True
                 io_cancel.set()
                 terminate_child_once()
@@ -14115,6 +14217,75 @@ def stream_worker(run_id: str) -> dict[str, Any]:
         _OPERATION_DEADLINE.reset(token)
 
 
+def _process_identity_observation(
+    metadata: Mapping[str, Any],
+    *,
+    pid_field: str,
+    identity_field: str,
+) -> dict[str, Any]:
+    raw_pid = metadata.get(pid_field)
+    if not isinstance(raw_pid, int) or isinstance(raw_pid, bool) or raw_pid <= 0:
+        return {
+            "pid": raw_pid,
+            "alive": False,
+            "owned": False,
+            "state": "exited",
+            "differing_fields": [],
+            "expected": None,
+        }
+    raw_identity = metadata.get(identity_field)
+    if not isinstance(raw_identity, Mapping):
+        alive = pid_alive(raw_pid)
+        return {
+            "pid": raw_pid,
+            "alive": alive,
+            "owned": False,
+            "state": "unverified" if alive else "exited",
+            "differing_fields": [],
+            "expected": None,
+        }
+    try:
+        expected = ProcessIdentity.from_dict(raw_identity)
+    except (TypeError, ValueError):
+        alive = pid_alive(raw_pid)
+        return {
+            "pid": raw_pid,
+            "alive": alive,
+            "owned": False,
+            "state": "unverified" if alive else "exited",
+            "differing_fields": [],
+            "expected": None,
+        }
+    launch = metadata.get("runtime_launch")
+    launch_nonce = (
+        str(launch.get("launch_nonce") or "")
+        if isinstance(launch, Mapping)
+        else ""
+    )
+    if expected.pid != raw_pid or not launch_nonce:
+        differing = ["pid"] if expected.pid != raw_pid else ["launch_nonce"]
+        return {
+            "pid": raw_pid,
+            "alive": True,
+            "owned": False,
+            "state": "mismatch" if expected.pid != raw_pid else "unverified",
+            "differing_fields": differing,
+            "expected": expected,
+        }
+    check = compare_process_identity(
+        expected,
+        expected_launch_nonce=launch_nonce,
+    )
+    return {
+        "pid": raw_pid,
+        "alive": check.state != "exited",
+        "owned": check.state == "match",
+        "state": check.state,
+        "differing_fields": list(check.differing_fields),
+        "expected": expected,
+    }
+
+
 def single_run_status(run_id: str, include_output_tail: bool = True, tail_chars: int = 4000) -> dict[str, Any]:
     run_dir = safe_run_dir(run_id)
     metadata = read_metadata(run_dir)
@@ -14122,8 +14293,18 @@ def single_run_status(run_id: str, include_output_tail: bool = True, tail_chars:
     child_pid = metadata.get("child_pid")
     worker_pid = metadata.get("worker_pid")
     owned_process_pid = metadata.get("owned_process_pid")
-    child_alive = pid_alive(int(child_pid)) if child_pid else False
-    worker_alive = pid_alive(int(worker_pid)) if worker_pid else False
+    child_identity = _process_identity_observation(
+        metadata,
+        pid_field="child_pid",
+        identity_field="child_process_identity",
+    )
+    worker_identity = _process_identity_observation(
+        metadata,
+        pid_field="worker_pid",
+        identity_field="worker_process_identity",
+    )
+    child_alive = bool(child_identity["alive"])
+    worker_alive = bool(worker_identity["alive"])
     owned_process_alive = (
         pid_alive(int(owned_process_pid)) if owned_process_pid else False
     )
@@ -14131,11 +14312,12 @@ def single_run_status(run_id: str, include_output_tail: bool = True, tail_chars:
         status in {"cleanup_pending", "cleanup_incomplete"}
         or metadata.get("cleanup_state") == "cleanup_incomplete"
     )
-    active = cleanup_unconfirmed or status in {
-        "starting",
-        "running",
-        "stop_requested",
-    } and (child_alive or worker_alive or owned_process_alive)
+    active = (
+        cleanup_unconfirmed
+        or child_alive
+        or worker_alive
+        or owned_process_alive
+    )
     if status in {"starting", "running", "stop_requested"} and not active:
         if metadata.get("finished_at") or metadata.get("exit_code") is not None:
             exit_code = metadata.get("exit_code")
@@ -14191,6 +14373,16 @@ def single_run_status(run_id: str, include_output_tail: bool = True, tail_chars:
         "worker_alive": worker_alive,
         "child_alive": child_alive,
         "owned_process_alive": owned_process_alive,
+        "worker_identity_state": worker_identity["state"],
+        "worker_identity_differing_fields": worker_identity[
+            "differing_fields"
+        ],
+        "worker_owned": worker_identity["owned"],
+        "child_identity_state": child_identity["state"],
+        "child_identity_differing_fields": child_identity[
+            "differing_fields"
+        ],
+        "child_owned": child_identity["owned"],
         "cleanup_state": metadata.get("cleanup_state"),
         "cleanup_owner": metadata.get("cleanup_owner"),
         "live_cleanup_threads": list(metadata.get("live_cleanup_threads") or []),
@@ -14330,8 +14522,71 @@ def poll_run(
     }
 
 
+def _stop_identity_failure(
+    run_id: str,
+    status: Mapping[str, Any],
+    *,
+    identity_state: str,
+    differing_fields: list[str] | tuple[str, ...] = (),
+) -> dict[str, Any]:
+    mismatch = identity_state == "mismatch"
+    code = "process_identity_mismatch" if mismatch else "process_identity_unverified"
+    response_status = "identity_mismatch" if mismatch else "identity_unverified"
+    error = _security_error(
+        code,
+        (
+            "The recorded worker identity no longer matches the live process."
+            if mismatch
+            else "The worker identity could not be verified through a stable process capability."
+        ),
+        safe_details={
+            "run_id": run_id,
+            "differing_fields": list(differing_fields),
+        },
+        suggested_action=(
+            "Do not retry termination by PID; inspect the run and clean up the owned process manually."
+        ),
+    )
+    return {
+        "ok": False,
+        "run_id": run_id,
+        "previous_status": status.get("status"),
+        "status": response_status,
+        "active": bool(status.get("active")),
+        "stopped": False,
+        "identity_state": identity_state,
+        "differing_fields": list(differing_fields),
+        "security_error": error.to_dict(),
+        "next_step": error.suggested_action,
+        "stop_results": [],
+    }
+
+
+def _valid_stop_request(run_dir: Path, metadata: Mapping[str, Any]) -> bool:
+    try:
+        payload = _read_bounded_regular_file(
+            run_dir / "stop-requested.json",
+            MAX_MANAGED_ARTIFACT_BYTES,
+        )
+        request = json.loads(payload.decode("utf-8"))
+    except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    launch = metadata.get("runtime_launch")
+    if not isinstance(request, Mapping) or not isinstance(launch, Mapping):
+        return False
+    return (
+        request.get("run_id") == metadata.get("run_id")
+        and request.get("launch_nonce") == launch.get("launch_nonce")
+        and isinstance(request.get("request_id"), str)
+        and bool(request.get("request_id"))
+        and isinstance(request.get("requested_at"), str)
+        and isinstance(request.get("force"), bool)
+    )
+
+
 def stop_run(run_id: str, force: bool = False, timeout_seconds: int = 5) -> dict[str, Any]:
     run_dir = safe_run_dir(run_id)
+    metadata = read_metadata(run_dir)
     status = single_run_status(run_id, include_output_tail=False)
     if not status.get("active"):
         final_status = status.get("status")
@@ -14343,18 +14598,104 @@ def stop_run(run_id: str, force: bool = False, timeout_seconds: int = 5) -> dict
             "active": False,
             "exit_code": status.get("exit_code"),
         }
+    observation = _process_identity_observation(
+        metadata,
+        pid_field="worker_pid",
+        identity_field="worker_process_identity",
+    )
+    expected_identity = observation.get("expected")
+    if observation["state"] != "match" or not isinstance(
+        expected_identity, ProcessIdentity
+    ):
+        return _stop_identity_failure(
+            run_id,
+            status,
+            identity_state=str(observation["state"]),
+            differing_fields=observation["differing_fields"],
+        )
+    launch = metadata.get("runtime_launch")
+    launch_nonce = (
+        str(launch.get("launch_nonce") or "")
+        if isinstance(launch, Mapping)
+        else ""
+    )
+    if not launch_nonce:
+        return _stop_identity_failure(
+            run_id,
+            status,
+            identity_state="unverified",
+        )
     requested_at = utc_now_iso()
-    (run_dir / "stop-requested.json").write_text(json.dumps({"requested_at": requested_at, "force": force}, ensure_ascii=False), encoding="utf-8")
-    update_metadata(run_dir, status="stop_requested", stop_requested_at=requested_at, stop_reason="user_requested")
-    append_event(run_dir, {"type": "stop_requested", "force": force})
+    request = {
+        "request_id": uuid.uuid4().hex,
+        "run_id": run_id,
+        "launch_nonce": launch_nonce,
+        "requested_at": requested_at,
+        "force": force,
+    }
     results: list[dict[str, Any]] = []
-    child_pid = status.get("child_pid")
-    worker_pid = status.get("worker_pid")
-    if child_pid:
-        results.append(terminate_process_tree(int(child_pid), force=force, wait_seconds=timeout_seconds))
+    _atomic_write_text(
+        run_dir / "stop-requested.json",
+        json.dumps(request, ensure_ascii=False, indent=2),
+    )
+    update_metadata(
+        run_dir,
+        status="stop_requested",
+        stop_requested_at=requested_at,
+        stop_reason="user_requested",
+        stop_request_id=request["request_id"],
+    )
+    append_event(run_dir, {"type": "stop_requested", "force": force})
+    deadline = time.monotonic() + max(0, int(timeout_seconds))
     refreshed = single_run_status(run_id, include_output_tail=False)
-    if refreshed.get("active") and worker_pid:
-        results.append(terminate_process_tree(int(worker_pid), force=True if force else False, wait_seconds=timeout_seconds))
+    while refreshed.get("active") and time.monotonic() < deadline:
+        time.sleep(min(0.05, max(0.001, deadline - time.monotonic())))
+        refreshed = single_run_status(run_id, include_output_tail=False)
+    if refreshed.get("active"):
+        if sys.platform != "win32":
+            update_metadata(
+                run_dir,
+                cleanup_state="cleanup_incomplete",
+                stop_cleanup_state="cleanup_incomplete",
+            )
+            failure = _stop_identity_failure(
+                run_id,
+                refreshed,
+                identity_state="unverified",
+                differing_fields=["process_tree_containment"],
+            )
+            failure["cleanup_state"] = "cleanup_incomplete"
+            return failure
+        with open_stable_process_capability(expected_identity) as capability:
+            if capability.state != "match":
+                after_capability = single_run_status(
+                    run_id, include_output_tail=False
+                )
+                if capability.state == "exited" and not after_capability.get(
+                    "active"
+                ):
+                    refreshed = after_capability
+                else:
+                    update_metadata(
+                        run_dir,
+                        cleanup_state="cleanup_incomplete",
+                        stop_cleanup_state="cleanup_incomplete",
+                    )
+                    failure = _stop_identity_failure(
+                        run_id,
+                        after_capability,
+                        identity_state=capability.state,
+                        differing_fields=capability.differing_fields,
+                    )
+                    failure["cleanup_state"] = "cleanup_incomplete"
+                    return failure
+            else:
+                results.append(
+                    capability.terminate(
+                        force=force,
+                        wait_seconds=max(0, int(timeout_seconds)),
+                    )
+                )
     final = single_run_status(run_id, include_output_tail=False)
     stopped = not final.get("active")
     stopped_at = utc_now_iso()
@@ -14362,14 +14703,23 @@ def stop_run(run_id: str, force: bool = False, timeout_seconds: int = 5) -> dict
         update_metadata(run_dir, status="stopped", stopped_at=stopped_at, finished_at=stopped_at, exit_code=final.get("exit_code") if final.get("exit_code") is not None else -15, stop_reason="user_requested")
         append_event(run_dir, {"type": "stopped", "status": "stopped"})
         final = single_run_status(run_id, include_output_tail=False)
+    else:
+        update_metadata(
+            run_dir,
+            cleanup_state="cleanup_incomplete",
+            stop_cleanup_state="cleanup_incomplete",
+        )
     return {
-        "ok": True,
+        "ok": stopped,
         "run_id": run_id,
         "previous_status": status.get("status"),
-        "status": final.get("status"),
+        "status": final.get("status") if stopped else "cleanup_incomplete",
         "active": final.get("active"),
         "force": force,
         "stopped": stopped,
+        "cleanup_state": (
+            "cleanup_confirmed" if stopped else "cleanup_incomplete"
+        ),
         "stop_results": results,
     }
 
@@ -16916,11 +17266,15 @@ def _security_response_fields(value: Any) -> dict[str, Any]:
 
 
 def _stop_response_confirmed(stop: Mapping[str, Any]) -> bool:
+    status = str(stop.get("status") or "")
     return bool(
         stop.get("ok") is True
-        and stop.get("stopped") is True
         and stop.get("active") is not True
-        and str(stop.get("status") or "")
+        and (
+            stop.get("stopped") is True
+            or status in {"stopped", "already_stopped", "already_finished"}
+        )
+        and status
         not in {
             "cleanup_pending",
             "cleanup_incomplete",
@@ -17245,9 +17599,11 @@ def queue_submit(
 
 def refresh_queue_job(job: dict[str, Any]) -> dict[str, Any]:
     if (
-        job.get("status") == "cancel_pending_cleanup"
+        job.get("status")
+        in {"cancel_pending_cleanup", "timeout_pending_cleanup"}
         and job.get("run_id")
     ):
+        pending_status = str(job["status"])
         status = single_run_status(
             str(job["run_id"]), include_output_tail=False
         )
@@ -17256,7 +17612,11 @@ def refresh_queue_job(job: dict[str, Any]) -> dict[str, Any]:
             "cleanup_incomplete",
         }:
             return job
-        job["status"] = "cancelled"
+        job["status"] = (
+            "timed_out"
+            if pending_status == "timeout_pending_cleanup"
+            else "cancelled"
+        )
         job["cleanup_state"] = "cleanup_confirmed"
         job["updated_at"] = utc_now_iso()
         _delete_queue_payload(job)
@@ -17268,9 +17628,36 @@ def refresh_queue_job(job: dict[str, Any]) -> dict[str, Any]:
     timeout = int(job.get("timeout_seconds") or 0)
     if status.get("active") and timeout and started_age is not None and started_age > timeout:
         stopped = stop_run(str(job["run_id"]), force=True)
-        job["status"] = "timed_out"
-        job["last_error"] = f"Queue timeout after {timeout}s; stop result: {stopped.get('status')}"
+        stop_confirmed = _stop_response_confirmed(stopped)
+        job["status"] = (
+            "timed_out" if stop_confirmed else "timeout_pending_cleanup"
+        )
+        job["cleanup_state"] = (
+            "cleanup_confirmed"
+            if stop_confirmed
+            else str(
+                stopped.get("cleanup_state")
+                or stopped.get("status")
+                or "cleanup_incomplete"
+            )
+        )
+        job["timeout_stop"] = {
+            key: stopped.get(key)
+            for key in (
+                "ok",
+                "status",
+                "active",
+                "stopped",
+                "cleanup_state",
+            )
+        }
+        job["last_error"] = (
+            f"Queue timeout after {timeout}s; stop result: "
+            f"{stopped.get('status')}"
+        )
         job["updated_at"] = utc_now_iso()
+        if stop_confirmed:
+            _delete_queue_payload(job)
         return job
     if status.get("active"):
         return job
@@ -17340,6 +17727,33 @@ def _reconcile_abandoned_queue_claim(job: dict[str, Any]) -> bool:
     return True
 
 
+def _queue_launch_claim_owner_state(launch_claim: object) -> str:
+    if not isinstance(launch_claim, Mapping):
+        return "unverified"
+    claim_id = launch_claim.get("claim_id")
+    owner_pid = launch_claim.get("owner_pid")
+    identity_data = launch_claim.get("owner_process_identity")
+    if (
+        not isinstance(claim_id, str)
+        or not claim_id
+        or not isinstance(owner_pid, int)
+        or isinstance(owner_pid, bool)
+        or owner_pid <= 0
+        or not isinstance(identity_data, Mapping)
+    ):
+        return "unverified"
+    try:
+        expected = ProcessIdentity.from_dict(identity_data)
+    except (TypeError, ValueError):
+        return "unverified"
+    if expected.pid != owner_pid or expected.launch_nonce != claim_id:
+        return "mismatch"
+    return compare_process_identity(
+        expected,
+        expected_launch_nonce=claim_id,
+    ).state
+
+
 def _queue_occupied_count(
     run_snapshot: Mapping[str, Any], jobs: list[dict[str, Any]]
 ) -> int:
@@ -17356,7 +17770,12 @@ def _queue_occupied_count(
         str(job.get("run_id"))
         for job in jobs
         if job.get("status")
-        in {"running", "cancel_pending_cleanup", "cleanup_incomplete"}
+        in {
+            "running",
+            "cancel_pending_cleanup",
+            "timeout_pending_cleanup",
+            "cleanup_incomplete",
+        }
         and isinstance(job.get("run_id"), str)
     }
     launching_run_ids = {
@@ -17392,17 +17811,8 @@ def queue_tick(max_concurrent: int | None = None) -> dict[str, Any]:
             if job.get("status") != "launching":
                 continue
             launch_claim = job.get("launch_claim")
-            owner_pid = (
-                launch_claim.get("owner_pid")
-                if isinstance(launch_claim, Mapping)
-                else None
-            )
-            if (
-                isinstance(owner_pid, int)
-                and not isinstance(owner_pid, bool)
-                and owner_pid > 0
-                and pid_alive(owner_pid)
-            ):
+            claim_owner_state = _queue_launch_claim_owner_state(launch_claim)
+            if claim_owner_state == "match":
                 continue
             if _reconcile_abandoned_queue_claim(job):
                 continue
@@ -17411,7 +17821,12 @@ def queue_tick(max_concurrent: int | None = None) -> dict[str, Any]:
                 if job.get("unsafe_runtime_grant") is not None
                 else "blocked_launch_claim"
             )
-            job["last_error"] = "queue_launch_claim_abandoned"
+            job["last_error"] = (
+                "queue_launch_claim_abandoned"
+                if claim_owner_state in {"mismatch", "exited"}
+                else "queue_launch_claim_identity_unverified"
+            )
+            job["launch_claim_identity_state"] = claim_owner_state
             job["updated_at"] = utc_now_iso()
             job.pop("launch_claim", None)
             _delete_queue_payload(job)
@@ -17427,6 +17842,17 @@ def queue_tick(max_concurrent: int | None = None) -> dict[str, Any]:
             key=lambda item: (-int(item.get("priority") or 0), str(item.get("created_at") or "")),
         )
         for job in pending[:slots]:
+            claim_id = uuid.uuid4().hex
+            try:
+                owner_identity = capture_process_identity(
+                    os.getpid(), launch_nonce=claim_id
+                )
+            except (OSError, TypeError, ValueError):
+                owner_identity = None
+            if owner_identity is None or not owner_identity.supported:
+                job["last_error"] = "queue_controller_identity_unverified"
+                job["updated_at"] = utc_now_iso()
+                continue
             grant = job.get("unsafe_runtime_grant")
             unsafe = grant is not None
             if unsafe:
@@ -17447,11 +17873,11 @@ def queue_tick(max_concurrent: int | None = None) -> dict[str, Any]:
                     continue
                 grant["uses_remaining"] = 0
                 grant["consumed_at"] = utc_now_iso()
-            claim_id = uuid.uuid4().hex
             job["status"] = "launching"
             job["launch_claim"] = {
                 "claim_id": claim_id,
                 "owner_pid": os.getpid(),
+                "owner_process_identity": owner_identity.to_dict(),
                 "claimed_at": utc_now_iso(),
             }
             job["updated_at"] = utc_now_iso()
@@ -17724,6 +18150,7 @@ def queue_status(include_finished: bool = True) -> dict[str, Any]:
                 "launching",
                 "running",
                 "cancel_pending_cleanup",
+                "timeout_pending_cleanup",
                 "cleanup_incomplete",
             }
         ]
@@ -17824,6 +18251,7 @@ def queue_cancel(job_id: str) -> dict[str, Any]:
                 "running",
                 "launching",
                 "cancel_pending_cleanup",
+                "timeout_pending_cleanup",
                 "cleanup_incomplete",
             } and isinstance(run_id, str):
                 try:
@@ -19111,6 +19539,54 @@ def workflow_retry_node(workflow_id: str, node_id: str, cwd: Path | None = None)
     if node_id not in nodes:
         raise OrchestratorError(f"Unknown workflow node: {node_id}")
     invalidated = {node_id, *workflow_descendants(nodes, node_id)}
+    stopped: list[dict[str, Any]] = []
+    for item in sorted(invalidated):
+        node_state = (status.get("nodes") or {}).get(item)
+        if not isinstance(node_state, dict) or not node_state.get("run_id"):
+            continue
+        try:
+            stop = stop_run(str(node_state["run_id"]), force=True)
+        except Exception as exc:
+            stop = {
+                "ok": False,
+                "status": "cleanup_incomplete",
+                "active": True,
+                "stopped": False,
+                "cleanup_state": "cleanup_incomplete",
+                "error": str(exc),
+            }
+        confirmed = _stop_response_confirmed(stop)
+        stopped.append({"node_id": item, "confirmed": confirmed, "stop": stop})
+        if not confirmed:
+            node_state["state"] = "cancel_pending_cleanup"
+            node_state["cleanup_state"] = str(
+                stop.get("cleanup_state")
+                or stop.get("status")
+                or "cleanup_incomplete"
+            )
+    if any(not item["confirmed"] for item in stopped):
+        status["status"] = "cleanup_incomplete"
+        status["block_reason"] = "workflow_retry_cleanup_unconfirmed"
+        status.setdefault("decisions", []).append(
+            workflow_decision(
+                node_id,
+                "block",
+                "manual retry cleanup was not confirmed",
+                invalidated=sorted(invalidated),
+                requires_controller_takeover=True,
+            )
+        )
+        write_workflow_status(workflow_dir, status)
+        return {
+            "ok": False,
+            "workflow_id": workflow_id,
+            "node_id": node_id,
+            "invalidated": [],
+            "pending_invalidation": sorted(invalidated),
+            "stopped": stopped,
+            "status": status["status"],
+            "status_path": str(workflow_dir / "status.json"),
+        }
     for item in invalidated:
         if item in status.get("nodes", {}):
             invalidate_workflow_node_evidence(status["nodes"][item], reason="manual retry requested")
@@ -19130,23 +19606,59 @@ def workflow_retry_node(workflow_id: str, node_id: str, cwd: Path | None = None)
         )
     )
     write_workflow_status(workflow_dir, status)
-    return {"ok": True, "workflow_id": workflow_id, "node_id": node_id, "invalidated": sorted(invalidated), "status_path": str(workflow_dir / "status.json")}
+    return {"ok": True, "workflow_id": workflow_id, "node_id": node_id, "invalidated": sorted(invalidated), "stopped": stopped, "status_path": str(workflow_dir / "status.json")}
 
 
 def workflow_stop(workflow_id: str, force: bool = False, cwd: Path | None = None) -> dict[str, Any]:
     workflow_dir = safe_workflow_dir(workflow_id, cwd=cwd)
     status = read_json_file(workflow_dir / "status.json", {})
     stopped: list[dict[str, Any]] = []
+    cleanup_states = {"cancel_pending_cleanup", "cleanup_incomplete"}
     for node_id, node in (status.get("nodes") or {}).items():
-        if node.get("state") == "running" and node.get("run_id"):
-            stopped.append({"node_id": node_id, "stop": stop_run(str(node["run_id"]), force=force)})
-            node["state"] = "cancelled"
-    status["status"] = "cancelled"
+        if node.get("state") in {"running", *cleanup_states} and node.get("run_id"):
+            try:
+                stop = stop_run(str(node["run_id"]), force=force)
+            except Exception as exc:
+                stop = {
+                    "ok": False,
+                    "status": "cleanup_incomplete",
+                    "active": True,
+                    "stopped": False,
+                    "cleanup_state": "cleanup_incomplete",
+                    "error": str(exc),
+                }
+            confirmed = _stop_response_confirmed(stop)
+            stopped.append(
+                {"node_id": node_id, "confirmed": confirmed, "stop": stop}
+            )
+            node["state"] = (
+                "cancelled" if confirmed else "cancel_pending_cleanup"
+            )
+            if not confirmed:
+                node["cleanup_state"] = str(
+                    stop.get("cleanup_state")
+                    or stop.get("status")
+                    or "cleanup_incomplete"
+                )
+            else:
+                node["cleanup_state"] = "cleanup_confirmed"
+    cleanup_incomplete = any(not item["confirmed"] for item in stopped) or any(
+        node.get("state") in cleanup_states
+        for node in (status.get("nodes") or {}).values()
+    )
+    status["status"] = (
+        "cleanup_incomplete" if cleanup_incomplete else "cancelled"
+    )
     status.setdefault("decisions", []).append(
         workflow_decision(None, "cancel", "workflow-stop requested", requires_controller_takeover=True)
     )
     write_workflow_status(workflow_dir, status)
-    return {"ok": True, "workflow_id": workflow_id, "stopped": stopped, "status": "cancelled"}
+    return {
+        "ok": not cleanup_incomplete,
+        "workflow_id": workflow_id,
+        "stopped": stopped,
+        "status": status["status"],
+    }
 
 
 def default_auto_policy() -> dict[str, Any]:

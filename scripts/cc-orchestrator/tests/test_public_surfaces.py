@@ -26,7 +26,10 @@ if str(TESTS_DIR) not in sys.path:
 from _support import ORCHESTRATOR_DIR  # noqa: E402
 
 import cc_orchestrator as orchestrator  # noqa: E402
-from secure_payload_store import InMemorySecurePayloadStore  # noqa: E402
+from secure_payload_store import (  # noqa: E402
+    InMemorySecurePayloadStore,
+    SecurePayloadStoreError,
+)
 
 
 PUBLIC_APIS = (
@@ -782,6 +785,225 @@ class PublicSurfaceContractTests(unittest.TestCase):
             benchmark["security_error"]["code"], "runtime_not_trusted"
         )
 
+    def test_workflow_stop_preserves_unconfirmed_cleanup_state(self) -> None:
+        workflow = {
+            "status": "running",
+            "nodes": {
+                "review": {"state": "running", "run_id": "run-review"}
+            },
+            "decisions": [],
+        }
+        persisted: dict[str, object] = {}
+        with tempfile.TemporaryDirectory(prefix="workflow-stop-") as temp:
+            with (
+                patch.object(
+                    orchestrator, "safe_workflow_dir", return_value=Path(temp)
+                ),
+                patch.object(
+                    orchestrator, "read_json_file", return_value=workflow
+                ),
+                patch.object(
+                    orchestrator,
+                    "stop_run",
+                    return_value={
+                        "ok": False,
+                        "status": "identity_unverified",
+                        "active": True,
+                        "stopped": False,
+                    },
+                ),
+                patch.object(
+                    orchestrator,
+                    "write_workflow_status",
+                    side_effect=lambda _path, value: persisted.update(value),
+                ),
+            ):
+                result = orchestrator.workflow_stop("workflow-fixture")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "cleanup_incomplete")
+        self.assertEqual(
+            persisted["nodes"]["review"]["state"],
+            "cancel_pending_cleanup",
+        )
+        self.assertEqual(persisted["status"], "cleanup_incomplete")
+
+    def test_workflow_stop_retries_pending_cleanup_without_false_success(self) -> None:
+        workflow = {
+            "status": "cleanup_incomplete",
+            "nodes": {
+                "review": {
+                    "state": "cancel_pending_cleanup",
+                    "run_id": "run-review",
+                }
+            },
+            "decisions": [],
+        }
+        with tempfile.TemporaryDirectory(prefix="workflow-restop-") as temp:
+            with (
+                patch.object(
+                    orchestrator, "safe_workflow_dir", return_value=Path(temp)
+                ),
+                patch.object(
+                    orchestrator, "read_json_file", return_value=workflow
+                ),
+                patch.object(
+                    orchestrator,
+                    "stop_run",
+                    return_value={
+                        "ok": False,
+                        "status": "identity_unverified",
+                        "active": True,
+                        "stopped": False,
+                    },
+                ) as stop,
+                patch.object(orchestrator, "write_workflow_status"),
+            ):
+                result = orchestrator.workflow_stop("workflow-fixture")
+        stop.assert_called_once_with("run-review", force=False)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "cleanup_incomplete")
+        self.assertEqual(
+            workflow["nodes"]["review"]["state"],
+            "cancel_pending_cleanup",
+        )
+
+    def test_workflow_retry_keeps_run_evidence_until_cleanup_is_confirmed(self) -> None:
+        workflow = {
+            "status": "running",
+            "nodes": {
+                "build": {"state": "running", "run_id": "run-build"}
+            },
+            "decisions": [],
+        }
+        with tempfile.TemporaryDirectory(prefix="workflow-retry-") as temp:
+            with (
+                patch.object(
+                    orchestrator, "safe_workflow_dir", return_value=Path(temp)
+                ),
+                patch.object(
+                    orchestrator, "read_json_file", return_value=workflow
+                ),
+                patch.object(orchestrator, "load_workflow_spec", return_value={}),
+                patch.object(
+                    orchestrator, "workflow_nodes", return_value={"build": {}}
+                ),
+                patch.object(
+                    orchestrator, "workflow_descendants", return_value=set()
+                ),
+                patch.object(
+                    orchestrator,
+                    "stop_run",
+                    return_value={
+                        "ok": False,
+                        "status": "identity_unverified",
+                        "active": True,
+                        "stopped": False,
+                    },
+                ) as stop,
+                patch.object(orchestrator, "write_workflow_status"),
+            ):
+                retry = orchestrator.workflow_retry_node(
+                    "workflow-fixture", "build"
+                )
+                stopped = orchestrator.workflow_stop("workflow-fixture")
+        self.assertFalse(retry["ok"])
+        self.assertEqual(retry["status"], "cleanup_incomplete")
+        self.assertEqual(retry["invalidated"], [])
+        self.assertEqual(workflow["nodes"]["build"]["run_id"], "run-build")
+        self.assertEqual(
+            workflow["nodes"]["build"]["state"],
+            "cancel_pending_cleanup",
+        )
+        self.assertFalse(stopped["ok"])
+        self.assertEqual(stopped["status"], "cleanup_incomplete")
+        self.assertEqual(stop.call_count, 2)
+
+    def test_workflow_retry_invalidates_only_after_confirmed_stop(self) -> None:
+        workflow = {
+            "status": "running",
+            "nodes": {
+                "build": {"state": "running", "run_id": "run-build"}
+            },
+            "decisions": [],
+        }
+        with tempfile.TemporaryDirectory(prefix="workflow-retry-ok-") as temp:
+            with (
+                patch.object(
+                    orchestrator, "safe_workflow_dir", return_value=Path(temp)
+                ),
+                patch.object(
+                    orchestrator, "read_json_file", return_value=workflow
+                ),
+                patch.object(orchestrator, "load_workflow_spec", return_value={}),
+                patch.object(
+                    orchestrator, "workflow_nodes", return_value={"build": {}}
+                ),
+                patch.object(
+                    orchestrator, "workflow_descendants", return_value=set()
+                ),
+                patch.object(
+                    orchestrator,
+                    "stop_run",
+                    return_value={
+                        "ok": True,
+                        "status": "stopped",
+                        "active": False,
+                        "stopped": True,
+                    },
+                ) as stop,
+                patch.object(orchestrator, "write_workflow_status"),
+            ):
+                result = orchestrator.workflow_retry_node(
+                    "workflow-fixture", "build"
+                )
+        stop.assert_called_once_with("run-build", force=True)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["invalidated"], ["build"])
+        self.assertNotIn("run_id", workflow["nodes"]["build"])
+        self.assertEqual(workflow["nodes"]["build"]["state"], "pending")
+
+    def test_workflow_retry_accepts_already_finished_run_as_confirmed(self) -> None:
+        workflow = {
+            "status": "failed",
+            "nodes": {
+                "build": {"state": "failed", "run_id": "run-build"}
+            },
+            "decisions": [],
+        }
+        with tempfile.TemporaryDirectory(prefix="workflow-retry-finished-") as temp:
+            with (
+                patch.object(
+                    orchestrator, "safe_workflow_dir", return_value=Path(temp)
+                ),
+                patch.object(
+                    orchestrator, "read_json_file", return_value=workflow
+                ),
+                patch.object(orchestrator, "load_workflow_spec", return_value={}),
+                patch.object(
+                    orchestrator, "workflow_nodes", return_value={"build": {}}
+                ),
+                patch.object(
+                    orchestrator, "workflow_descendants", return_value=set()
+                ),
+                patch.object(
+                    orchestrator,
+                    "stop_run",
+                    return_value={
+                        "ok": True,
+                        "status": "already_finished",
+                        "active": False,
+                    },
+                ),
+                patch.object(orchestrator, "write_workflow_status"),
+            ):
+                result = orchestrator.workflow_retry_node(
+                    "workflow-fixture", "build"
+                )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["invalidated"], ["build"])
+        self.assertNotIn("run_id", workflow["nodes"]["build"])
+        self.assertEqual(workflow["nodes"]["build"]["state"], "pending")
+
     def test_visible_launch_uses_guarded_builder_without_launcher_files(self) -> None:
         provider = orchestrator.Provider(
             id="fixture",
@@ -1271,13 +1493,18 @@ class QueueAuthorizationTests(unittest.TestCase):
         first = orchestrator.queue_submit("first-safe")
         second = orchestrator.queue_submit("second-safe")
         self.assertTrue(first["ok"] and second["ok"])
+        claim_id = "live-mixed-claim"
+        owner_identity = orchestrator.capture_process_identity(
+            os.getpid(), launch_nonce=claim_id
+        )
         self._mutate_job(
             lambda job: job.update(
                 {
                     "status": "launching",
                     "launch_claim": {
-                        "claim_id": "live-mixed-claim",
+                        "claim_id": claim_id,
                         "owner_pid": os.getpid(),
+                        "owner_process_identity": owner_identity.to_dict(),
                         "claimed_at": "2026-01-01T00:00:00+00:00",
                     },
                 }
@@ -1400,6 +1627,52 @@ class QueueAuthorizationTests(unittest.TestCase):
             "queue_launch_run_id_mismatch",
         )
 
+    def test_queue_timeout_waits_for_confirmed_cleanup(self) -> None:
+        submitted = orchestrator.queue_submit("timeout-safe")
+        self.assertTrue(submitted["ok"])
+        with orchestrator.queue_lock():
+            queue = orchestrator.load_queue()
+            job = queue["jobs"][0]
+        reference = job["payload_reference"]
+        job.update(
+            {
+                "status": "running",
+                "run_id": orchestrator.new_run_id(),
+                "started_at": "2000-01-01T00:00:00+00:00",
+                "timeout_seconds": 1,
+            }
+        )
+        with (
+            patch.object(
+                orchestrator,
+                "single_run_status",
+                return_value={"active": True, "status": "running"},
+            ),
+            patch.object(
+                orchestrator,
+                "stop_run",
+                return_value={
+                    "ok": False,
+                    "status": "identity_unverified",
+                    "active": True,
+                    "stopped": False,
+                },
+            ),
+        ):
+            pending = orchestrator.refresh_queue_job(job)
+        self.assertEqual(pending["status"], "timeout_pending_cleanup")
+        self.assertEqual(self.store.get(reference), b'{"task":"timeout-safe","context":null}')
+
+        with patch.object(
+            orchestrator,
+            "single_run_status",
+            return_value={"active": False, "status": "timed_out"},
+        ):
+            terminal = orchestrator.refresh_queue_job(pending)
+        self.assertEqual(terminal["status"], "timed_out")
+        with self.assertRaises(SecurePayloadStoreError):
+            self.store.get(reference)
+
     def test_dead_launch_claim_is_terminal_and_cannot_retry(self) -> None:
         _result, _prepared = self._submit_unsafe()
 
@@ -1425,16 +1698,98 @@ class QueueAuthorizationTests(unittest.TestCase):
         prepare.assert_not_called()
         launch.assert_not_called()
         self.assertEqual(result["jobs"][0]["status"], "blocked_runtime_grant")
-        self.assertEqual(result["jobs"][0]["last_error"], "queue_launch_claim_abandoned")
+        self.assertEqual(
+            result["jobs"][0]["last_error"],
+            "queue_launch_claim_identity_unverified",
+        )
+
+    def test_reused_live_owner_pid_does_not_keep_launch_claim_alive(self) -> None:
+        result = orchestrator.queue_submit("reused-pid-task")
+        self.assertTrue(result["ok"])
+        claim_id = "reused-live-pid-claim"
+        owner_identity = orchestrator.capture_process_identity(
+            os.getpid(), launch_nonce=claim_id
+        ).to_dict()
+        owner_identity["creation_token"] = "forged-creation-token"
+        self._mutate_job(
+            lambda job: job.update(
+                {
+                    "status": "launching",
+                    "launch_claim": {
+                        "claim_id": claim_id,
+                        "owner_pid": os.getpid(),
+                        "owner_process_identity": owner_identity,
+                        "claimed_at": "2026-01-01T00:00:00+00:00",
+                    },
+                }
+            )
+        )
+        with patch.object(orchestrator, "run_streaming_agent") as launch:
+            tick = orchestrator.queue_tick(max_concurrent=1)
+        launch.assert_not_called()
+        job = tick["jobs"][0]
+        self.assertEqual(job["status"], "blocked_launch_claim")
+        self.assertEqual(job["last_error"], "queue_launch_claim_abandoned")
+        self.assertEqual(job["launch_claim_identity_state"], "mismatch")
+
+    def test_unverified_controller_identity_does_not_consume_unsafe_grant(self) -> None:
+        _result, _prepared = self._submit_unsafe()
+        with orchestrator.queue_lock():
+            before = orchestrator.load_queue()["jobs"][0]
+        payload_reference = before["payload_reference"]
+        grant_reference = before["unsafe_runtime_grant"]["grant_reference"]
+
+        def unsupported_identity(pid: int, *, launch_nonce: str):
+            return orchestrator.ProcessIdentity(
+                pid=pid,
+                creation_token=None,
+                executable_path=None,
+                parent_pid=None,
+                process_group_id=None,
+                session_id=None,
+                launch_nonce=launch_nonce,
+                supported=False,
+                unsupported_reason="fixture query failure",
+            )
+
+        with (
+            patch.object(
+                orchestrator,
+                "capture_process_identity",
+                side_effect=unsupported_identity,
+            ),
+            patch.object(orchestrator, "_prepare_streaming_agent") as prepare,
+            patch.object(orchestrator, "run_streaming_agent") as launch,
+        ):
+            tick = orchestrator.queue_tick(max_concurrent=1)
+        prepare.assert_not_called()
+        launch.assert_not_called()
+        job = tick["jobs"][0]
+        self.assertEqual(job["status"], "queued")
+        self.assertEqual(
+            job["last_error"], "queue_controller_identity_unverified"
+        )
+        with orchestrator.queue_lock():
+            persisted = orchestrator.load_queue()["jobs"][0]
+        grant = persisted["unsafe_runtime_grant"]
+        self.assertEqual(grant["uses_remaining"], 1)
+        self.assertIsNone(grant["consumed_at"])
+        self.assertTrue(self.store.get(payload_reference))
+        self.assertTrue(self.store.get(grant_reference))
 
     def test_live_launching_job_is_visible_and_consumes_capacity(self) -> None:
         result = orchestrator.queue_submit("safe-task")
         self.assertTrue(result["ok"])
+        claim_id = "live-claim"
+        owner_identity = orchestrator.capture_process_identity(
+            os.getpid(), launch_nonce=claim_id
+        )
         self._mutate_job(lambda job: job.update({
             "status": "launching",
             "launch_claim": {
-                "claim_id": "live-claim",
+                "claim_id": claim_id,
                 "owner_pid": os.getpid(),
+                "owner_process_identity": owner_identity.to_dict(),
                 "claimed_at": "2026-01-01T00:00:00+00:00",
             },
         }))
