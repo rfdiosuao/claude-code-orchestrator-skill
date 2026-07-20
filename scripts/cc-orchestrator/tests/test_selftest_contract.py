@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 import os
+import stat
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -16,6 +18,202 @@ import cc_orchestrator as orchestrator  # noqa: E402
 
 
 class SelftestCliContractTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "Darwin path aliases are POSIX-only")
+    def test_trusted_darwin_aliases_are_canonicalized_without_realpath(self) -> None:
+        for alias in ("etc", "tmp", "var"):
+            with self.subTest(alias=alias), patch.object(
+                orchestrator, "_HOST_IS_DARWIN", True
+            ), patch.object(
+                orchestrator, "_open_posix_directory_fd", return_value=123
+            ) as open_alias, patch.object(orchestrator.os, "close") as close_fd:
+                canonical = orchestrator._canonical_posix_managed_path(
+                    Path(f"/{alias}/fixture/private")
+                )
+
+            self.assertEqual(
+                canonical, Path(f"/private/{alias}/fixture/private")
+            )
+            open_alias.assert_called_once_with(Path("/") / alias)
+            close_fd.assert_called_once_with(123)
+
+    @unittest.skipUnless(os.name == "posix", "Darwin path aliases are POSIX-only")
+    def test_darwin_alias_fails_closed_when_system_identity_is_untrusted(
+        self,
+    ) -> None:
+        details = SimpleNamespace(
+            st_mode=stat.S_IFLNK | 0o755,
+            st_uid=501,
+            st_dev=1,
+            st_ino=2,
+            st_ctime_ns=3,
+        )
+        with patch.object(
+            orchestrator.os, "stat", return_value=details
+        ), patch.object(
+            orchestrator.os, "readlink", return_value="private/var"
+        ):
+            with self.assertRaisesRegex(
+                orchestrator.OrchestratorError, "not trusted"
+            ):
+                orchestrator._darwin_root_alias_evidence(42, "var")
+
+    @unittest.skipUnless(os.name == "posix", "Darwin path aliases are POSIX-only")
+    def test_darwin_alias_rejects_noncanonical_link_text(self) -> None:
+        details = SimpleNamespace(
+            st_mode=stat.S_IFLNK | 0o755,
+            st_uid=0,
+            st_dev=1,
+            st_ino=2,
+            st_ctime_ns=3,
+        )
+        with patch.object(
+            orchestrator.os, "stat", return_value=details
+        ), patch.object(
+            orchestrator.os,
+            "readlink",
+            return_value="private/../private/var",
+        ):
+            with self.assertRaisesRegex(
+                orchestrator.OrchestratorError, "not trusted"
+            ):
+                orchestrator._darwin_root_alias_evidence(42, "var")
+
+    @unittest.skipUnless(os.name == "posix", "Darwin path aliases are POSIX-only")
+    def test_darwin_compatibility_never_resolves_arbitrary_ancestors(self) -> None:
+        with (
+            patch.object(orchestrator, "_HOST_IS_DARWIN", True),
+            patch.object(orchestrator, "_open_posix_directory_fd") as open_alias,
+        ):
+            canonical = orchestrator._canonical_posix_managed_path(
+                Path("/Users/fixture/project/linked/artifact")
+            )
+
+        self.assertEqual(
+            canonical, Path("/Users/fixture/project/linked/artifact")
+        )
+        open_alias.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "Darwin path aliases are POSIX-only")
+    def test_security_audit_identity_is_stable_across_darwin_aliases(self) -> None:
+        with patch.object(
+            orchestrator, "_HOST_IS_DARWIN", True
+        ), patch.object(
+            orchestrator, "_open_posix_directory_fd", return_value=123
+        ), patch.object(
+            orchestrator,
+            "_darwin_volume_is_case_sensitive",
+            return_value=False,
+        ), patch.object(orchestrator.os, "close"):
+            aliased = orchestrator._security_audit_paths(
+                Path("/var/folders/fixture/artifacts")
+            )
+            canonical = orchestrator._security_audit_paths(
+                Path("/private/var/folders/fixture/artifacts")
+            )
+
+        self.assertEqual(aliased["root"], canonical["root"])
+        self.assertEqual(aliased["bootstrap_failures"], canonical["bootstrap_failures"])
+
+    @unittest.skipUnless(os.name == "posix", "Darwin audit identity contract")
+    def test_security_audit_identity_folds_tail_case_on_insensitive_volume(
+        self,
+    ) -> None:
+        with patch.object(
+            orchestrator, "_HOST_IS_DARWIN", True
+        ), patch.object(
+            orchestrator,
+            "_darwin_volume_is_case_sensitive",
+            return_value=False,
+        ):
+            upper = Path("/private/var/Project/Artifacts")
+            lower = Path("/private/var/project/artifacts")
+            self.assertEqual(
+                orchestrator._security_audit_root_identity(upper),
+                orchestrator._security_audit_root_identity(lower),
+            )
+
+    def test_security_audit_identity_keeps_tail_case_on_sensitive_volume(
+        self,
+    ) -> None:
+        with patch.object(
+            orchestrator, "_HOST_IS_DARWIN", True
+        ), patch.object(
+            orchestrator,
+            "_darwin_volume_is_case_sensitive",
+            return_value=True,
+        ):
+            upper = Path("/private/var/Project/Artifacts")
+            lower = Path("/private/var/project/artifacts")
+            self.assertNotEqual(
+                orchestrator._security_audit_root_identity(upper),
+                orchestrator._security_audit_root_identity(lower),
+            )
+
+    @unittest.skipUnless(
+        orchestrator._HOST_IS_DARWIN, "Darwin volume capability contract"
+    )
+    def test_darwin_volume_case_query_matches_observed_filesystem(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="darwin-case-volume-") as temp:
+            root = Path(temp)
+            probe = root / "CaseProbe"
+            probe.write_text("probe", encoding="utf-8")
+            observed_sensitive = not (root / "caseprobe").exists()
+
+            self.assertEqual(
+                orchestrator._darwin_volume_is_case_sensitive(root),
+                observed_sensitive,
+            )
+
+    @unittest.skipUnless(os.name == "posix", "Darwin path aliases are POSIX-only")
+    def test_darwin_system_anchor_case_variants_are_rejected(self) -> None:
+        with patch.object(orchestrator, "_HOST_IS_DARWIN", True):
+            for path in (Path("/VAR/fixture"), Path("/Private/TMP/fixture")):
+                with self.subTest(path=path):
+                    with self.assertRaisesRegex(
+                        orchestrator.OrchestratorError, "canonical lowercase"
+                    ):
+                        orchestrator._canonical_posix_managed_path(path)
+                    with self.assertRaisesRegex(
+                        orchestrator.OrchestratorError, "canonical lowercase"
+                    ):
+                        orchestrator._posix_directory_components(path, 42)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX mkdirat safety contract")
+    def test_private_directory_creation_rejects_linked_ancestor_before_side_effect(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="posix-link-parent-") as temp:
+            root = Path(temp).resolve()
+            outside = root / "outside"
+            outside.mkdir()
+            linked = root / "linked"
+            linked.symlink_to(outside, target_is_directory=True)
+            escaped = outside / "must-not-exist"
+
+            with self.assertRaises(orchestrator.OrchestratorError):
+                orchestrator._set_private_directory(linked / escaped.name)
+
+            self.assertFalse(escaped.exists())
+
+    @unittest.skipUnless(
+        orchestrator._HOST_IS_DARWIN, "Darwin anchor safety contract"
+    )
+    def test_darwin_system_anchor_cannot_be_created_or_privatized(self) -> None:
+        for alias in ("etc", "tmp", "var"):
+            with self.subTest(alias=alias), self.assertRaisesRegex(
+                orchestrator.OrchestratorError,
+                "cannot be used as managed private directories",
+            ):
+                orchestrator._set_private_directory(Path("/") / alias)
+            for anchor in (Path("/") / alias, Path("/private") / alias):
+                with self.subTest(writable_anchor=anchor), self.assertRaisesRegex(
+                    orchestrator.OrchestratorError, "cannot be made writable"
+                ):
+                    with orchestrator._open_posix_managed_directory(
+                        anchor, writable=True, verify_private=False
+                    ):
+                        self.fail("Darwin system anchor was opened writable")
+
     def test_selftest_fails_when_production_containment_is_unavailable(self) -> None:
         containment = {
             "supported": False,

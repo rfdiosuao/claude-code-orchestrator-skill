@@ -29,6 +29,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 import zipfile
 from collections import Counter
@@ -68,6 +69,43 @@ def subprocess_text(value: Any) -> str:
 
 
 configure_stdio()
+
+
+_HOST_IS_DARWIN = sys.platform == "darwin"
+_DARWIN_ROOT_ALIASES = MappingProxyType(
+    {
+        "etc": ("private", "etc"),
+        "tmp": ("private", "tmp"),
+        "var": ("private", "var"),
+    }
+)
+_DARWIN_ATTR_BIT_MAP_COUNT = 5
+_DARWIN_ATTR_VOL_CAPABILITIES = 0x00020000
+_DARWIN_ATTR_VOL_INFO = 0x80000000
+_DARWIN_FSOPT_NOFOLLOW = 0x00000001
+_DARWIN_VOL_CAP_FMT_CASE_SENSITIVE = 0x00000100
+
+
+class _DarwinAttrList(ctypes.Structure):
+    _pack_ = 4
+    _fields_ = [
+        ("bitmapcount", ctypes.c_uint16),
+        ("reserved", ctypes.c_uint16),
+        ("commonattr", ctypes.c_uint32),
+        ("volattr", ctypes.c_uint32),
+        ("dirattr", ctypes.c_uint32),
+        ("fileattr", ctypes.c_uint32),
+        ("forkattr", ctypes.c_uint32),
+    ]
+
+
+class _DarwinVolumeCapabilitiesBuffer(ctypes.Structure):
+    _pack_ = 4
+    _fields_ = [
+        ("length", ctypes.c_uint32),
+        ("capabilities", ctypes.c_uint32 * 4),
+        ("valid", ctypes.c_uint32 * 4),
+    ]
 
 
 ROOT = Path(__file__).resolve().parent
@@ -2340,15 +2378,36 @@ class _ArtifactLock:
                     )
                 time.sleep(0.005)
             except OSError as exc:
+                winerror = getattr(exc, "winerror", None)
+                error_number = getattr(exc, "errno", None)
+                transient_windows_error = (
+                    winerror in {2, 3, 32, 33, 80, 183}
+                    or (
+                        winerror is None
+                        and error_number
+                        in {
+                            32,
+                            33,
+                            errno.ENOENT,
+                            errno.EEXIST,
+                            errno.EAGAIN,
+                            errno.EBUSY,
+                        }
+                    )
+                )
                 if (
                     os.name == "nt"
-                    and getattr(exc, "winerror", None) in {5, 32, 183}
+                    and transient_windows_error
                     and time.monotonic() < deadline
                 ):
                     time.sleep(0.005)
                     continue
+                error_codes = (
+                    f"winerror={winerror}, errno={error_number}"
+                )
                 raise OrchestratorError(
-                    f"Could not acquire artifact lock for run: {self.run_dir.name}"
+                    "Could not acquire artifact lock for run: "
+                    f"{self.run_dir.name} ({error_codes})"
                 ) from exc
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
@@ -3551,27 +3610,192 @@ def _open_windows_managed_directory(
         kernel32.CloseHandle(native_handle)
 
 
-def _open_posix_directory_fd(path: Path) -> int:
+def _darwin_root_alias_evidence(
+    root_fd: int, alias: str
+) -> tuple[int, int, int, str]:
+    expected = _DARWIN_ROOT_ALIASES[alias]
+    expected_targets = {"/" + "/".join(expected), "/".join(expected)}
+    try:
+        details = os.stat(alias, dir_fd=root_fd, follow_symlinks=False)
+        raw_target = os.readlink(alias, dir_fd=root_fd)
+    except OSError as exc:
+        raise OrchestratorError(
+            f"Darwin system path alias could not be verified: {alias}"
+        ) from exc
+    if (
+        not stat.S_ISLNK(details.st_mode)
+        or details.st_uid != 0
+        or raw_target not in expected_targets
+    ):
+        raise OrchestratorError(
+            f"Darwin system path alias is not trusted: {alias}"
+        )
+    ctime_ns = getattr(details, "st_ctime_ns", None)
+    if ctime_ns is None:
+        ctime_ns = int(details.st_ctime * 1_000_000_000)
+    return (
+        int(details.st_dev),
+        int(details.st_ino),
+        int(ctime_ns),
+        raw_target,
+    )
+
+
+def _posix_directory_components(
+    absolute: Path, root_fd: int
+) -> tuple[list[str], tuple[str, tuple[int, int, int, str]] | None]:
+    components = list(absolute.parts[1:])
+    if not _HOST_IS_DARWIN or not components:
+        return components, None
+    first_folded = components[0].casefold()
+    if first_folded in {*_DARWIN_ROOT_ALIASES, "private"}:
+        if components[0] != first_folded:
+            raise OrchestratorError(
+                "Darwin system path anchors require canonical lowercase spelling."
+            )
+    second_folded = components[1].casefold() if len(components) >= 2 else None
+    if first_folded == "private" and second_folded in _DARWIN_ROOT_ALIASES:
+        if components[1] != second_folded:
+            raise OrchestratorError(
+                "Darwin system path anchors require canonical lowercase spelling."
+            )
+    if (
+        len(components) >= 2
+        and components[0] == "private"
+        and components[1] in _DARWIN_ROOT_ALIASES
+    ):
+        alias = components[1]
+        evidence = _darwin_root_alias_evidence(root_fd, alias)
+        return components, (alias, evidence)
+    alias = components[0]
+    target = _DARWIN_ROOT_ALIASES.get(alias)
+    if target is None:
+        return components, None
+    evidence = _darwin_root_alias_evidence(root_fd, alias)
+    return [*target, *components[1:]], (alias, evidence)
+
+
+def _validate_darwin_alias_target(
+    details: os.stat_result, *, alias: str, component_index: int
+) -> None:
+    if component_index > 1:
+        return
+    mode = details.st_mode
+    if details.st_uid != 0:
+        raise OrchestratorError(
+            f"Darwin system path target is not root-owned: {alias}"
+        )
+    if component_index == 0 and mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise OrchestratorError(
+            f"Darwin private path root is writable by untrusted users: {alias}"
+        )
+    if component_index == 1 and alias == "tmp":
+        if not mode & stat.S_ISVTX:
+            raise OrchestratorError(
+                "Darwin private temporary root is missing sticky protection."
+            )
+    elif component_index == 1 and mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise OrchestratorError(
+            f"Darwin system path target is writable by untrusted users: {alias}"
+        )
+
+
+def _open_posix_directory_fd(
+    path: Path, *, create_missing: bool = False, private_final: bool = False
+) -> int:
     absolute = Path(os.path.abspath(path))
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     anchor = Path(absolute.anchor)
-    fd = os.open(str(anchor), flags)
+    root_fd = os.open(str(anchor), flags)
     try:
-        for part in absolute.parts[1:]:
-            next_fd = os.open(part, flags, dir_fd=fd)
-            details = os.fstat(next_fd)
-            if not stat.S_ISDIR(details.st_mode):
+        fd = os.dup(root_fd)
+    except Exception:
+        os.close(root_fd)
+        raise
+    try:
+        components, alias_evidence = _posix_directory_components(
+            absolute, root_fd
+        )
+        if not components:
+            raise OrchestratorError(
+                "The filesystem root cannot be used as a managed private directory."
+            )
+        protected_depth = 0
+        if _HOST_IS_DARWIN and components[0] == "private":
+            protected_depth = 1
+            if (
+                len(components) >= 2
+                and components[1] in _DARWIN_ROOT_ALIASES
+            ):
+                protected_depth = 2
+        for index, part in enumerate(components):
+            created = False
+            try:
+                next_fd = os.open(part, flags, dir_fd=fd)
+            except FileNotFoundError:
+                if not create_missing:
+                    raise
+                if index < protected_depth:
+                    raise OrchestratorError(
+                        "Darwin system path anchors cannot be created by the "
+                        f"orchestrator: {part}"
+                    )
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=fd)
+                    created = True
+                except FileExistsError:
+                    pass
+                next_fd = os.open(part, flags, dir_fd=fd)
+            try:
+                details = os.fstat(next_fd)
+                if not stat.S_ISDIR(details.st_mode):
+                    raise OrchestratorError(
+                        f"Managed artifact is not a directory: {part}"
+                    )
+                if alias_evidence is not None:
+                    _validate_darwin_alias_target(
+                        details,
+                        alias=alias_evidence[0],
+                        component_index=index,
+                    )
+                elif _HOST_IS_DARWIN and index == 0 and part == "private":
+                    _validate_darwin_alias_target(
+                        details,
+                        alias="private",
+                        component_index=0,
+                    )
+                final_component = index == len(components) - 1
+                if (
+                    private_final
+                    and final_component
+                    and index < protected_depth
+                ):
+                    raise OrchestratorError(
+                        "Darwin system path anchors cannot be used as managed "
+                        f"private directories: {part}"
+                    )
+                if created or (private_final and final_component):
+                    os.fchmod(next_fd, 0o700)
+            except Exception:
                 os.close(next_fd)
-                raise OrchestratorError(
-                    f"Managed artifact is not a directory: {part}"
-                )
+                raise
             os.close(fd)
             fd = next_fd
+        if alias_evidence is not None:
+            alias, expected_evidence = alias_evidence
+            if _darwin_root_alias_evidence(root_fd, alias) != expected_evidence:
+                raise OrchestratorError(
+                    f"Darwin system path alias changed during traversal: {alias}"
+                )
+        if private_final and stat.S_IMODE(os.fstat(fd).st_mode) != 0o700:
+            raise OrchestratorError(
+                f"Private artifact mode is invalid: {absolute.name}"
+            )
         return fd
     except OSError as exc:
         os.close(fd)
-        if exc.errno == errno.ELOOP:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
             raise OrchestratorError(
                 f"Managed artifact links are forbidden: {path.name}"
             ) from exc
@@ -3579,6 +3803,54 @@ def _open_posix_directory_fd(path: Path) -> int:
     except Exception:
         os.close(fd)
         raise
+    finally:
+        os.close(root_fd)
+
+
+def _canonical_posix_managed_path(path: Path) -> Path:
+    absolute = Path(os.path.abspath(path))
+    if not _HOST_IS_DARWIN or len(absolute.parts) < 2:
+        return absolute
+    components = list(absolute.parts[1:])
+    first_folded = components[0].casefold()
+    if first_folded in {*_DARWIN_ROOT_ALIASES, "private"}:
+        if components[0] != first_folded:
+            raise OrchestratorError(
+                "Darwin system path anchors require canonical lowercase spelling."
+            )
+    if first_folded == "private" and len(components) >= 2:
+        second_folded = components[1].casefold()
+        if second_folded in _DARWIN_ROOT_ALIASES:
+            if components[1] != second_folded:
+                raise OrchestratorError(
+                    "Darwin system path anchors require canonical lowercase spelling."
+                )
+            alias_fd = _open_posix_directory_fd(Path("/") / second_folded)
+            os.close(alias_fd)
+            return Path("/").joinpath(
+                "private", second_folded, *components[2:]
+            )
+    alias = components[0]
+    target = _DARWIN_ROOT_ALIASES.get(alias)
+    if target is None:
+        return absolute
+    alias_fd = _open_posix_directory_fd(Path("/") / alias)
+    os.close(alias_fd)
+    return Path("/").joinpath(*target, *absolute.parts[2:])
+
+
+def _is_darwin_system_anchor_path(path: Path) -> bool:
+    if not _HOST_IS_DARWIN:
+        return False
+    absolute = Path(os.path.abspath(path))
+    components = list(absolute.parts[1:])
+    if len(components) == 1:
+        return components[0] in {*_DARWIN_ROOT_ALIASES, "private"}
+    return (
+        len(components) == 2
+        and components[0] == "private"
+        and components[1] in _DARWIN_ROOT_ALIASES
+    )
 
 
 @contextlib.contextmanager
@@ -3589,6 +3861,11 @@ def _open_posix_managed_directory(
     try:
         fd = _open_posix_directory_fd(path)
         if writable:
+            if _is_darwin_system_anchor_path(path):
+                raise OrchestratorError(
+                    "Darwin system path anchors cannot be made writable by the "
+                    "orchestrator."
+                )
             os.fchmod(fd, 0o700)
         details = os.fstat(fd)
         if not stat.S_ISDIR(details.st_mode):
@@ -3806,6 +4083,12 @@ def _secure_windows_private_directory(
 
 
 def _set_private_directory(path: Path) -> None:
+    if os.name != "nt":
+        directory_fd = _open_posix_directory_fd(
+            path, create_missing=True, private_final=True
+        )
+        os.close(directory_fd)
+        return
     missing: list[Path] = []
     current = path
     while not current.exists():
@@ -3819,55 +4102,11 @@ def _set_private_directory(path: Path) -> None:
         raise OrchestratorError(
             f"Private directory parent is invalid: {current.name}"
         )
-    if os.name == "nt":
-        directories = list(reversed(missing)) if missing else [path]
-        for directory in directories:
-            _secure_windows_private_directory(
-                directory, strict_owner=False
-            )
-        return
-    directories: list[tuple[Path, bool]] = []
-    for directory in reversed(missing):
-        created = False
-        try:
-            directory.mkdir(mode=0o700)
-            created = True
-        except FileExistsError:
-            pass
-        directories.append((directory, created))
-    if not missing:
-        directories.append((path, False))
-    for directory, created in directories:
-        if not created:
-            try:
-                _verify_private_path(directory, is_dir=True)
-                continue
-            except (OSError, OrchestratorError):
-                pass
-        deadline = time.monotonic() + 1.0
-        effective = _effective_deadline()
-        if effective is not None:
-            deadline = min(deadline, effective)
-        while True:
-            try:
-                with _open_managed_directory(
-                    directory,
-                    writable=True,
-                    verify_private=False,
-                    set_owner=created,
-                ):
-                    pass
-            except (OSError, OrchestratorError):
-                try:
-                    _verify_private_path(directory, is_dir=True)
-                    break
-                except (OSError, OrchestratorError):
-                    if time.monotonic() >= deadline:
-                        raise
-                    time.sleep(0.005)
-                    continue
-            _verify_private_path(directory, is_dir=True)
-            break
+    directories = list(reversed(missing)) if missing else [path]
+    for directory in directories:
+        _secure_windows_private_directory(
+            directory, strict_owner=False
+        )
 
 
 def _set_private_file(path: Path) -> None:
@@ -4878,9 +5117,13 @@ def _atomic_write_text(
 
 def _security_audit_paths(artifact_root: str | Path) -> dict[str, Path]:
     root = Path(os.path.abspath(Path(artifact_root).expanduser()))
+    if os.name != "nt":
+        root = _canonical_posix_managed_path(root)
     bootstrap_root = root.parent / ".runtime-security-audit-bootstrap"
     bootstrap_scope = bootstrap_root / hashlib.sha256(
-        os.path.normcase(str(root)).encode("utf-8")
+        _security_audit_root_identity(root).encode(
+            "utf-8", errors="surrogatepass"
+        )
     ).hexdigest()
     return {
         "root": root,
@@ -4894,6 +5137,86 @@ def _security_audit_paths(artifact_root: str | Path) -> dict[str, Path]:
         "log": root / "logs" / "security-events.ndjson",
         "checkpoint": root / "logs" / "security-events.checkpoint.json",
     }
+
+
+def _security_audit_root_identity(artifact_root: str | Path) -> str:
+    identity = str(Path(artifact_root))
+    if _HOST_IS_DARWIN:
+        if not _darwin_volume_is_case_sensitive(Path(artifact_root)):
+            identity = unicodedata.normalize("NFC", identity).casefold()
+        return identity
+    return os.path.normcase(identity)
+
+
+def _open_nearest_posix_directory_fd(path: Path) -> int:
+    candidate = Path(os.path.abspath(path))
+    anchor = Path(candidate.anchor)
+    while candidate != anchor:
+        try:
+            return _open_posix_directory_fd(candidate)
+        except FileNotFoundError:
+            candidate = candidate.parent
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    return os.open(str(anchor), flags)
+
+
+def _darwin_volume_is_case_sensitive(path: Path) -> bool:
+    if not _HOST_IS_DARWIN:
+        raise OrchestratorError(
+            "Darwin volume capabilities are unavailable on this host."
+        )
+    fd = _open_nearest_posix_directory_fd(path)
+    try:
+        attributes = _DarwinAttrList(
+            bitmapcount=_DARWIN_ATTR_BIT_MAP_COUNT,
+            volattr=(
+                _DARWIN_ATTR_VOL_INFO | _DARWIN_ATTR_VOL_CAPABILITIES
+            ),
+        )
+        result = _DarwinVolumeCapabilitiesBuffer()
+        libc = ctypes.CDLL(None, use_errno=True)
+        fgetattrlist = libc.fgetattrlist
+        fgetattrlist.argtypes = [
+            ctypes.c_int,
+            ctypes.POINTER(_DarwinAttrList),
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_uint,
+        ]
+        fgetattrlist.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        if (
+            fgetattrlist(
+                fd,
+                ctypes.byref(attributes),
+                ctypes.byref(result),
+                ctypes.sizeof(result),
+                _DARWIN_FSOPT_NOFOLLOW,
+            )
+            != 0
+        ):
+            error_code = ctypes.get_errno() or errno.EIO
+            raise OrchestratorError(
+                "Darwin volume case-sensitivity query failed: "
+                f"errno={error_code}"
+            )
+        if result.length != ctypes.sizeof(result):
+            raise OrchestratorError(
+                "Darwin volume capability response has an invalid size."
+            )
+        if not (
+            result.valid[0] & _DARWIN_VOL_CAP_FMT_CASE_SENSITIVE
+        ):
+            raise OrchestratorError(
+                "Darwin volume did not report case-sensitivity semantics."
+            )
+        return bool(
+            result.capabilities[0]
+            & _DARWIN_VOL_CAP_FMT_CASE_SENSITIVE
+        )
+    finally:
+        os.close(fd)
 
 
 def _verify_strict_private_directory(path: Path) -> None:
@@ -5327,7 +5650,9 @@ def _append_security_event_inner(
 
 
 def _security_audit_failure_key(artifact_root: str | Path) -> str:
-    return os.path.normcase(str(_security_audit_paths(artifact_root)["root"]))
+    return _security_audit_root_identity(
+        _security_audit_paths(artifact_root)["root"]
+    )
 
 
 def _mark_security_audit_failure(

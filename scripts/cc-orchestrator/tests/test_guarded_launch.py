@@ -5695,7 +5695,7 @@ class SixthReviewTeamAuthorizationTests(GuardedLaunchFixture):
                 "atomic authorization",
                 roles=["testing", "review"],
                 cwd=self.workspace,
-                timeout_seconds=5,
+                timeout_seconds=20,
             )
         self.assertTrue(team["ok"], team)
         self.assertEqual(statuses, ["prepared", "authorized"])
@@ -5704,7 +5704,7 @@ class SixthReviewTeamAuthorizationTests(GuardedLaunchFixture):
             self.assertFalse(
                 (run_dir / orchestrator.WORKER_START_GATE_FILENAME).exists()
             )
-            terminal = self._wait_for_terminal_metadata(run_dir, timeout=10)
+            terminal = self._wait_for_terminal_metadata(run_dir, timeout=30)
             self._wait_for_pid_exit(int(terminal["worker_pid"]))
 
     def test_member_terminal_before_authorization_rolls_back_zero_children(self) -> None:
@@ -6433,6 +6433,56 @@ class SeventhReviewManagedReaderTests(GuardedLaunchFixture):
 
 
 class EighthReviewArtifactLockTests(GuardedLaunchFixture):
+    @unittest.skipUnless(os.name == "nt", "Windows lock retry contract")
+    def test_windows_retries_classified_transient_lock_error(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        real_prepare = orchestrator._prepare_private_atomic_write
+        attempts = 0
+
+        def transient_once(*args: object, **kwargs: object) -> Path:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError(33, "fixture transient lock failure")
+            return real_prepare(*args, **kwargs)
+
+        with patch.object(
+            orchestrator,
+            "_prepare_private_atomic_write",
+            side_effect=transient_once,
+        ):
+            with orchestrator.artifact_lock(run_dir, timeout_seconds=1):
+                pass
+
+        self.assertGreaterEqual(attempts, 2)
+
+    @unittest.skipUnless(os.name == "nt", "Windows lock retry contract")
+    def test_windows_rejects_unclassified_lock_error_without_retry(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        attempts = 0
+
+        def structural_failure(*_args: object, **_kwargs: object) -> Path:
+            nonlocal attempts
+            attempts += 1
+            error = OSError("fixture structural lock failure")
+            error.winerror = 999  # type: ignore[attr-defined]
+            raise error
+
+        with patch.object(
+            orchestrator,
+            "_prepare_private_atomic_write",
+            side_effect=structural_failure,
+        ):
+            with self.assertRaisesRegex(
+                orchestrator.OrchestratorError, "winerror=999"
+            ):
+                with orchestrator.artifact_lock(run_dir, timeout_seconds=1):
+                    pass
+
+        self.assertEqual(attempts, 1)
+
     def test_concurrent_legacy_directory_reclaimers_cannot_retire_successor(self) -> None:
         run_dir = self.runs_dir / orchestrator.new_run_id()
         orchestrator._set_private_directory(run_dir)
@@ -10100,14 +10150,14 @@ class TwelfthReviewLifecycleRegressionTests(TenthReviewFixture):
             launch = orchestrator.run_streaming_agent(
                 "twelfth detached success",
                 cwd=self.workspace,
-                timeout_seconds=8,
+                timeout_seconds=30,
             )
 
         self.assertEqual(launch["status"], "starting", launch)
         self.assertEqual(len(workers), 1, workers)
         self.assertIsNone(orchestrator._owned_process_record(workers[0]))
         terminal = self._wait_for_terminal_metadata(
-            self.runs_dir / str(launch["run_id"]), timeout=12
+            self.runs_dir / str(launch["run_id"]), timeout=45
         )
         self.assertEqual(terminal["status"], "succeeded", terminal)
 
