@@ -10380,6 +10380,25 @@ class TenthReviewWindowsPublicationTests(TenthReviewFixture):
         ) as (_handle, details):
             self.assertTrue(os.path.samefile(details["final_path"], run_dir))
 
+    def test_windows_directory_rejects_intermediate_reparse_point(self) -> None:
+        external_parent = self.workspace / "external-parent"
+        external_child = external_parent / "managed-child"
+        orchestrator._set_private_directory(external_child)
+        linked_parent = self.workspace / "linked-parent"
+        try:
+            os.symlink(external_parent, linked_parent, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"Windows directory symlinks are unavailable: {exc}")
+
+        with self.assertRaisesRegex(
+            orchestrator.OrchestratorError,
+            "Managed artifact ancestor changed after directory open",
+        ):
+            with orchestrator._open_windows_managed_directory(
+                linked_parent / external_child.name, verify_private=False
+            ):
+                self.fail("intermediate reparse point was accepted")
+
     def test_initial_source_fstat_failure_deletes_retained_source_not_successor(self) -> None:
         run_dir = self.runs_dir / orchestrator.new_run_id()
         orchestrator._set_private_directory(run_dir)

@@ -3460,6 +3460,12 @@ def _open_windows_managed_directory(
         wintypes.DWORD,
     )
     kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    kernel32.GetLongPathNameW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+    )
+    kernel32.GetLongPathNameW.restype = wintypes.DWORD
     kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
     desired_access = 0x80000000 | 0x00020000
     if writable:
@@ -3522,11 +3528,20 @@ def _open_windows_managed_directory(
             final_path = "\\\\" + final_path[8:]
         elif final_path.startswith("\\\\?\\"):
             final_path = final_path[4:]
-        try:
-            same_directory = os.path.samefile(final_path, path)
-        except OSError:
-            same_directory = False
-        if not same_directory:
+        requested_buffer = ctypes.create_unicode_buffer(32768)
+        requested_length = kernel32.GetLongPathNameW(
+            os.path.abspath(path), requested_buffer, len(requested_buffer)
+        )
+        if not requested_length or requested_length >= len(requested_buffer):
+            raise ctypes.WinError(ctypes.get_last_error())
+        requested_path = requested_buffer.value
+        if requested_path.startswith("\\\\?\\UNC\\"):
+            requested_path = "\\\\" + requested_path[8:]
+        elif requested_path.startswith("\\\\?\\"):
+            requested_path = requested_path[4:]
+        if os.path.normcase(os.path.abspath(final_path)) != os.path.normcase(
+            os.path.abspath(requested_path)
+        ):
             raise OrchestratorError(
                 f"Managed artifact ancestor changed after directory open: {path.name}"
             )
