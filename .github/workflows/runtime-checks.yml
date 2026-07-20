@@ -28,6 +28,7 @@ jobs:
         os:
           - ubuntu-latest
           - windows-latest
+          - macos-latest
         python-version:
           - "3.10"
           - "3.12"
@@ -42,8 +43,14 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Install runtime test dependencies
+        run: python -m pip install --disable-pip-version-check -r scripts/cc-orchestrator/requirements-runtime.txt
+
       - name: Compile Python entrypoints
-        run: python -m py_compile scripts/cc-orchestrator/cc_orchestrator.py scripts/cc-orchestrator/server.py
+        run: python -m py_compile scripts/cc-orchestrator/cc_orchestrator.py scripts/cc-orchestrator/runtime_security.py scripts/cc-orchestrator/process_identity.py scripts/cc-orchestrator/secure_payload_store.py scripts/cc-orchestrator/server.py
+
+      - name: Run guarded runtime contract tests
+        run: python -m unittest scripts/cc-orchestrator/tests/test_runtime_security.py scripts/cc-orchestrator/tests/test_process_identity.py scripts/cc-orchestrator/tests/test_secure_payload_store.py scripts/cc-orchestrator/tests/test_public_surfaces.py -v
 
       - name: Run orchestrator selftest
         run: python scripts/cc-orchestrator/cc_orchestrator.py selftest

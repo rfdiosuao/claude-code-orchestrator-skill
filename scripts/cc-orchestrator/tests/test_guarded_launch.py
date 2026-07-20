@@ -318,6 +318,7 @@ class GuardedLaunchFixture(unittest.TestCase):
         prompt_payload: bytes = b"",
         trailing_payload: bytes = b"",
         gate: str = "open",
+        worker_subcommand: str = "_stream-worker",
     ) -> dict[str, object]:
         metadata = prepared.metadata()
         run_id = str(metadata["run_id"])
@@ -335,7 +336,7 @@ class GuardedLaunchFixture(unittest.TestCase):
                 "-I",
                 "-B",
                 str(Path(orchestrator.__file__).resolve()),
-                "_stream-worker",
+                worker_subcommand,
                 "--run-id",
                 run_id,
             ],
@@ -639,6 +640,40 @@ class GuardedLaunchIntegrationTests(GuardedLaunchFixture):
                 latest = orchestrator.read_metadata(run_dir)
                 self.assertIsNone(latest.get("child_pid"))
                 self.assertEqual((run_dir / "stdout.txt").read_text(encoding="utf-8"), "")
+
+    def test_direct_visible_worker_rejects_missing_forged_expired_and_replayed_nonce(self) -> None:
+        cases = (
+            {"nonce_env": None},
+            {"nonce_env": "f" * 64},
+            {
+                "nonce_env": "approved",
+                "expires_at": "2000-01-01T00:00:00+00:00",
+            },
+            {"nonce_env": "approved", "consumed": True},
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                prepared = self._prepare("visible")
+                nonce_env = case["nonce_env"]
+                if nonce_env == "approved":
+                    nonce_env = prepared.launch_spec.launch_nonce
+                response = self._direct_worker_protocol(
+                    prepared,
+                    nonce_env=nonce_env,
+                    expires_at=case.get("expires_at"),
+                    consumed=bool(case.get("consumed", False)),
+                    prompt_payload=prepared.prompt_bytes,
+                    worker_subcommand="_visible-worker",
+                )
+                self.assertEqual(
+                    response["security_error"]["code"], "runtime_not_trusted"
+                )
+                run_dir = self.runs_dir / str(prepared.metadata()["run_id"])
+                latest = orchestrator.read_metadata(run_dir)
+                self.assertIsNone(latest.get("child_pid"))
+                self.assertEqual(
+                    (run_dir / "stdout.txt").read_text(encoding="utf-8"), ""
+                )
 
     def test_direct_worker_rejects_truncated_prompt_frame_without_child(self) -> None:
         prepared = self._prepare("streaming")
@@ -5029,16 +5064,18 @@ class SeventhReviewGitAndDeadlineTests(GuardedLaunchFixture):
     def test_stream_protocol_and_initialization_share_total_deadline(self) -> None:
         real_initialize = orchestrator._initialize_prepared_run
         real_write = orchestrator._write_pipe_chunk
+        observed_deadlines: list[float | None] = []
 
         def delayed_initialize(prepared: object) -> tuple[Path, dict[str, object]]:
-            time.sleep(0.55)
+            observed_deadlines.append(orchestrator._effective_deadline())
             return real_initialize(prepared)
 
         def delayed_write(pipe: object, payload: bytes) -> None:
-            time.sleep(0.18)
+            observed_deadlines.append(orchestrator._effective_deadline())
+            if len(observed_deadlines) == 3:
+                raise TimeoutError("fixture protocol deadline")
             real_write(pipe, payload)
 
-        started = time.monotonic()
         with patch.object(
             orchestrator, "_initialize_prepared_run", side_effect=delayed_initialize
         ), patch.object(
@@ -5049,9 +5086,12 @@ class SeventhReviewGitAndDeadlineTests(GuardedLaunchFixture):
                 cwd=self.workspace,
                 timeout_seconds=1,
             )
-        elapsed = time.monotonic() - started
 
-        self.assertLess(elapsed, 1.3, (elapsed, result))
+        self.assertTrue(observed_deadlines)
+        self.assertIsNotNone(observed_deadlines[0])
+        self.assertTrue(
+            all(deadline == observed_deadlines[0] for deadline in observed_deadlines)
+        )
         self.assertIn(
             result["status"],
             {

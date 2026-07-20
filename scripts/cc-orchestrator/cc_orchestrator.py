@@ -9,6 +9,7 @@ import contextvars
 import errno
 import functools
 import hashlib
+import hmac
 import html as html_lib
 import json
 import math
@@ -84,6 +85,12 @@ from runtime_security import (
     build_runtime_launch_spec,
     canonical_path,
 )
+from secure_payload_store import (
+    SecurePayloadStore,
+    SecurePayloadStoreError,
+    SecurePayloadStoreUnavailable,
+    create_secure_payload_store,
+)
 
 
 def _has_skill_assets(candidate: Path) -> bool:
@@ -122,6 +129,9 @@ ARTIFACT_NAMESPACE = "claude-code-orchestrator"
 _OPERATION_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
     "cc_orchestrator_operation_deadline", default=None
 )
+_TEST_ONLY_RUNTIME_CANDIDATE: contextvars.ContextVar[
+    RuntimeExecutableCandidate | None
+] = contextvars.ContextVar("cc_orchestrator_test_runtime_candidate", default=None)
 _HELD_ARTIFACT_LOCKS: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar(
     "cc_orchestrator_held_artifact_locks", default=frozenset()
 )
@@ -779,6 +789,9 @@ def discover_claude_candidate(
 def resolve_runtime_candidate(
     policy: RuntimeSecurityPolicy,
 ) -> RuntimeExecutableCandidate:
+    test_fixture = _TEST_ONLY_RUNTIME_CANDIDATE.get()
+    if test_fixture is not None:
+        return test_fixture
     configured = policy.configured_runtime_path()
     if configured is not None:
         return local_configured_candidate(configured)
@@ -7100,7 +7113,7 @@ class PreparedWorkerLaunch:
     )
 
     def __post_init__(self) -> None:
-        if self.mode not in {"one_shot", "streaming"}:
+        if self.mode not in {"one_shot", "streaming", "visible"}:
             raise ValueError("prepared launch mode is unsupported")
         if not isinstance(self.launch_spec, RuntimeLaunchSpec):
             raise TypeError("launch_spec must be a RuntimeLaunchSpec")
@@ -7197,8 +7210,8 @@ def _prepare_worker_launch_inner(
     _check_deadline(
         message="Runtime launch preparation exceeded the transaction deadline."
     )
-    if mode not in {"one_shot", "streaming"}:
-        raise OrchestratorError("Launch mode must be one_shot or streaming.")
+    if mode not in {"one_shot", "streaming", "visible"}:
+        raise OrchestratorError("Launch mode must be one_shot, streaming, or visible.")
     if isinstance(prompt, str):
         prompt_bytes = prompt.encode("utf-8")
     elif isinstance(prompt, bytes):
@@ -7279,7 +7292,11 @@ def _prepare_worker_launch_inner(
     metadata.update(
         {
             "run_id": new_run_id(),
-            "mode": "streaming" if mode == "streaming" else "one_shot",
+            "mode": (
+                "visible_window"
+                if mode == "visible"
+                else "streaming" if mode == "streaming" else "one_shot"
+            ),
             "started_at": utc_now_iso(),
             "cwd": str(effective_cwd),
             "workspace_root": str(workspace),
@@ -10966,6 +10983,14 @@ def _start_prepared_worker_launch_inner(
         )
     if prepared.mode == "one_shot":
         return _start_one_shot_launch(prepared, run_dir, metadata)
+    if prepared.mode == "visible":
+        return _start_streaming_controller(
+            prepared,
+            run_dir,
+            metadata,
+            worker_subcommand="_visible-worker",
+            visible_console=True,
+        )
     return _start_streaming_controller(prepared, run_dir, metadata)
 
 
@@ -11244,6 +11269,9 @@ def _start_streaming_controller(
     prepared: PreparedWorkerLaunch,
     run_dir: Path,
     metadata: dict[str, Any],
+    *,
+    worker_subcommand: str = "_stream-worker",
+    visible_console: bool = False,
 ) -> dict[str, Any]:
     spec = prepared.launch_spec
     worker_env = dict(spec.environment)
@@ -11256,14 +11284,18 @@ def _start_streaming_controller(
         "-I",
         "-B",
         str(Path(__file__).resolve()),
-        "_stream-worker",
+        worker_subcommand,
         "--run-id",
         str(metadata["run_id"]),
     ]
     creationflags = 0
     popen_kwargs: dict[str, Any] = {}
     if os.name == "nt":
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        creationflags = getattr(
+            subprocess,
+            "CREATE_NEW_CONSOLE" if visible_console else "CREATE_NO_WINDOW",
+            0,
+        )
     else:
         popen_kwargs["start_new_session"] = True
     reservation = prepared.admission_reservation
@@ -11328,8 +11360,8 @@ def _start_streaming_controller(
                 cwd=str(ROOT),
                 env=worker_env,
                 stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+            stdout=None if visible_console else subprocess.DEVNULL,
+            stderr=None if visible_console else subprocess.DEVNULL,
             creationflags=creationflags,
             **popen_kwargs,
         )
@@ -11570,8 +11602,7 @@ def _start_streaming_controller(
                 pass
 
 
-@_guard_public_launch_transaction(timeout_position=6)
-def run_streaming_agent(
+def _prepare_streaming_agent(
     task: str,
     role: str = "implementation",
     task_type: str | None = None,
@@ -11593,7 +11624,7 @@ def run_streaming_agent(
     skip_cost_guard: bool = False,
     allow_unsafe_runtime: bool = False,
     _admission_reservation: _LaunchAdmissionReservation | None = None,
-) -> dict[str, Any]:
+) -> PreparedWorkerLaunch:
     if not isinstance(task, str) or not task.strip():
         raise OrchestratorError("Task cannot be empty.")
     route = resolve_route(role=role, task_type=task_type, profile=profile)
@@ -11699,6 +11730,63 @@ def run_streaming_agent(
     _check_deadline(
         message="Runtime preparation exceeded the launch transaction deadline."
     )
+    return prepared
+
+
+@_guard_public_launch_transaction(timeout_position=6)
+def run_streaming_agent(
+    task: str,
+    role: str = "implementation",
+    task_type: str | None = None,
+    profile: str | None = None,
+    model_override: str | None = None,
+    allow_write: bool = False,
+    timeout_seconds: int | None = None,
+    cwd: Path | None = None,
+    context: str | None = None,
+    output_format: str = "stream-json",
+    include_partial_messages: bool = True,
+    max_output_bytes: int | None = None,
+    max_events_bytes: int | None = None,
+    soft_output_bytes: int | None = None,
+    output_budget_policy: str | None = None,
+    kill_on_excessive_output: bool = False,
+    final_only: bool = False,
+    final_max_chars: int | None = None,
+    skip_cost_guard: bool = False,
+    allow_unsafe_runtime: bool = False,
+    _admission_reservation: _LaunchAdmissionReservation | None = None,
+    _prepared_launch: PreparedWorkerLaunch | None = None,
+) -> dict[str, Any]:
+    prepared = _prepared_launch or _prepare_streaming_agent(
+        task=task,
+        role=role,
+        task_type=task_type,
+        profile=profile,
+        model_override=model_override,
+        allow_write=allow_write,
+        timeout_seconds=timeout_seconds,
+        cwd=cwd,
+        context=context,
+        output_format=output_format,
+        include_partial_messages=include_partial_messages,
+        max_output_bytes=max_output_bytes,
+        max_events_bytes=max_events_bytes,
+        soft_output_bytes=soft_output_bytes,
+        output_budget_policy=output_budget_policy,
+        kill_on_excessive_output=kill_on_excessive_output,
+        final_only=final_only,
+        final_max_chars=final_max_chars,
+        skip_cost_guard=skip_cost_guard,
+        allow_unsafe_runtime=allow_unsafe_runtime,
+        _admission_reservation=_admission_reservation,
+    )
+    if _prepared_launch is not None:
+        if prepared.admission_reservation is not _admission_reservation:
+            raise OrchestratorError("Prepared launch admission reservation changed before start.")
+        expected_unsafe = prepared.launch_spec.trust_level == "local_unsafe"
+        if expected_unsafe != bool(allow_unsafe_runtime):
+            raise OrchestratorError("Prepared launch approval does not match this request.")
     return start_prepared_worker_launch(prepared)
 
 
@@ -13606,6 +13694,310 @@ def _stream_worker_inner(run_id: str) -> dict[str, Any]:
     )
 
 
+def _write_windows_console_input(handle: Any, text: str) -> None:
+    """Inject the initial prompt into the new console without using argv or disk."""
+    if os.name != "nt":
+        raise OSError("Console input injection is only supported on Windows.")
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class CharUnion(ctypes.Union):
+        _fields_ = [("UnicodeChar", wintypes.WCHAR), ("AsciiChar", ctypes.c_char)]
+
+    class KeyEventRecord(ctypes.Structure):
+        _fields_ = [
+            ("bKeyDown", wintypes.BOOL),
+            ("wRepeatCount", wintypes.WORD),
+            ("wVirtualKeyCode", wintypes.WORD),
+            ("wVirtualScanCode", wintypes.WORD),
+            ("uChar", CharUnion),
+            ("dwControlKeyState", wintypes.DWORD),
+        ]
+
+    class EventUnion(ctypes.Union):
+        _fields_ = [("KeyEvent", KeyEventRecord), ("padding", ctypes.c_byte * 16)]
+
+    class InputRecord(ctypes.Structure):
+        _fields_ = [("EventType", wintypes.WORD), ("Event", EventUnion)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    native_handle = msvcrt.get_osfhandle(handle.fileno())
+    content = text.replace("\r\n", "\n").replace("\r", "\n") + "\r"
+    for offset in range(0, len(content), 2048):
+        chunk = content[offset : offset + 2048]
+        records = (InputRecord * (len(chunk) * 2))()
+        for index, character in enumerate(chunk):
+            virtual_key = 0x0D if character == "\r" else 0
+            for down in (True, False):
+                record = records[index * 2 + (0 if down else 1)]
+                record.EventType = 0x0001
+                record.Event.KeyEvent.bKeyDown = down
+                record.Event.KeyEvent.wRepeatCount = 1
+                record.Event.KeyEvent.wVirtualKeyCode = virtual_key
+                record.Event.KeyEvent.uChar.UnicodeChar = character
+        written = wintypes.DWORD()
+        if not kernel32.WriteConsoleInputW(
+            native_handle,
+            records,
+            len(records),
+            ctypes.byref(written),
+        ) or written.value != len(records):
+            raise OSError(ctypes.get_last_error(), "Could not inject the visible prompt")
+
+
+def _visible_worker_inner(run_id: str) -> dict[str, Any]:
+    run_dir = safe_run_dir(run_id)
+    try:
+        frame = _read_bounded_payload(
+            sys.stdin.buffer, PRIVATE_LAUNCH_FRAME_LIMIT, "frame"
+        )
+        prompt_bytes = _read_bounded_payload(
+            sys.stdin.buffer, PROMPT_BYTES_LIMIT, "prompt"
+        )
+        metadata, executable_identity, arguments = _parse_worker_frame(run_dir, frame)
+        if metadata.get("mode") != "visible_window":
+            raise _runtime_not_trusted("Visible worker mode does not match metadata.")
+        if metadata.get("prompt_bytes") != len(prompt_bytes):
+            raise _runtime_not_trusted("Visible worker prompt length does not match metadata.")
+        if _read_protocol_trailer(sys.stdin.buffer) != b"":
+            raise _runtime_not_trusted("Visible worker launch payload has trailing data.")
+        nonce = str(metadata["runtime_launch"]["launch_nonce"])
+        metadata = _consume_worker_nonce(run_dir, nonce)
+        metadata = _wait_for_controller_handoff_acceptance(run_dir, metadata)
+        if not executable_identity.matches_current_file():
+            raise _runtime_identity_changed(executable_identity.canonical_path)
+    except RuntimeSecurityError as error:
+        return _worker_security_failure(run_dir, error)
+    except Exception:
+        return _worker_security_failure(
+            run_dir,
+            _runtime_not_trusted("Visible worker launch state could not be verified."),
+        )
+
+    cwd = Path(str(metadata.get("cwd") or Path.cwd()))
+    workspace_root = Path(str(metadata.get("workspace_root") or cwd)).resolve()
+    environment_keys = json.loads(frame.decode("utf-8"))["environment_keys"]
+    runtime_env = {key: os.environ[key] for key in environment_keys}
+    sensitive_values = _normalize_sensitive_values(
+        (
+            *_prompt_sensitive_values(prompt_bytes),
+            *(value for key, value in runtime_env.items() if value and should_redact_key(key, value)),
+        )
+    )
+    launch_deadline = _effective_deadline()
+    if launch_deadline is None:
+        return _worker_security_failure(
+            run_dir, _runtime_not_trusted("Visible transaction deadline is unavailable.")
+        )
+    try:
+        git_before_raw = capture_git_snapshot(
+            run_dir, workspace_root, "before", sensitive_values
+        )
+        if not git_before_raw.get("evidence_complete"):
+            raise OrchestratorError("Pre-launch Git evidence is unavailable.")
+        metadata = update_metadata(
+            run_dir,
+            git_before=_git_snapshot_projection(git_before_raw, sensitive_values),
+        )
+        pinned_scope = _pin_write_scope_policy(workspace_root)
+    except Exception:
+        return _record_blocked_launch(
+            run_dir,
+            metadata,
+            sensitive_values=sensitive_values,
+            status="blocked_runtime_launch",
+            error=_launch_failure_error(
+                "write_scope_invalid", "Visible launch preflight could not be pinned."
+            ),
+        )
+    if not executable_identity.matches_current_file():
+        return _worker_security_failure(
+            run_dir, _runtime_identity_changed(executable_identity.canonical_path)
+        )
+
+    console_in = None
+    console_out = None
+    proc: subprocess.Popen[bytes] | None = None
+    started_monotonic = time.monotonic()
+    timed_out = False
+    try:
+        console_in = open("CONIN$", "rb", buffering=0)
+        console_out = open("CONOUT$", "wb", buffering=0)
+        command = _runtime_command(executable_identity, arguments)
+        proc = _owned_process_popen(
+            command,
+            final_identity=executable_identity,
+            cwd=str(cwd),
+            env=runtime_env,
+            stdin=console_in,
+            stdout=console_out,
+            stderr=console_out,
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        )
+        child_identity = capture_process_identity(proc.pid, launch_nonce=nonce)
+        _validate_started_identity(
+            child_identity, executable_identity, process_kind="visible runtime child"
+        )
+        if not executable_identity.matches_current_file():
+            raise _runtime_identity_changed(executable_identity.canonical_path)
+        metadata = update_metadata(
+            run_dir,
+            status="running",
+            child_pid=proc.pid,
+            child_process_identity=child_identity.to_dict(),
+            visible_console_input="CONIN$",
+        )
+        _atomic_write_text(run_dir / "pid.txt", str(proc.pid))
+        append_event(
+            run_dir,
+            {"type": "process_started", "pid": proc.pid, "status": "running"},
+        )
+        prompt_text = prompt_bytes.decode("utf-8")
+        _write_windows_console_input(console_in, prompt_text)
+        remaining = _remaining_deadline(
+            _runtime_execution_deadline(launch_deadline, started_monotonic),
+            float(metadata.get("timeout_seconds") or 1800),
+        )
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(command, 0)
+        exit_code = proc.wait(timeout=remaining)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        exit_code = 124
+        if proc is not None:
+            cleanup_deadline = _owned_process_cleanup_deadline(
+                proc, launch_deadline, timeout_evidence=True
+            )
+            if not _terminate_owned_process(
+                proc,
+                deadline=cleanup_deadline,
+            ):
+                raise _OwnedCleanupPending(
+                    proc,
+                    response_updates=_worker_cleanup_response_updates(
+                        timed_out=True, stopped=False
+                    ),
+                )
+    except RuntimeSecurityError as error:
+        if proc is not None and not _terminate_owned_process(
+            proc, deadline=launch_deadline
+        ):
+            raise _OwnedCleanupPending(proc) from error
+        return _worker_security_failure(run_dir, error)
+    except _OwnedCleanupPending:
+        raise
+    except Exception as error:
+        if proc is not None and not _terminate_owned_process(
+            proc, deadline=launch_deadline
+        ):
+            raise _OwnedCleanupPending(proc) from error
+        return _worker_security_failure(
+            run_dir,
+            _runtime_not_trusted("Visible runtime could not be started or supervised."),
+        )
+    finally:
+        for handle in (console_in, console_out):
+            if handle is not None:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+
+    assert proc is not None
+    if proc.poll() is None:
+        cleanup_confirmed = _terminate_owned_process(
+            proc, deadline=launch_deadline
+        )
+    else:
+        _close_process_streams(proc)
+        cleanup_confirmed = _release_owned_containment(
+            proc, terminate_descendants=True, deadline=launch_deadline
+        )
+    if not cleanup_confirmed:
+        raise _OwnedCleanupPending(
+            proc,
+            response_updates=_worker_cleanup_response_updates(
+                timed_out=timed_out, stopped=False
+            ),
+        )
+    try:
+        git_after_raw = capture_git_snapshot(
+            run_dir, workspace_root, "after", sensitive_values
+        )
+        scope_check, _scope_failed, _scope_deadline_crossed = _terminal_write_scope_evidence(
+            run_id,
+            workspace_root,
+            git_before_raw,
+            git_after_raw,
+            pinned_scope,
+            timed_out=timed_out,
+        )
+    except Exception:
+        git_after_raw = _failed_git_snapshot(
+            "after", OrchestratorError("Visible post-run evidence failed."), sensitive_values
+        )
+        scope_check = {"ok": False, "violations": ["post_run_evidence_unavailable"]}
+    status = "timed_out" if timed_out else "succeeded" if exit_code == 0 else "failed"
+    updates = {
+        "status": status,
+        "finished_at": utc_now_iso(),
+        "duration_ms": int((time.monotonic() - started_monotonic) * 1000),
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "stop_reason": "timeout" if timed_out else None,
+        "git_after": _git_snapshot_projection(git_after_raw, sensitive_values),
+        "write_scope_check": _scrub_guarded_value(scope_check, sensitive_values),
+        "cleanup_state": "cleanup_confirmed",
+    }
+    return _persist_streaming_terminal_state(
+        run_dir,
+        metadata,
+        updates=updates,
+        events=(
+            {
+                "type": "process_exited",
+                "status": status,
+                "exit_code": exit_code,
+                "duration_ms": updates["duration_ms"],
+            },
+        ),
+        sensitive_values=sensitive_values,
+        remove_pid=True,
+        launch_deadline=launch_deadline,
+    )
+
+
+def visible_worker(run_id: str) -> dict[str, Any]:
+    run_dir = safe_run_dir(run_id)
+    try:
+        initial = read_metadata(run_dir)
+    except Exception:
+        initial = {"run_id": run_id}
+    deadline = initial.get("transaction_deadline_monotonic")
+    if (
+        not isinstance(deadline, (int, float))
+        or isinstance(deadline, bool)
+        or not math.isfinite(float(deadline))
+    ):
+        return _worker_security_failure(
+            run_dir,
+            _runtime_not_trusted("Visible transaction deadline evidence is invalid."),
+        )
+    token = _OPERATION_DEADLINE.set(float(deadline))
+    try:
+        try:
+            return _visible_worker_inner(run_id)
+        except _OwnedCleanupPending as pending:
+            try:
+                latest = read_metadata(run_dir)
+            except Exception:
+                latest = initial
+            return _complete_isolated_worker_cleanup(run_dir, latest, pending)
+    finally:
+        _OPERATION_DEADLINE.reset(token)
+
+
 def stream_worker(run_id: str) -> dict[str, Any]:
     run_dir = safe_run_dir(run_id)
     try:
@@ -14067,6 +14459,7 @@ def write_team_manifest(team_id: str, data: dict[str, Any]) -> Path:
     return write_json_file(path, data, precommit=precommit)
 
 
+@_guard_public_launch_transaction(timeout_position=5)
 def send_instruction(
     run_id: str,
     instruction: str,
@@ -14078,19 +14471,15 @@ def send_instruction(
     reroute: bool = False,
     route_profile: str | None = None,
     route_model: str | None = None,
+    allow_unsafe_runtime: bool = False,
 ) -> dict[str, Any]:
     """Append instruction by stopping the run and restarting with recovered context."""
     if not instruction.strip():
         raise OrchestratorError("Instruction cannot be empty.")
     previous = poll_run(run_id, max_bytes=50000, include_output_tail=True)
     status = previous["status"]
-    if status.get("active"):
-        stop = stop_run(run_id, force=force, timeout_seconds=5)
-    else:
-        stop = {"ok": True, "status": "already_finished"}
     metadata = read_metadata(safe_run_dir(run_id))
     run_dir = safe_run_dir(run_id)
-    original_prompt = (run_dir / "prompt.txt").read_text(encoding="utf-8", errors="replace") if (run_dir / "prompt.txt").exists() else ""
     events_tail = tail_file(run_dir / "events.ndjson", chars=12000)
     context = "\n".join(
         [
@@ -14100,9 +14489,6 @@ def send_instruction(
             f"Previous task type: {metadata.get('task_type')}",
             f"Previous cwd: {metadata.get('cwd')}",
             f"Previous model: {(metadata.get('profile') or {}).get('model')}",
-            "",
-            "Original prompt:",
-            original_prompt[-12000:],
             "",
             "Previous stdout tail:",
             str(status.get("stdout_tail", ""))[-10000:],
@@ -14128,23 +14514,54 @@ def send_instruction(
     previous_model = (metadata.get("profile") or {}).get("model")
     selected_profile = route_profile or (previous_profile if preserve_route and not reroute else None)
     selected_model = route_model or (previous_model if preserve_route and not reroute else None)
-    new_run = run_streaming_agent(
-        task=task,
-        role=role or str(metadata.get("role") or "implementation"),
-        task_type=task_type or metadata.get("task_type"),
-        profile=selected_profile,
-        model_override=selected_model,
-        allow_write=bool(metadata.get("allow_write", False)),
-        timeout_seconds=timeout_seconds or metadata.get("timeout_seconds"),
-        cwd=Path(str(metadata.get("cwd") or Path.cwd())),
-        context=context,
-        max_output_bytes=(metadata.get("output_budget") or {}).get("max_output_bytes"),
-        max_events_bytes=(metadata.get("output_budget") or {}).get("max_events_bytes"),
-        soft_output_bytes=(metadata.get("output_budget") or {}).get("soft_output_bytes"),
-        output_budget_policy=(metadata.get("output_budget") or {}).get("policy"),
-        final_only=bool((metadata.get("output_budget") or {}).get("final_only", False)),
-        final_max_chars=(metadata.get("output_budget") or {}).get("final_max_chars"),
+    launch_kwargs = {
+        "task": task,
+        "role": role or str(metadata.get("role") or "implementation"),
+        "task_type": task_type or metadata.get("task_type"),
+        "profile": selected_profile,
+        "model_override": selected_model,
+        "allow_write": bool(metadata.get("allow_write", False)),
+        "timeout_seconds": timeout_seconds or metadata.get("timeout_seconds"),
+        "cwd": Path(str(metadata.get("cwd") or Path.cwd())),
+        "context": context,
+        "max_output_bytes": (metadata.get("output_budget") or {}).get("max_output_bytes"),
+        "max_events_bytes": (metadata.get("output_budget") or {}).get("max_events_bytes"),
+        "soft_output_bytes": (metadata.get("output_budget") or {}).get("soft_output_bytes"),
+        "output_budget_policy": (metadata.get("output_budget") or {}).get("policy"),
+        "final_only": bool((metadata.get("output_budget") or {}).get("final_only", False)),
+        "final_max_chars": (metadata.get("output_budget") or {}).get("final_max_chars"),
+    }
+    prepared = _prepare_streaming_agent(
+        **launch_kwargs,
+        allow_unsafe_runtime=allow_unsafe_runtime,
     )
+    if status.get("active"):
+        stop = stop_run(run_id, force=force, timeout_seconds=5)
+        if not _stop_response_confirmed(stop):
+            return {
+                "ok": False,
+                "status": "replacement_stop_failed",
+                "old_run_id": run_id,
+                "stop": stop,
+                "error": "The old worker could not be stopped with verified cleanup; the replacement was not started.",
+            }
+    else:
+        stop = {"ok": True, "status": "already_finished"}
+    new_run = run_streaming_agent(
+        **launch_kwargs,
+        allow_unsafe_runtime=allow_unsafe_runtime,
+        _prepared_launch=prepared,
+    )
+    if not _launch_response_succeeded(new_run):
+        return {
+            "ok": False,
+            "status": "replacement_launch_failed",
+            "old_run_id": run_id,
+            "stop": stop,
+            "new_run": new_run,
+            "error": "The old worker stopped, but the replacement launch was not accepted.",
+            **_security_response_fields(new_run),
+        }
     new_profile = (new_run.get("profile") or {}).get("name")
     new_model = (new_run.get("profile") or {}).get("model")
     route_drift = {
@@ -14247,6 +14664,7 @@ def spawn_role_team(
     cwd: Path | None = None,
     context: str | None = None,
     timeout_seconds: int | None = None,
+    allow_unsafe_runtime: bool = False,
 ) -> dict[str, Any]:
     if not task.strip():
         raise OrchestratorError("Task cannot be empty.")
@@ -14370,15 +14788,38 @@ def spawn_role_team(
                 "stops": stops,
             }
         try:
+            prepared_members: list[tuple[str, str, PreparedWorkerLaunch]] = []
             for role in selected_roles:
+                member_context = "\n".join(
+                    part for part in [f"Team id: {team_id}", context or ""] if part
+                )
+                prepared_members.append(
+                    (
+                        role,
+                        member_context,
+                        _prepare_streaming_agent(
+                            task=task,
+                            role=role,
+                            cwd=cwd,
+                            context=member_context,
+                            timeout_seconds=timeout_seconds,
+                            skip_cost_guard=True,
+                            allow_unsafe_runtime=allow_unsafe_runtime,
+                            _admission_reservation=reservation,
+                        ),
+                    )
+                )
+            for role, member_context, prepared in prepared_members:
                 run = run_streaming_agent(
                     task=task,
                     role=role,
                     cwd=cwd,
-                    context="\n".join(part for part in [f"Team id: {team_id}", context or ""] if part),
+                    context=member_context,
                     timeout_seconds=timeout_seconds,
                     skip_cost_guard=True,
+                    allow_unsafe_runtime=allow_unsafe_runtime,
                     _admission_reservation=reservation,
+                    _prepared_launch=prepared,
                 )
                 run_id = str(run["run_id"])
                 runs.append(
@@ -14445,6 +14886,7 @@ def spawn_role_team(
             return response
         except Exception as exc:
             rollback = rollback_registered_workers()
+            security_fields = _security_response_fields(exc)
             decision_visible = False
             decision_payload: dict[str, Any] = {}
             candidate_manifest = manifest_path or (TEAMS_DIR / f"{team_id}.json")
@@ -14483,6 +14925,7 @@ def spawn_role_team(
                 "max_concurrent": max_concurrent,
                 "requested_count": len(selected_roles),
                 "rollback": rollback,
+                **security_fields,
             }
             if decision_visible:
                 path = candidate_manifest
@@ -14500,6 +14943,7 @@ def spawn_role_team(
                 "launched_count": len(runs),
                 "runs": runs,
                 "rollback": rollback,
+                **security_fields,
             }
         finally:
             reservation.active = False
@@ -14568,11 +15012,13 @@ def collect_team_results(team_id: str | None = None, run_ids: list[str] | None =
     return {"ok": True, "team_id": team_id, "run_ids": ids, "items": items, "agreements": agreements, "conflicts": conflict_lines[:20], "report": "\n".join(report_lines)}
 
 
+@_guard_public_launch_transaction(timeout_position=3)
 def cross_review(
     run_ids: list[str],
     reviewer_roles: list[str] | None = None,
     cwd: Path | None = None,
     timeout_seconds: int | None = None,
+    allow_unsafe_runtime: bool = False,
 ) -> dict[str, Any]:
     ids = resolve_team_run_ids(run_ids=run_ids)
     roles = reviewer_roles or ["security", "testing", "review"]
@@ -14582,9 +15028,102 @@ def cross_review(
         bundle_lines.extend([f"## Run {run_id} / role {status.get('role')} / status {status.get('status')}", str(status.get("stdout_tail", ""))[-6000:], ""])
     task = "Cross-review prior Claude Code worker outputs and produce second-round findings ordered by severity."
     spawned: list[dict[str, Any]] = []
-    for role in roles:
-        run = run_streaming_agent(task=task, role=role, cwd=cwd, context="\n".join(bundle_lines), timeout_seconds=timeout_seconds)
-        spawned.append({"reviewer_role": role, "run_id": run["run_id"], "status": run["status"], "profile": run.get("profile")})
+    review_context = "\n".join(bundle_lines)
+    prepared = [
+        (
+            role,
+            _prepare_streaming_agent(
+                task=task,
+                role=role,
+                cwd=cwd,
+                context=review_context,
+                timeout_seconds=timeout_seconds,
+                allow_unsafe_runtime=allow_unsafe_runtime,
+            ),
+        )
+        for role in roles
+    ]
+
+    def rollback_started_reviewers() -> dict[str, Any]:
+        stops: list[dict[str, Any]] = []
+        for item in spawned:
+            run_id = item.get("run_id")
+            if not isinstance(run_id, str) or not run_id:
+                continue
+            try:
+                stop = stop_run(run_id, force=True)
+            except Exception as exc:
+                stop = {
+                    "ok": False,
+                    "status": "cleanup_incomplete",
+                    "active": True,
+                    "stopped": False,
+                    "error": str(exc),
+                }
+            stops.append(
+                {
+                    "run_id": run_id,
+                    "confirmed": _stop_response_confirmed(stop),
+                    **{
+                        key: stop.get(key)
+                        for key in (
+                            "ok",
+                            "status",
+                            "active",
+                            "stopped",
+                            "cleanup_state",
+                        )
+                    },
+                }
+            )
+        failed = sum(1 for item in stops if not item["confirmed"])
+        return {
+            "attempted": bool(stops),
+            "stopped_count": len(stops) - failed,
+            "failed_stop_count": failed,
+            "stops": stops,
+        }
+
+    for role, prepared_launch in prepared:
+        run = run_streaming_agent(
+            task=task,
+            role=role,
+            cwd=cwd,
+            context=review_context,
+            timeout_seconds=timeout_seconds,
+            allow_unsafe_runtime=allow_unsafe_runtime,
+            _prepared_launch=prepared_launch,
+        )
+        review_run = {
+            "reviewer_role": role,
+            "run_id": run.get("run_id"),
+            "status": run.get("status"),
+            "profile": run.get("profile"),
+            **_security_response_fields(run),
+        }
+        if run.get("error"):
+            review_run["error"] = run.get("error")
+        if not _launch_response_succeeded(run):
+            rollback = rollback_started_reviewers()
+            status_name = (
+                "rollback_incomplete"
+                if rollback["failed_stop_count"]
+                else "rolled_back_partial_launch"
+                if rollback["attempted"]
+                else "blocked_runtime_launch"
+            )
+            return {
+                "ok": False,
+                "status": status_name,
+                "source_run_ids": ids,
+                "review_runs": [*spawned, review_run],
+                "failed_role": role,
+                "error": "A prepared cross-review worker launch was not accepted.",
+                "failed_launch": run,
+                "rollback": rollback,
+                **_security_response_fields(run),
+            }
+        spawned.append(review_run)
     return {"ok": True, "source_run_ids": ids, "review_runs": spawned}
 
 
@@ -15312,6 +15851,7 @@ def benchmark_model(
     task: str = "Return a concise JSON object with keys ok and summary.",
     timeout_seconds: int = 120,
     execute: bool = False,
+    allow_unsafe_runtime: bool = False,
 ) -> dict[str, Any]:
     route = resolve_route(role=role, profile=profile)
     provider = get_provider(route["profile"])
@@ -15322,12 +15862,33 @@ def benchmark_model(
             "message": "Pass execute=true to run a real benchmark task through Claude Code.",
             "profile": provider.name,
             "model": route.get("model_override") or provider.model,
-            "task": task,
+            "task_length": len(task),
         }
     started = time.time()
-    run = run_agent(task=task, role=role, profile=profile, timeout_seconds=timeout_seconds, output_format="json")
+    run = run_agent(
+        task=task,
+        role=role,
+        profile=profile,
+        timeout_seconds=timeout_seconds,
+        output_format="json",
+        allow_unsafe_runtime=allow_unsafe_runtime,
+    )
+    launch_accepted = bool(
+        isinstance(run, Mapping)
+        and run.get("run_id")
+        and str(run.get("status") or "")
+        not in {
+            "blocked_runtime_launch",
+            "blocked_runtime_identity",
+            "blocked_process_identity",
+            "cleanup_pending",
+            "cleanup_incomplete",
+            "timed_out",
+        }
+        and run.get("ok") is not False
+    )
     result = {
-        "ok": run.get("exit_code") == 0,
+        "ok": launch_accepted and run.get("exit_code") == 0,
         "dry_run": False,
         "profile": provider.name,
         "model": route.get("model_override") or provider.model,
@@ -15335,6 +15896,16 @@ def benchmark_model(
         "run_id": run.get("run_id"),
         "exit_code": run.get("exit_code"),
         "stdout_tail": run.get("stdout_tail", "")[-2000:],
+        **(
+            {}
+            if launch_accepted
+            else {
+                "status": run.get("status") or "benchmark_launch_failed",
+                "error": run.get("error")
+                or "The benchmark runtime launch was not accepted.",
+                **_security_response_fields(run),
+            }
+        ),
     }
     append_model_benchmark_history({"recorded_at": utc_now_iso(), "type": "single", "role": role, **result})
     build_model_registry(refresh=True, apply=True)
@@ -16211,10 +16782,22 @@ BENCHMARK_SUITE_TASKS = [
 ]
 
 
-def benchmark_suite(profile: str | None = None, execute: bool = False, timeout_seconds: int = 120) -> dict[str, Any]:
+def benchmark_suite(
+    profile: str | None = None,
+    execute: bool = False,
+    timeout_seconds: int = 120,
+    allow_unsafe_runtime: bool = False,
+) -> dict[str, Any]:
     items: list[dict[str, Any]] = []
     for task in BENCHMARK_SUITE_TASKS:
-        result = benchmark_model(profile=profile, role=task["role"], task=task["task"], timeout_seconds=timeout_seconds, execute=execute)
+        result = benchmark_model(
+            profile=profile,
+            role=task["role"],
+            task=task["task"],
+            timeout_seconds=timeout_seconds,
+            execute=execute,
+            allow_unsafe_runtime=allow_unsafe_runtime,
+        )
         items.append({"id": task["id"], "role": task["role"], **result})
     score = 0
     if execute and items:
@@ -16235,11 +16818,282 @@ def benchmark_suite(profile: str | None = None, execute: bool = False, timeout_s
     return result
 
 
+_QUEUE_THREAD_LOCK = threading.RLock()
+QUEUE_LOCK_TIMEOUT_SECONDS = 30.0
+
+
+@contextlib.contextmanager
+def queue_lock() -> Any:
+    """Serialize queue claims across threads and controller processes."""
+    lock_path = QUEUE_PATH.with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with _QUEUE_THREAD_LOCK:
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        with os.fdopen(descriptor, "r+b") as handle:
+            handle.seek(0)
+            deadline = _effective_deadline() or (
+                time.monotonic() + QUEUE_LOCK_TIMEOUT_SECONDS
+            )
+            if os.name == "nt":
+                import msvcrt
+
+                while True:
+                    try:
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError as exc:
+                        if time.monotonic() >= deadline:
+                            raise OrchestratorError(
+                                "Queue lock acquisition timed out."
+                            ) from exc
+                        time.sleep(0.05)
+            else:
+                import fcntl
+
+                while True:
+                    try:
+                        fcntl.flock(
+                            handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                        )
+                        break
+                    except BlockingIOError as exc:
+                        if time.monotonic() >= deadline:
+                            raise OrchestratorError(
+                                "Queue lock acquisition timed out."
+                            ) from exc
+                        time.sleep(0.05)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def get_secure_payload_store() -> SecurePayloadStore:
+    return create_secure_payload_store()
+
+
+def _public_queue_job(job: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        str(key): value
+        for key, value in job.items()
+        if key not in {"task", "context", "launch_claim"}
+    }
+
+
+def _launch_response_succeeded(run: Mapping[str, Any] | None) -> bool:
+    return bool(
+        isinstance(run, Mapping)
+        and run.get("run_id")
+        and str(run.get("status") or "") in {"starting", "running"}
+        and run.get("ok") is not False
+    )
+
+
+def _security_response_fields(value: Any) -> dict[str, Any]:
+    if isinstance(value, RuntimeSecurityError):
+        return {
+            "security_error": value.to_dict(),
+            "next_step": value.suggested_action,
+        }
+    if not isinstance(value, Mapping):
+        return {}
+    security_error = value.get("security_error")
+    if not isinstance(security_error, Mapping):
+        return {}
+    result = {"security_error": dict(security_error)}
+    next_step = value.get("next_step") or security_error.get("suggested_action")
+    if isinstance(next_step, str) and next_step:
+        result["next_step"] = next_step
+    return result
+
+
+def _stop_response_confirmed(stop: Mapping[str, Any]) -> bool:
+    return bool(
+        stop.get("ok") is True
+        and stop.get("stopped") is True
+        and stop.get("active") is not True
+        and str(stop.get("status") or "")
+        not in {
+            "cleanup_pending",
+            "cleanup_incomplete",
+            "identity_mismatch",
+            "identity_unverified",
+        }
+    )
+
+
+def _runtime_identity_digest(prepared: PreparedWorkerLaunch) -> str:
+    public = prepared.launch_spec.executable_identity.to_public_dict()
+    payload = json.dumps(public, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _grant_integrity(grant: Mapping[str, Any], authenticator: bytes) -> str:
+    covered = {
+        key: grant.get(key)
+        for key in (
+            "grant_id",
+            "job_id",
+            "executable_identity_digest",
+            "policy_decision_id",
+            "expires_at",
+            "max_uses",
+            "uses_remaining",
+            "consumed_at",
+            "grant_reference",
+        )
+    }
+    payload = json.dumps(covered, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hmac.new(
+        authenticator,
+        b"cc-orchestrator-unsafe-runtime-grant-v1\0" + payload,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _new_unsafe_runtime_grant(
+    *,
+    job_id: str,
+    prepared: PreparedWorkerLaunch,
+    timeout_seconds: int,
+    grant_reference: str,
+    authenticator: bytes,
+) -> dict[str, Any]:
+    expires_at = datetime.now(timezone.utc) + timedelta(
+        seconds=max(60, min(int(timeout_seconds), 900))
+    )
+    grant: dict[str, Any] = {
+        "grant_id": uuid.uuid4().hex,
+        "job_id": job_id,
+        "executable_identity_digest": _runtime_identity_digest(prepared),
+        "policy_decision_id": prepared.launch_spec.policy_decision_id,
+        "expires_at": expires_at.isoformat(),
+        "max_uses": 1,
+        "uses_remaining": 1,
+        "consumed_at": None,
+        "grant_reference": grant_reference,
+    }
+    grant["integrity_hmac_sha256"] = _grant_integrity(grant, authenticator)
+    return grant
+
+
+def _grant_is_expired(grant: Mapping[str, Any]) -> bool:
+    try:
+        expires = datetime.fromisoformat(str(grant["expires_at"]))
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+    except (KeyError, TypeError, ValueError):
+        return True
+    return datetime.now(timezone.utc) >= expires.astimezone(timezone.utc)
+
+
+def _grant_validation_error(
+    grant: Any,
+    *,
+    job_id: str,
+    duplicate_grant_ids: set[str],
+) -> str | None:
+    if not isinstance(grant, Mapping):
+        return "unsafe_runtime_grant_missing"
+    grant_id = str(grant.get("grant_id") or "")
+    if not re.fullmatch(r"[a-f0-9]{32}", grant_id):
+        return "unsafe_runtime_grant_invalid"
+    if grant_id in duplicate_grant_ids:
+        return "unsafe_runtime_grant_duplicate"
+    if grant.get("job_id") != job_id:
+        return "unsafe_runtime_grant_job_mismatch"
+    if grant.get("max_uses") != 1 or grant.get("uses_remaining") != 1:
+        return "unsafe_runtime_grant_consumed"
+    if grant.get("consumed_at") is not None:
+        return "unsafe_runtime_grant_replayed"
+    if _grant_is_expired(grant):
+        return "unsafe_runtime_grant_expired"
+    return None
+
+
+def _consume_unsafe_runtime_grant(
+    grant: Mapping[str, Any],
+    *,
+    job_id: str,
+    duplicate_grant_ids: set[str],
+    store: SecurePayloadStore,
+) -> str | None:
+    error = _grant_validation_error(
+        grant,
+        job_id=job_id,
+        duplicate_grant_ids=duplicate_grant_ids,
+    )
+    reference = grant.get("grant_reference") if isinstance(grant, Mapping) else None
+    if error:
+        if isinstance(reference, str):
+            try:
+                store.delete(reference)
+            except SecurePayloadStoreError:
+                pass
+        return error
+    if not isinstance(reference, str):
+        return "unsafe_runtime_grant_invalid"
+    try:
+        authenticator = store.get(reference)
+    except SecurePayloadStoreError:
+        return "unsafe_runtime_grant_replayed"
+    expected = _grant_integrity(grant, authenticator)
+    if not hmac.compare_digest(
+        str(grant.get("integrity_hmac_sha256") or ""), expected
+    ):
+        try:
+            store.delete(reference)
+        except SecurePayloadStoreError:
+            pass
+        return "unsafe_runtime_grant_tampered"
+    try:
+        store.delete(reference)
+    except SecurePayloadStoreError:
+        return "unsafe_runtime_grant_consume_failed"
+    return None
+
+
+def _decode_queue_payload(value: bytes) -> tuple[str, str | None]:
+    try:
+        payload = json.loads(value.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SecurePayloadStoreError("Secure queue payload is invalid.") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("task"), str):
+        raise SecurePayloadStoreError("Secure queue payload is invalid.")
+    context = payload.get("context")
+    if context is not None and not isinstance(context, str):
+        raise SecurePayloadStoreError("Secure queue payload is invalid.")
+    return payload["task"], context
+
+
+def _delete_queue_payload(job: dict[str, Any]) -> None:
+    reference = job.get("payload_reference")
+    if not isinstance(reference, str) or job.get("payload_deleted_at"):
+        return
+    try:
+        get_secure_payload_store().delete(reference)
+        job["payload_deleted_at"] = utc_now_iso()
+    except (SecurePayloadStoreError, SecurePayloadStoreUnavailable) as exc:
+        job["payload_delete_error"] = type(exc).__name__
+
+
 def load_queue() -> dict[str, Any]:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     if QUEUE_PATH.exists():
         queue = json.loads(QUEUE_PATH.read_text(encoding="utf-8"))
         for job in queue.get("jobs", []):
+            if "task" in job or "context" in job:
+                if job.get("status") not in {"done", "failed", "cancelled", "timed_out"}:
+                    job["status"] = "blocked_legacy_payload"
+                job["legacy_payload_present"] = True
             if job.get("status") == "pending":
                 job["status"] = "queued"
             elif job.get("status") == "succeeded":
@@ -16250,7 +17104,10 @@ def load_queue() -> dict[str, Any]:
 
 def save_queue(queue: dict[str, Any]) -> None:
     queue["updated_at"] = utc_now_iso()
-    QUEUE_PATH.write_text(json.dumps(queue, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write_bytes(
+        QUEUE_PATH,
+        (json.dumps(queue, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+    )
 
 
 def load_queue_policy() -> dict[str, Any]:
@@ -16286,40 +17143,124 @@ def queue_submit(
     timeout_seconds: int | None = None,
     max_retries: int = 0,
     allow_write: bool = False,
+    allow_unsafe_runtime: bool = False,
 ) -> dict[str, Any]:
     if not task.strip():
         raise OrchestratorError("Task cannot be empty.")
-    queue = load_queue()
     policy = load_queue_policy()
     job_id = "job-" + new_run_id()
     effective_timeout = timeout_seconds or int(policy.get("default_timeout_seconds", 900))
     effective_retries = max_retries
     if max_retries == 0:
         effective_retries = int(policy.get("retry_write_enabled" if allow_write else "retry_failed_read_only", 0))
+    effective_cwd = (cwd or Path.cwd()).expanduser().resolve()
+    payload = json.dumps(
+        {"task": task, "context": context},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    try:
+        store = get_secure_payload_store()
+        payload_reference = store.put(payload_id=job_id, value=payload)
+    except (SecurePayloadStoreUnavailable, SecurePayloadStoreError) as exc:
+        return {
+            "ok": False,
+            "status": "secure_payload_store_unavailable",
+            "error": "Deferred prompt could not be placed in an OS-protected store.",
+            "security_error": {
+                "code": "secure_payload_store_unavailable",
+                "message": str(exc),
+                "safe_details": {"job_id": job_id},
+                "suggested_action": "Enable the native protected store and submit a new queue job.",
+            },
+        }
+    grant: dict[str, Any] | None = None
+    grant_reference: str | None = None
+    try:
+        if allow_unsafe_runtime:
+            prepared = _prepare_streaming_agent(
+                task=task,
+                role=role,
+                cwd=effective_cwd,
+                context=context,
+                timeout_seconds=effective_timeout,
+                allow_write=allow_write,
+                allow_unsafe_runtime=True,
+            )
+            if prepared.launch_spec.trust_level == "local_unsafe":
+                authenticator = os.urandom(32)
+                grant_reference = store.put(
+                    payload_id=f"{job_id}-runtime-grant",
+                    value=authenticator,
+                )
+                grant = _new_unsafe_runtime_grant(
+                    job_id=job_id,
+                    prepared=prepared,
+                    timeout_seconds=effective_timeout,
+                    grant_reference=grant_reference,
+                    authenticator=authenticator,
+                )
+                effective_retries = 0
+    except Exception:
+        store.delete(payload_reference)
+        if grant_reference is not None:
+            store.delete(grant_reference)
+        raise
     job = {
         "job_id": job_id,
         "status": "queued",
         "created_at": utc_now_iso(),
         "updated_at": utc_now_iso(),
         "priority": priority if priority is not None else int(policy.get("default_priority", 100)),
-        "task": task,
         "role": role,
-        "cwd": str(cwd or Path.cwd()),
-        "context": context,
+        "cwd": str(effective_cwd),
+        "payload_reference": payload_reference,
+        "task_length": len(task),
+        "context_length": len(context or ""),
         "timeout_seconds": effective_timeout,
         "max_retries": effective_retries,
         "attempts": 0,
         "allow_write": allow_write,
         "timeout_policy": "stop",
-        "retry_policy": "read_only_default" if not allow_write else "write_disabled_by_default",
+        "retry_policy": (
+            "unsafe_runtime_requires_new_submission"
+            if grant is not None
+            else "read_only_default" if not allow_write else "write_disabled_by_default"
+        ),
+        "unsafe_runtime_grant": grant,
         "runs": [],
     }
-    queue.setdefault("jobs", []).append(job)
-    save_queue(queue)
-    return {"ok": True, "job": job, "queue_path": str(QUEUE_PATH)}
+    try:
+        with queue_lock():
+            queue = load_queue()
+            queue.setdefault("jobs", []).append(job)
+            save_queue(queue)
+    except Exception:
+        store.delete(payload_reference)
+        if grant_reference is not None:
+            store.delete(grant_reference)
+        raise
+    return {"ok": True, "job": _public_queue_job(job), "queue_path": str(QUEUE_PATH)}
 
 
 def refresh_queue_job(job: dict[str, Any]) -> dict[str, Any]:
+    if (
+        job.get("status") == "cancel_pending_cleanup"
+        and job.get("run_id")
+    ):
+        status = single_run_status(
+            str(job["run_id"]), include_output_tail=False
+        )
+        if status.get("active") or status.get("cleanup_state") in {
+            "cleanup_pending",
+            "cleanup_incomplete",
+        }:
+            return job
+        job["status"] = "cancelled"
+        job["cleanup_state"] = "cleanup_confirmed"
+        job["updated_at"] = utc_now_iso()
+        _delete_queue_payload(job)
+        return job
     if job.get("status") != "running" or not job.get("run_id"):
         return job
     status = single_run_status(str(job["run_id"]), include_output_tail=False)
@@ -16345,70 +17286,578 @@ def refresh_queue_job(job: dict[str, Any]) -> dict[str, Any]:
         job["status"] = "failed"
         job["last_error"] = f"Run {job['run_id']} ended as {status.get('status')}."
     job["updated_at"] = utc_now_iso()
+    if job.get("status") in {"done", "failed", "cancelled", "timed_out"}:
+        _delete_queue_payload(job)
     return job
 
 
+def _reconcile_abandoned_queue_claim(job: dict[str, Any]) -> bool:
+    intended_run_id = job.get("intended_run_id")
+    if not isinstance(intended_run_id, str) or not RUN_ID_RE.fullmatch(
+        intended_run_id
+    ):
+        return False
+    try:
+        observed = single_run_status(
+            intended_run_id, include_output_tail=False
+        )
+    except Exception:
+        return False
+    observed_status = str(observed.get("status") or "")
+    if not observed.get("active") and observed_status not in {
+        "succeeded",
+        "failed",
+        "stopped",
+        "timed_out",
+        "cleanup_pending",
+        "cleanup_incomplete",
+    }:
+        return False
+    job["run_id"] = intended_run_id
+    job.setdefault("runs", [])
+    if intended_run_id not in job["runs"]:
+        job["runs"].append(intended_run_id)
+    job["attempts"] = max(1, int(job.get("attempts") or 0))
+    job["updated_at"] = utc_now_iso()
+    job["reconciled_at"] = utc_now_iso()
+    job.pop("launch_claim", None)
+    if observed.get("active"):
+        job["status"] = "running"
+        job.setdefault("started_at", job.get("launch_intent_at") or utc_now_iso())
+        job["last_error"] = "queue_launch_claim_reconciled"
+        return True
+    if observed_status == "succeeded":
+        job["status"] = "done"
+    elif observed_status == "timed_out":
+        job["status"] = "timed_out"
+    elif observed_status in {"cleanup_pending", "cleanup_incomplete"}:
+        job["status"] = "cleanup_incomplete"
+        job["cleanup_state"] = observed_status
+    else:
+        job["status"] = "failed"
+    job["last_error"] = f"queue_launch_claim_reconciled_{observed_status}"
+    _delete_queue_payload(job)
+    return True
+
+
+def _queue_occupied_count(
+    run_snapshot: Mapping[str, Any], jobs: list[dict[str, Any]]
+) -> int:
+    active_count = max(0, int(run_snapshot.get("active_count") or 0))
+    active_run_ids = {
+        str(item.get("run_id"))
+        for item in run_snapshot.get("runs", [])
+        if isinstance(item, Mapping)
+        and item.get("active")
+        and isinstance(item.get("run_id"), str)
+    }
+    unidentified_active = max(0, active_count - len(active_run_ids))
+    queue_run_ids = {
+        str(job.get("run_id"))
+        for job in jobs
+        if job.get("status")
+        in {"running", "cancel_pending_cleanup", "cleanup_incomplete"}
+        and isinstance(job.get("run_id"), str)
+    }
+    launching_run_ids = {
+        str(job.get("intended_run_id"))
+        for job in jobs
+        if job.get("status") == "launching"
+        and isinstance(job.get("intended_run_id"), str)
+    }
+    unidentified_launching = sum(
+        1
+        for job in jobs
+        if job.get("status") == "launching"
+        and not isinstance(job.get("intended_run_id"), str)
+    )
+    return (
+        unidentified_active
+        + len(active_run_ids | queue_run_ids | launching_run_ids)
+        + unidentified_launching
+    )
+
+
 def queue_tick(max_concurrent: int | None = None) -> dict[str, Any]:
-    queue = load_queue()
-    jobs = [refresh_queue_job(job) for job in queue.get("jobs", [])]
-    active = run_status(include_finished=False).get("active_count", 0)
+    run_snapshot = run_status(include_finished=False)
     guard = load_cost_guard()
     policy = load_queue_policy()
     limit = max_concurrent if max_concurrent is not None else min(int(policy.get("max_concurrent", 3)), int(guard.get("max_concurrent", 4)))
-    slots = max(0, limit - int(active))
-    started: list[dict[str, Any]] = []
-    pending = sorted(
-        [job for job in jobs if job.get("status") == "queued"],
-        key=lambda item: (-int(item.get("priority") or 0), str(item.get("created_at") or "")),
-    )
-    for job in pending[:slots]:
-        run = run_streaming_agent(
-            task=str(job["task"]),
-            role=str(job.get("role") or "implementation"),
-            cwd=Path(str(job.get("cwd") or Path.cwd())),
-            context=job.get("context"),
-            timeout_seconds=job.get("timeout_seconds"),
-            allow_write=bool(job.get("allow_write", False)),
+    slots = 0
+    claims: list[dict[str, Any]] = []
+    with queue_lock():
+        queue = load_queue()
+        jobs = [refresh_queue_job(job) for job in queue.get("jobs", [])]
+        for job in jobs:
+            if job.get("status") != "launching":
+                continue
+            launch_claim = job.get("launch_claim")
+            owner_pid = (
+                launch_claim.get("owner_pid")
+                if isinstance(launch_claim, Mapping)
+                else None
+            )
+            if (
+                isinstance(owner_pid, int)
+                and not isinstance(owner_pid, bool)
+                and owner_pid > 0
+                and pid_alive(owner_pid)
+            ):
+                continue
+            if _reconcile_abandoned_queue_claim(job):
+                continue
+            job["status"] = (
+                "blocked_runtime_grant"
+                if job.get("unsafe_runtime_grant") is not None
+                else "blocked_launch_claim"
+            )
+            job["last_error"] = "queue_launch_claim_abandoned"
+            job["updated_at"] = utc_now_iso()
+            job.pop("launch_claim", None)
+            _delete_queue_payload(job)
+        slots = max(0, limit - _queue_occupied_count(run_snapshot, jobs))
+        counts = Counter(
+            str((job.get("unsafe_runtime_grant") or {}).get("grant_id") or "")
+            for job in jobs
+            if isinstance(job.get("unsafe_runtime_grant"), Mapping)
         )
-        job["status"] = "running"
-        job["run_id"] = run["run_id"]
-        job["started_at"] = utc_now_iso()
-        job["attempts"] = int(job.get("attempts") or 0) + 1
-        job["updated_at"] = utc_now_iso()
-        job.setdefault("runs", []).append(run["run_id"])
-        started.append({"job_id": job["job_id"], "run_id": run["run_id"], "role": job.get("role")})
-    queue["jobs"] = jobs
-    save_queue(queue)
-    return {"ok": True, "queue_path": str(QUEUE_PATH), "max_concurrent": limit, "slots_used": len(started), "started": started, "jobs": jobs}
+        duplicate_ids = {grant_id for grant_id, count in counts.items() if grant_id and count > 1}
+        pending = sorted(
+            [job for job in jobs if job.get("status") == "queued"],
+            key=lambda item: (-int(item.get("priority") or 0), str(item.get("created_at") or "")),
+        )
+        for job in pending[:slots]:
+            grant = job.get("unsafe_runtime_grant")
+            unsafe = grant is not None
+            if unsafe:
+                try:
+                    store = get_secure_payload_store()
+                    error = _consume_unsafe_runtime_grant(
+                        grant,
+                        job_id=str(job.get("job_id") or ""),
+                        duplicate_grant_ids=duplicate_ids,
+                        store=store,
+                    )
+                except SecurePayloadStoreUnavailable:
+                    error = "secure_payload_store_unavailable"
+                if error:
+                    job["status"] = "blocked_runtime_grant"
+                    job["last_error"] = error
+                    job["updated_at"] = utc_now_iso()
+                    continue
+                grant["uses_remaining"] = 0
+                grant["consumed_at"] = utc_now_iso()
+            claim_id = uuid.uuid4().hex
+            job["status"] = "launching"
+            job["launch_claim"] = {
+                "claim_id": claim_id,
+                "owner_pid": os.getpid(),
+                "claimed_at": utc_now_iso(),
+            }
+            job["updated_at"] = utc_now_iso()
+            claims.append(
+                {
+                    "job_id": job["job_id"],
+                    "claim_id": claim_id,
+                    "payload_reference": job.get("payload_reference"),
+                    "role": job.get("role"),
+                    "cwd": job.get("cwd"),
+                    "timeout_seconds": job.get("timeout_seconds"),
+                    "allow_write": bool(job.get("allow_write", False)),
+                    "unsafe": unsafe,
+                    "grant": dict(grant) if isinstance(grant, Mapping) else None,
+                }
+            )
+        queue["jobs"] = jobs
+        save_queue(queue)
+
+    started: list[dict[str, Any]] = []
+    for claim in claims:
+        run: dict[str, Any] | None = None
+        error_code: str | None = None
+        error_message: str | None = None
+        error_security_fields: dict[str, Any] = {}
+        mismatch_stop: dict[str, Any] | None = None
+        try:
+            reference = claim.get("payload_reference")
+            if not isinstance(reference, str):
+                raise SecurePayloadStoreError("Secure payload reference is missing.")
+            task, context = _decode_queue_payload(get_secure_payload_store().get(reference))
+            prepared = _prepare_streaming_agent(
+                task=task,
+                role=str(claim.get("role") or "implementation"),
+                cwd=Path(str(claim.get("cwd") or Path.cwd())),
+                context=context,
+                timeout_seconds=claim.get("timeout_seconds"),
+                allow_write=bool(claim.get("allow_write", False)),
+                allow_unsafe_runtime=bool(claim.get("unsafe")),
+            )
+            grant = claim.get("grant")
+            if isinstance(grant, Mapping):
+                if _runtime_identity_digest(prepared) != grant.get("executable_identity_digest"):
+                    raise _runtime_identity_changed(prepared.launch_spec.executable_identity.canonical_path)
+                if prepared.launch_spec.policy_decision_id != grant.get("policy_decision_id"):
+                    raise _security_error(
+                        "runtime_policy_drift",
+                        "Runtime policy decision changed after queue approval.",
+                        suggested_action="Submit a new queue job under the current policy.",
+                    )
+            intended_run_id = str(prepared.metadata().get("run_id") or "")
+            if not RUN_ID_RE.fullmatch(intended_run_id):
+                raise OrchestratorError(
+                    "Prepared queue launch has no valid deterministic run id."
+                )
+            claim_still_current = False
+            with queue_lock():
+                queue = load_queue()
+                job = next(
+                    (
+                        item
+                        for item in queue.get("jobs", [])
+                        if item.get("job_id") == claim["job_id"]
+                    ),
+                    None,
+                )
+                persisted_claim = (
+                    job.get("launch_claim") if isinstance(job, Mapping) else None
+                )
+                persisted_claim_id = (
+                    persisted_claim.get("claim_id")
+                    if isinstance(persisted_claim, Mapping)
+                    else persisted_claim
+                )
+                if (
+                    isinstance(job, dict)
+                    and job.get("status") == "launching"
+                    and persisted_claim_id == claim["claim_id"]
+                ):
+                    job["intended_run_id"] = intended_run_id
+                    job["launch_intent_at"] = utc_now_iso()
+                    job["updated_at"] = utc_now_iso()
+                    claim_still_current = True
+                elif isinstance(job, dict) and job.get("status") == "cancelled":
+                    job.pop("launch_claim", None)
+                    job["updated_at"] = utc_now_iso()
+                    _delete_queue_payload(job)
+                save_queue(queue)
+            if not claim_still_current:
+                continue
+            run = run_streaming_agent(
+                task=task,
+                role=str(claim.get("role") or "implementation"),
+                cwd=Path(str(claim.get("cwd") or Path.cwd())),
+                context=context,
+                timeout_seconds=claim.get("timeout_seconds"),
+                allow_write=bool(claim.get("allow_write", False)),
+                allow_unsafe_runtime=bool(claim.get("unsafe")),
+                _prepared_launch=prepared,
+            )
+            if run.get("run_id") and run.get("run_id") != intended_run_id:
+                try:
+                    mismatch_stop = stop_run(str(run["run_id"]), force=True)
+                except Exception as exc:
+                    mismatch_stop = {
+                        "ok": False,
+                        "status": "cleanup_incomplete",
+                        "active": True,
+                        "stopped": False,
+                        "error": str(exc),
+                    }
+                run = {
+                    **run,
+                    "ok": False,
+                    "status": "queue_launch_run_id_mismatch",
+                }
+                error_code = "queue_launch_run_id_mismatch"
+                error_message = (
+                    "Queue launch returned a run id different from its "
+                    "persisted intent."
+                )
+        except (RuntimeSecurityError, SecurePayloadStoreError, SecurePayloadStoreUnavailable) as exc:
+            error_code = getattr(exc, "code", None) or type(exc).__name__
+            error_message = str(exc)
+            error_security_fields = _security_response_fields(exc)
+        except Exception as exc:
+            error_code = type(exc).__name__
+            error_message = str(exc)
+        with queue_lock():
+            queue = load_queue()
+            job = next((item for item in queue.get("jobs", []) if item.get("job_id") == claim["job_id"]), None)
+            if job is None:
+                if run and run.get("run_id"):
+                    stop_run(str(run["run_id"]), force=True)
+                continue
+            persisted_claim = job.get("launch_claim")
+            persisted_claim_id = (
+                persisted_claim.get("claim_id")
+                if isinstance(persisted_claim, Mapping)
+                else persisted_claim
+            )
+            if (
+                persisted_claim_id != claim["claim_id"]
+                or job.get("status") != "launching"
+            ):
+                if run and run.get("run_id"):
+                    run_id = str(run["run_id"])
+                    job["run_id"] = run_id
+                    job.setdefault("runs", [])
+                    if run_id not in job["runs"]:
+                        job["runs"].append(run_id)
+                    try:
+                        stop = stop_run(run_id, force=True)
+                    except Exception as exc:
+                        stop = {
+                            "ok": False,
+                            "status": "cleanup_incomplete",
+                            "active": True,
+                            "stopped": False,
+                            "error": str(exc),
+                        }
+                    job["cleanup_state"] = str(
+                        stop.get("cleanup_state")
+                        or stop.get("status")
+                        or "cleanup_incomplete"
+                    )
+                    job["cancel_stop"] = {
+                        key: stop.get(key)
+                        for key in (
+                            "ok",
+                            "status",
+                            "active",
+                            "stopped",
+                            "cleanup_state",
+                        )
+                    }
+                    if _stop_response_confirmed(stop):
+                        job["status"] = "cancelled"
+                        job["cleanup_state"] = "cleanup_confirmed"
+                        _delete_queue_payload(job)
+                    else:
+                        job["status"] = "cancel_pending_cleanup"
+                        job["last_error"] = "queue_cancel_cleanup_unconfirmed"
+                else:
+                    _delete_queue_payload(job)
+                job.pop("launch_claim", None)
+                job["updated_at"] = utc_now_iso()
+                save_queue(queue)
+                continue
+            job.pop("launch_claim", None)
+            launch_succeeded = _launch_response_succeeded(run)
+            if launch_succeeded:
+                job["status"] = "running"
+                job["run_id"] = run["run_id"]
+                job["started_at"] = utc_now_iso()
+                job["attempts"] = int(job.get("attempts") or 0) + 1
+                job["updated_at"] = utc_now_iso()
+                job.setdefault("runs", []).append(run["run_id"])
+                started.append({"job_id": job["job_id"], "run_id": run["run_id"], "role": job.get("role")})
+            else:
+                cleanup_unconfirmed = (
+                    mismatch_stop is not None
+                    and not _stop_response_confirmed(mismatch_stop)
+                )
+                job["status"] = (
+                    "cleanup_incomplete" if cleanup_unconfirmed else "failed"
+                )
+                run_security_fields = _security_response_fields(run)
+                security_fields = error_security_fields or run_security_fields
+                run_security_error = security_fields.get("security_error")
+                job["last_error"] = (
+                    error_code
+                    or (
+                        run_security_error.get("code")
+                        if isinstance(run_security_error, Mapping)
+                        else None
+                    )
+                    or str((run or {}).get("status") or "queue_launch_failed")
+                )
+                job["last_error_detail"] = (
+                    error_message
+                    or str((run or {}).get("error") or "Queue launch was not accepted.")
+                )
+                job.update(security_fields)
+                if run and run.get("run_id"):
+                    job["run_id"] = run["run_id"]
+                    if run["run_id"] not in job.setdefault("runs", []):
+                        job["runs"].append(run["run_id"])
+                if mismatch_stop is not None:
+                    job["cleanup_state"] = (
+                        "cleanup_incomplete"
+                        if cleanup_unconfirmed
+                        else "cleanup_confirmed"
+                    )
+                    job["launch_stop"] = {
+                        key: mismatch_stop.get(key)
+                        for key in (
+                            "ok",
+                            "status",
+                            "active",
+                            "stopped",
+                            "cleanup_state",
+                        )
+                    }
+                job["updated_at"] = utc_now_iso()
+                if not cleanup_unconfirmed:
+                    _delete_queue_payload(job)
+            save_queue(queue)
+
+    with queue_lock():
+        final_queue = load_queue()
+        public_jobs = [_public_queue_job(job) for job in final_queue.get("jobs", [])]
+    return {"ok": True, "queue_path": str(QUEUE_PATH), "max_concurrent": limit, "slots_used": len(started), "started": started, "jobs": public_jobs}
 
 
 def queue_status(include_finished: bool = True) -> dict[str, Any]:
-    queue = load_queue()
-    all_jobs = [refresh_queue_job(job) for job in queue.get("jobs", [])]
-    queue["jobs"] = all_jobs
-    save_queue(queue)
+    with queue_lock():
+        queue = load_queue()
+        all_jobs = [refresh_queue_job(job) for job in queue.get("jobs", [])]
+        queue["jobs"] = all_jobs
+        save_queue(queue)
     jobs = all_jobs
     if not include_finished:
-        jobs = [job for job in all_jobs if job.get("status") in {"queued", "running"}]
+        jobs = [
+            job
+            for job in all_jobs
+            if job.get("status")
+            in {
+                "queued",
+                "launching",
+                "running",
+                "cancel_pending_cleanup",
+                "cleanup_incomplete",
+            }
+        ]
     counts: dict[str, int] = {}
     for job in all_jobs:
         counts[str(job.get("status") or "unknown")] = counts.get(str(job.get("status") or "unknown"), 0) + 1
-    return {"ok": True, "queue_path": str(QUEUE_PATH), "policy": load_queue_policy(), "count": len(jobs), "state_counts": counts, "jobs": jobs}
+    return {"ok": True, "queue_path": str(QUEUE_PATH), "policy": load_queue_policy(), "count": len(jobs), "state_counts": counts, "jobs": [_public_queue_job(job) for job in jobs]}
+
+
+def migrate_legacy_queue_payloads(apply: bool = False) -> dict[str, Any]:
+    """Move legacy plaintext queue prompts into the protected store transactionally."""
+    with queue_lock():
+        queue = load_queue()
+        legacy = [
+            job
+            for job in queue.get("jobs", [])
+            if "task" in job or "context" in job
+        ]
+        if not apply:
+            return {
+                "ok": True,
+                "applied": False,
+                "legacy_job_count": len(legacy),
+                "job_ids": [str(job.get("job_id") or "") for job in legacy],
+            }
+        if not legacy:
+            return {"ok": True, "applied": True, "migrated_count": 0, "jobs": []}
+        try:
+            store = get_secure_payload_store()
+        except (SecurePayloadStoreUnavailable, SecurePayloadStoreError) as exc:
+            return {
+                "ok": False,
+                "applied": False,
+                "status": "secure_payload_store_unavailable",
+                "error": str(exc),
+            }
+        created: list[str] = []
+        migrated_ids: list[str] = []
+        try:
+            for job in legacy:
+                task = job.get("task")
+                context = job.get("context")
+                if not isinstance(task, str) or (
+                    context is not None and not isinstance(context, str)
+                ):
+                    raise SecurePayloadStoreError("Legacy queue payload is invalid.")
+                value = json.dumps(
+                    {"task": task, "context": context},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                reference = store.put(
+                    payload_id=str(job.get("job_id") or uuid.uuid4().hex),
+                    value=value,
+                )
+                created.append(reference)
+                if store.get(reference) != value:
+                    raise SecurePayloadStoreError(
+                        "Protected payload retrieval verification failed."
+                    )
+                job["payload_reference"] = reference
+                job["task_length"] = len(task)
+                job["context_length"] = len(context or "")
+                job.pop("task", None)
+                job.pop("context", None)
+                job.pop("legacy_payload_present", None)
+                if job.get("status") == "blocked_legacy_payload":
+                    job["status"] = "queued"
+                job["updated_at"] = utc_now_iso()
+                migrated_ids.append(str(job.get("job_id") or ""))
+            save_queue(queue)
+        except Exception:
+            for reference in created:
+                try:
+                    store.delete(reference)
+                except SecurePayloadStoreError:
+                    pass
+            raise
+        return {
+            "ok": True,
+            "applied": True,
+            "migrated_count": len(migrated_ids),
+            "job_ids": migrated_ids,
+        }
 
 
 def queue_cancel(job_id: str) -> dict[str, Any]:
     if not QUEUE_JOB_ID_RE.match(job_id):
         raise OrchestratorError(f"Invalid queue job id: {job_id}")
-    queue = load_queue()
-    for job in queue.get("jobs", []):
-        if job.get("job_id") != job_id:
-            continue
-        if job.get("status") == "running" and job.get("run_id"):
-            stop_run(str(job["run_id"]), force=True)
-        job["status"] = "cancelled"
-        job["updated_at"] = utc_now_iso()
-        save_queue(queue)
-        return {"ok": True, "job": job}
+    with queue_lock():
+        queue = load_queue()
+        for job in queue.get("jobs", []):
+            if job.get("job_id") != job_id:
+                continue
+            run_id = job.get("run_id") or job.get("intended_run_id")
+            stop: dict[str, Any] | None = None
+            if job.get("status") in {
+                "running",
+                "launching",
+                "cancel_pending_cleanup",
+                "cleanup_incomplete",
+            } and isinstance(run_id, str):
+                try:
+                    stop = stop_run(run_id, force=True)
+                except Exception as exc:
+                    stop = {
+                        "ok": False,
+                        "status": "cleanup_incomplete",
+                        "active": True,
+                        "stopped": False,
+                        "error": str(exc),
+                    }
+                job["run_id"] = run_id
+                if run_id not in job.setdefault("runs", []):
+                    job["runs"].append(run_id)
+            if stop is not None and not _stop_response_confirmed(stop):
+                job["status"] = "cancel_pending_cleanup"
+                job["cleanup_state"] = str(
+                    stop.get("cleanup_state")
+                    or stop.get("status")
+                    or "cleanup_incomplete"
+                )
+                job["last_error"] = "queue_cancel_cleanup_unconfirmed"
+            else:
+                job["status"] = "cancelled"
+                job["cleanup_state"] = "cleanup_confirmed"
+                _delete_queue_payload(job)
+            job["updated_at"] = utc_now_iso()
+            save_queue(queue)
+            return {
+                "ok": job["status"] == "cancelled",
+                "job": _public_queue_job(job),
+                "stop": stop,
+            }
     raise OrchestratorError(f"Queue job not found: {job_id}")
 
 
@@ -16485,9 +17934,11 @@ def write_fake_claude_launcher(directory: Path) -> Path:
         "\n".join(
             [
                 "import json, os, sys, time",
-                "steps = int(os.environ.get('CC_ORCHESTRATOR_FAKE_STEPS', '4'))",
-                "delay = float(os.environ.get('CC_ORCHESTRATOR_FAKE_DELAY', '0.05'))",
-                "payload_bytes = int(os.environ.get('CC_ORCHESTRATOR_FAKE_PAYLOAD_BYTES', '0'))",
+                "from pathlib import Path",
+                "config = json.loads(Path(__file__).with_name('fake-config.json').read_text(encoding='utf-8'))",
+                "steps = int(config['steps'])",
+                "delay = float(config['delay'])",
+                "payload_bytes = int(config['payload_bytes'])",
                 "payload = 'x' * payload_bytes",
                 "model_usage = {'fake-model': {'inputTokens': 123, 'outputTokens': 45, 'costUSD': 0.99, 'contextWindow': 200000, 'maxOutputTokens': 4096}}",
                 "print(json.dumps({'type':'system','subtype':'init','cwd':os.getcwd()}), flush=True)",
@@ -16512,19 +17963,38 @@ def write_fake_claude_launcher(directory: Path) -> Path:
 def mock_stream_test(timeout_seconds: int = 20) -> dict[str, Any]:
     gates: dict[str, bool] = {}
     details: dict[str, Any] = {}
-    old_bin = os.environ.get("CLAUDE_CODE_BIN")
-    old_steps = os.environ.get("CC_ORCHESTRATOR_FAKE_STEPS")
-    old_delay = os.environ.get("CC_ORCHESTRATOR_FAKE_DELAY")
-    old_payload = os.environ.get("CC_ORCHESTRATOR_FAKE_PAYLOAD_BYTES")
     mock_parent = Path(os.environ.get("PROGRAMDATA") or "C:/ProgramData") / "cc-orchestrator-mock"
     mock_dir = mock_parent / uuid.uuid4().hex[:12]
     mock_dir.mkdir(parents=True, exist_ok=False)
     launcher = write_fake_claude_launcher(mock_dir)
-    os.environ["CLAUDE_CODE_BIN"] = str(launcher)
+
+    def configure_fake_runtime(
+        *, steps: int, delay: float, payload_bytes: int = 0
+    ) -> None:
+        _atomic_write_text(
+            mock_dir / "fake-config.json",
+            json.dumps(
+                {
+                    "steps": steps,
+                    "delay": delay,
+                    "payload_bytes": payload_bytes,
+                },
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ),
+        )
+
+    configure_fake_runtime(steps=4, delay=0.05)
+    fixture_token = _TEST_ONLY_RUNTIME_CANDIDATE.set(
+        RuntimeExecutableCandidate(
+            canonical_path=str(launcher.resolve()),
+            source="explicit_mock_stream_test_fixture",
+            trust_class="trusted_default",
+        )
+    )
     cleanup_mock_dir = os.environ.get("CC_ORCHESTRATOR_CLEAN_MOCK_DIR") == "1"
     try:
-            os.environ["CC_ORCHESTRATOR_FAKE_STEPS"] = "4"
-            os.environ["CC_ORCHESTRATOR_FAKE_DELAY"] = "0.05"
+            configure_fake_runtime(steps=4, delay=0.05)
             finish_run = run_streaming_agent("mock finish test", role="testing", timeout_seconds=timeout_seconds)
             deadline = time.time() + timeout_seconds
             finish_poll: dict[str, Any] = {}
@@ -16538,8 +18008,7 @@ def mock_stream_test(timeout_seconds: int = 20) -> dict[str, Any]:
             gates["events_ndjson_written"] = int(finish_poll.get("events", {}).get("size") or 0) > 0
             gates["poll_returned_events"] = bool(finish_poll.get("events", {}).get("items"))
 
-            os.environ["CC_ORCHESTRATOR_FAKE_STEPS"] = "200"
-            os.environ["CC_ORCHESTRATOR_FAKE_DELAY"] = "0.1"
+            configure_fake_runtime(steps=200, delay=0.1)
             stop_run_data = run_streaming_agent("mock stop test", role="testing", timeout_seconds=60)
             before_stop = {}
             deadline = time.time() + 5
@@ -16554,9 +18023,7 @@ def mock_stream_test(timeout_seconds: int = 20) -> dict[str, Any]:
             gates["stop_run_stopped_worker"] = bool(stopped.get("stopped")) or not bool(after_stop.get("active"))
             gates["status_after_stop_inactive"] = not bool(after_stop.get("active"))
 
-            os.environ["CC_ORCHESTRATOR_FAKE_STEPS"] = "20"
-            os.environ["CC_ORCHESTRATOR_FAKE_DELAY"] = "0.01"
-            os.environ["CC_ORCHESTRATOR_FAKE_PAYLOAD_BYTES"] = "4096"
+            configure_fake_runtime(steps=20, delay=0.01, payload_bytes=4096)
             budget_run = run_streaming_agent(
                 "mock output budget test",
                 role="testing",
@@ -16577,9 +18044,7 @@ def mock_stream_test(timeout_seconds: int = 20) -> dict[str, Any]:
             gates["output_budget_truncated_without_hang"] = budget_status.get("status") in {"succeeded", "stopped"} and budget_state.get("state") == "truncated"
             gates["output_budget_reason_recorded"] = budget_meta.get("stop_reason") == "output_budget_exceeded" or budget_state.get("stop_reason") == "output_budget_exceeded"
 
-            os.environ["CC_ORCHESTRATOR_FAKE_STEPS"] = "12"
-            os.environ["CC_ORCHESTRATOR_FAKE_DELAY"] = "0"
-            os.environ["CC_ORCHESTRATOR_FAKE_PAYLOAD_BYTES"] = "4096"
+            configure_fake_runtime(steps=12, delay=0, payload_bytes=4096)
             final_only_run = run_streaming_agent(
                 "mock final-only budget test",
                 role="testing",
@@ -16666,22 +18131,7 @@ def mock_stream_test(timeout_seconds: int = 20) -> dict[str, Any]:
                 "cwd_expected_runs": str(cwd_paths["runs"]),
             }
     finally:
-        if old_bin is None:
-            os.environ.pop("CLAUDE_CODE_BIN", None)
-        else:
-            os.environ["CLAUDE_CODE_BIN"] = old_bin
-        if old_steps is None:
-            os.environ.pop("CC_ORCHESTRATOR_FAKE_STEPS", None)
-        else:
-            os.environ["CC_ORCHESTRATOR_FAKE_STEPS"] = old_steps
-        if old_delay is None:
-            os.environ.pop("CC_ORCHESTRATOR_FAKE_DELAY", None)
-        else:
-            os.environ["CC_ORCHESTRATOR_FAKE_DELAY"] = old_delay
-        if old_payload is None:
-            os.environ.pop("CC_ORCHESTRATOR_FAKE_PAYLOAD_BYTES", None)
-        else:
-            os.environ["CC_ORCHESTRATOR_FAKE_PAYLOAD_BYTES"] = old_payload
+        _TEST_ONLY_RUNTIME_CANDIDATE.reset(fixture_token)
         if cleanup_mock_dir:
             shutil.rmtree(mock_dir, ignore_errors=True)
         else:
@@ -16697,92 +18147,74 @@ def run_visible_agent(
     allow_write: bool = False,
     cwd: Path | None = None,
     context: str | None = None,
+    allow_unsafe_runtime: bool = False,
 ) -> dict[str, Any]:
-    """Open Claude Code in a visible PowerShell window with selected provider env."""
+    """Open a guarded Claude Code runtime in a new Windows console."""
     if not task.strip():
         raise OrchestratorError("Task cannot be empty.")
     route = resolve_route(role=role, task_type=task_type, profile=profile)
     provider = get_provider(route["profile"])
-    permission_mode = route["permission_mode"] if not allow_write else "acceptEdits"
+    model_policy = load_json(POLICY_PATH)
+    write_enabled = allow_write or bool(
+        model_policy.get("safety", {}).get("default_write_enabled", False)
+    )
+    permission_mode = route["permission_mode"] if not write_enabled else "acceptEdits"
+    timeout = min(
+        int(route["timeout_seconds"]),
+        int(model_policy.get("safety", {}).get("max_timeout_seconds", 1800)),
+    )
+    selected_model = route.get("model_override") or provider.model
+    timeout = clamp_timeout_for_model(selected_model, timeout)
     effective_cwd = (cwd or Path.cwd()).expanduser().resolve()
-    paths = workspace_paths(effective_cwd)
+    paths = _guarded_launch_paths(effective_cwd)
     prompt = build_prompt(role, task, context, artifact_root=paths["artifact_root"])
-    safe_prompt = str(redact(prompt))
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
-    run_dir = paths["runs"] / run_id
-    run_dir.mkdir(parents=True, exist_ok=False)
-    register_run_dir(run_id, run_dir, paths["workspace_root"], paths["artifact_root"])
-    prompt_path = run_dir / "prompt.txt"
-    bootstrap_path = run_dir / "start-visible.ps1"
-    prompt_path.write_text(safe_prompt, encoding="utf-8")
-    env = build_worker_env(provider.env, route.get("model_override"), workspace_root=paths["workspace_root"], artifact_root=paths["artifact_root"])
-    env_for_log: dict[str, str] = {}
-    for key, value in provider.env.items():
-        env_for_log[key] = value
-    if route.get("model_override"):
-        env_for_log["ANTHROPIC_MODEL"] = str(route["model_override"])
-    env_for_log["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
-    console_lines = [
-        "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new()",
-        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()",
-        "$OutputEncoding = [System.Text.UTF8Encoding]::new()",
-    ]
-    script = "\n".join(
-        [
-            "$ErrorActionPreference = 'Stop'",
-            f"Set-Location -LiteralPath {json.dumps(str(effective_cwd))}",
-            *console_lines,
-            f"$prompt = Get-Content -Raw -LiteralPath {json.dumps(str(prompt_path))}",
-            f"& {json.dumps(claude_bin_path())} --permission-mode {permission_mode} $prompt",
-            "Write-Host ''",
-            "Write-Host 'Claude Code session ended. Press Enter to close this window.'",
-            "[void][Console]::ReadLine()",
-        ]
-    )
-    bootstrap_path.write_text(script, encoding="utf-8")
-    metadata = {
-        "run_id": run_id,
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "mode": "visible_window",
-        "cwd": str(effective_cwd),
-        "workspace_root": str(paths["workspace_root"]),
-        "artifact_root": str(paths["artifact_root"]),
-        "runs_root": str(paths["runs"]),
-        "role": role,
-        "task_type": route["task_type"],
-        "profile": {
-            "id": provider.id,
-            "name": provider.name,
-            "model": route.get("model_override") or provider.model,
-            "provider_default_model": provider.model,
-            "base_url": provider.env.get("ANTHROPIC_BASE_URL"),
-            "endpoints": provider.endpoints,
+    prepared = prepare_worker_launch(
+        mode="visible",
+        prompt=prompt,
+        provider_env=provider.env,
+        model_override=route.get("model_override"),
+        cwd=effective_cwd,
+        workspace_root=paths["workspace_root"],
+        artifact_root=paths["artifact_root"],
+        permission_mode=permission_mode,
+        timeout_seconds=timeout,
+        arguments=(
+            "--permission-mode",
+            permission_mode,
+            "--no-session-persistence",
+        ),
+        safe_route_metadata={
+            "role": role,
+            "task_type": route["task_type"],
+            "profile": {
+                "id": provider.id,
+                "name": provider.name,
+                "model": selected_model,
+                "provider_default_model": provider.model,
+                "endpoints": provider.endpoints,
+            },
+            "permission_mode": permission_mode,
+            "allow_write": write_enabled,
+            "route_reason": route.get("reason", ""),
+            "visible_console": True,
         },
-        "permission_mode": permission_mode,
-        "allow_write": allow_write,
-        "prompt_path": str(prompt_path),
-        "bootstrap_path": str(bootstrap_path),
-        "env": redact(env_for_log),
-    }
-    write_metadata(run_dir, metadata)
-    subprocess.Popen(
-        [
-            "powershell",
-            "-NoExit",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(bootstrap_path),
-        ],
-        cwd=str(effective_cwd),
-        env=env,
-        creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+        allow_unsafe_runtime=allow_unsafe_runtime,
+        selected_model=selected_model,
+        sensitive_values=(task, context or ""),
     )
-    paths["runs"].mkdir(parents=True, exist_ok=True)
-    (paths["runs"] / "latest.txt").write_text(run_id, encoding="utf-8")
-    RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    (RUNS_DIR / "latest.txt").write_text(run_id, encoding="utf-8")
-    return metadata
+    if os.name != "nt":
+        error = _security_error(
+            "visible_runtime_unsupported",
+            "Visible runtime launch is unavailable on this platform.",
+            suggested_action="Use run-streaming and poll the guarded worker output.",
+        )
+        return {
+            "ok": False,
+            "status": "visible_runtime_unsupported",
+            "error": error.message,
+            "security_error": error.to_dict(),
+        }
+    return start_prepared_worker_launch(prepared)
 
 
 def git_diff(cwd: Path | None = None, limit_chars: int = 12000) -> dict[str, Any]:
@@ -17456,7 +18888,14 @@ def workflow_decision(
     return payload
 
 
-def workflow_run(file: str | Path, task: str, cwd: Path | None = None, mock: bool = False, loop_guard: int = 50) -> dict[str, Any]:
+def workflow_run(
+    file: str | Path,
+    task: str,
+    cwd: Path | None = None,
+    mock: bool = False,
+    loop_guard: int = 50,
+    allow_unsafe_runtime: bool = False,
+) -> dict[str, Any]:
     if not mock:
         raise OrchestratorError("Real workflow-run is not enabled in v0.7.0. Use --mock to validate the controller without spending model quota.")
     spec = load_workflow_spec(file, cwd=cwd)
@@ -17469,12 +18908,28 @@ def workflow_run(file: str | Path, task: str, cwd: Path | None = None, mock: boo
     workflow_dir.mkdir(parents=True, exist_ok=False)
     register_workflow_dir(workflow_id, workflow_dir, paths["workspace_root"], paths["artifact_root"])
     nodes = workflow_nodes(spec)
-    source_text = str(spec.get("_source_text") or json.dumps({k: v for k, v in spec.items() if not str(k).startswith("_")}, ensure_ascii=False, indent=2))
-    (workflow_dir / "workflow.yaml").write_text(source_text, encoding="utf-8")
+    persisted_spec = {
+        key: value
+        for key, value in spec.items()
+        if not str(key).startswith("_") and key not in {"task", "context", "prompt"}
+    }
+    persisted_nodes: dict[str, Any] = {}
+    for node_id, node in (persisted_spec.get("nodes") or {}).items():
+        if isinstance(node, Mapping):
+            persisted_nodes[str(node_id)] = {
+                key: value
+                for key, value in node.items()
+                if key not in {"task", "context", "prompt"}
+            }
+        else:
+            persisted_nodes[str(node_id)] = node
+    persisted_spec["nodes"] = persisted_nodes
+    source_text = json.dumps(persisted_spec, ensure_ascii=False, indent=2)
+    _atomic_write_text(workflow_dir / "workflow.yaml", source_text + "\n")
     manifest = {
         "workflow_id": workflow_id,
         "source_file": spec.get("_source_file"),
-        "task": task,
+        "task_length": len(task),
         "cwd": str((cwd or Path.cwd()).resolve()),
         "mock": mock,
         "created_at": utc_now_iso(),
@@ -17483,7 +18938,7 @@ def workflow_run(file: str | Path, task: str, cwd: Path | None = None, mock: boo
     status: dict[str, Any] = {
         "workflow_id": workflow_id,
         "status": "running",
-        "task": task,
+        "task_length": len(task),
         "cwd": manifest["cwd"],
         "mock": mock,
         "created_at": utc_now_iso(),
@@ -17586,6 +19041,7 @@ def workflow_run(file: str | Path, task: str, cwd: Path | None = None, mock: boo
                     final_only=bool((spec.get("defaults") or {}).get("final_only", True)),
                     max_output_bytes=int((spec.get("defaults") or {}).get("max_output_bytes") or OUTPUT_BUDGET_DEFAULTS["max_output_bytes"]),
                     max_events_bytes=int((spec.get("defaults") or {}).get("max_events_bytes") or OUTPUT_BUDGET_DEFAULTS["max_events_bytes"]),
+                    allow_unsafe_runtime=allow_unsafe_runtime,
                 )
                 node_state.update({"state": "running", "run_id": run["run_id"]})
                 status["decisions"].append(workflow_decision(node_id, "advance", "worker launched", next_nodes=[]))
@@ -18042,7 +19498,7 @@ nodes:
         source_before = source_file.read_text(encoding="utf-8")
         workflow_valid = validate_workflow_spec(valid_workflow)
         workflow_dry = workflow_dry_run(workflow_path, task="mock task", cwd=Path(tmp))
-        workflow_mock = workflow_run(workflow_path, task="mock task", cwd=Path(tmp), mock=True)
+        workflow_mock = workflow_run(workflow_path, task="mock task", cwd=Path(tmp), mock=True, allow_unsafe_runtime=False)
         workflow_mock_status = workflow_status(str(workflow_mock.get("workflow_id")), cwd=Path(tmp))
         workflow_report_text = Path(str(workflow_mock.get("report_path"))).read_text(encoding="utf-8")
         workflow_id = str(workflow_mock.get("workflow_id"))
@@ -18066,11 +19522,11 @@ nodes:
             tampered_workflow_index_rejected = True
         register_workflow_dir(workflow_id, workflow_dir, workspace_paths(Path(tmp))["workspace_root"], workspace_paths(Path(tmp))["artifact_root"])
         try:
-            workflow_run(workflow_path, task="real workflow should be disabled", cwd=Path(tmp), mock=False)
+            workflow_run(workflow_path, task="real workflow should be disabled", cwd=Path(tmp), mock=False, allow_unsafe_runtime=False)
             real_workflow_run_rejected = False
         except OrchestratorError:
             real_workflow_run_rejected = True
-        manual_retry_workflow = workflow_run(workflow_path, task="mock manual retry", cwd=Path(tmp), mock=True)
+        manual_retry_workflow = workflow_run(workflow_path, task="mock manual retry", cwd=Path(tmp), mock=True, allow_unsafe_runtime=False)
         manual_retry_id = str(manual_retry_workflow.get("workflow_id"))
         manual_retry_result = workflow_retry_node(manual_retry_id, "implementation", cwd=Path(tmp))
         manual_retry_status = read_workflow_status(manual_retry_id, cwd=Path(tmp))
@@ -18108,7 +19564,7 @@ nodes:
         missing_handoff_spec["nodes"]["requirements"]["mock_missing_handoff"] = ["status"]
         missing_handoff_path = Path(tmp) / "missing-handoff-workflow.json"
         write_json_file(missing_handoff_path, missing_handoff_spec)
-        missing_handoff_run = workflow_run(missing_handoff_path, task="mock missing handoff", cwd=Path(tmp), mock=True)
+        missing_handoff_run = workflow_run(missing_handoff_path, task="mock missing handoff", cwd=Path(tmp), mock=True, allow_unsafe_runtime=False)
         missing_handoff_nodes = (missing_handoff_run.get("status") or {}).get("nodes") or {}
 
         max_retry_spec = json.loads(json.dumps(valid_workflow))
@@ -18116,11 +19572,11 @@ nodes:
         max_retry_spec["nodes"]["quality_gate"]["on_fail"]["max_retries"] = 1
         max_retry_path = Path(tmp) / "max-retry-workflow.json"
         write_json_file(max_retry_path, max_retry_spec)
-        max_retry_run = workflow_run(max_retry_path, task="mock max retry", cwd=Path(tmp), mock=True)
+        max_retry_run = workflow_run(max_retry_path, task="mock max retry", cwd=Path(tmp), mock=True, allow_unsafe_runtime=False)
         max_retry_status = max_retry_run.get("status") or {}
         max_retry_nodes = max_retry_status.get("nodes") or {}
         max_retry_decisions = max_retry_status.get("decisions") or []
-        loop_guard_run = workflow_run(workflow_path, task="mock loop guard", cwd=Path(tmp), mock=True, loop_guard=1)
+        loop_guard_run = workflow_run(workflow_path, task="mock loop guard", cwd=Path(tmp), mock=True, loop_guard=1, allow_unsafe_runtime=False)
         loop_guard_status = loop_guard_run.get("status") or {}
         decision_sets = [
             workflow_mock_status.get("decisions") or [],
@@ -18358,6 +19814,7 @@ def main() -> int:
     run.add_argument("--allow-write", action="store_true")
     run.add_argument("--timeout-seconds", type=int)
     run.add_argument("--cwd")
+    run.add_argument("--allow-unsafe-runtime", action="store_true", help="Approve a custom runtime already pinned in runtime_security.override.json for this request only.")
     stream = sub.add_parser("run-streaming")
     stream.add_argument("task")
     stream.add_argument("--role", default="implementation")
@@ -18375,6 +19832,7 @@ def main() -> int:
     stream.add_argument("--kill-on-excessive-output", action="store_true")
     stream.add_argument("--final-only", action="store_true")
     stream.add_argument("--final-max-chars", type=int)
+    stream.add_argument("--allow-unsafe-runtime", action="store_true", help="Approve a custom runtime already pinned in runtime_security.override.json for this request only.")
     poll = sub.add_parser("poll-run")
     poll.add_argument("--run-id", required=True)
     poll.add_argument("--stdout-offset", type=int, default=0)
@@ -18421,12 +19879,14 @@ def main() -> int:
     send.add_argument("--reroute", action="store_true")
     send.add_argument("--route-profile")
     send.add_argument("--route-model")
+    send.add_argument("--allow-unsafe-runtime", action="store_true", help="Approve a custom runtime already pinned in runtime_security.override.json for this request only.")
     team = sub.add_parser("spawn-role-team")
     team.add_argument("task")
     team.add_argument("--roles", default="requirements,architecture,security,testing")
     team.add_argument("--cwd")
     team.add_argument("--context")
     team.add_argument("--timeout-seconds", type=int)
+    team.add_argument("--allow-unsafe-runtime", action="store_true", help="Approve a custom runtime already pinned in runtime_security.override.json for this request only.")
     collect = sub.add_parser("collect-team-results")
     collect.add_argument("--team-id")
     collect.add_argument("--run-id", action="append", dest="run_ids")
@@ -18436,6 +19896,7 @@ def main() -> int:
     cross.add_argument("--reviewer-roles", default="security,testing,review")
     cross.add_argument("--cwd")
     cross.add_argument("--timeout-seconds", type=int)
+    cross.add_argument("--allow-unsafe-runtime", action="store_true", help="Approve a custom runtime already pinned in runtime_security.override.json for this request only.")
     scope = sub.add_parser("preflight-write-scope")
     scope.add_argument("--cwd")
     scope.add_argument("--allow", action="append", dest="allowed_paths")
@@ -18463,10 +19924,12 @@ def main() -> int:
     bench.add_argument("--task", default="Return a concise JSON object with keys ok and summary.")
     bench.add_argument("--timeout-seconds", type=int, default=120)
     bench.add_argument("--execute", action="store_true")
+    bench.add_argument("--allow-unsafe-runtime", action="store_true", help="Approve a custom runtime already pinned in runtime_security.override.json for this request only.")
     bench_suite = sub.add_parser("benchmark-suite")
     bench_suite.add_argument("--profile")
     bench_suite.add_argument("--timeout-seconds", type=int, default=120)
     bench_suite.add_argument("--execute", action="store_true")
+    bench_suite.add_argument("--allow-unsafe-runtime", action="store_true", help="Approve a custom runtime already pinned in runtime_security.override.json for this request only.")
     calibrate = sub.add_parser("calibrate-policy")
     calibrate.add_argument("--preferences-json", default="{}")
     calibrate.add_argument("--preference", action="append", dest="preferences")
@@ -18488,12 +19951,15 @@ def main() -> int:
     queue_submit_cmd.add_argument("--timeout-seconds", type=int)
     queue_submit_cmd.add_argument("--max-retries", type=int, default=0)
     queue_submit_cmd.add_argument("--allow-write", action="store_true")
+    queue_submit_cmd.add_argument("--allow-unsafe-runtime", action="store_true", help="Approve a custom runtime already pinned in runtime_security.override.json for this request only.")
     queue_tick_cmd = sub.add_parser("queue-tick")
     queue_tick_cmd.add_argument("--max-concurrent", type=int)
     queue_status_cmd = sub.add_parser("queue-status")
     queue_status_cmd.add_argument("--active-only", action="store_true")
     queue_cancel_cmd = sub.add_parser("queue-cancel")
     queue_cancel_cmd.add_argument("--job-id", required=True)
+    queue_migrate_cmd = sub.add_parser("queue-migrate-payloads")
+    queue_migrate_cmd.add_argument("--apply", action="store_true")
     queue_policy_cmd = sub.add_parser("queue-policy")
     queue_policy_cmd.add_argument("--config-json", default="{}")
     queue_policy_cmd.add_argument("--max-concurrent", type=int)
@@ -18571,6 +20037,7 @@ def main() -> int:
     visible.add_argument("--profile")
     visible.add_argument("--allow-write", action="store_true")
     visible.add_argument("--cwd")
+    visible.add_argument("--allow-unsafe-runtime", action="store_true", help="Approve a custom runtime already pinned in runtime_security.override.json for this request only.")
     diff = sub.add_parser("diff")
     diff.add_argument("--cwd")
     workflow = sub.add_parser("workflow-plan")
@@ -18589,6 +20056,7 @@ def main() -> int:
     workflow_run_cmd.add_argument("--cwd")
     workflow_run_cmd.add_argument("--mock", action="store_true")
     workflow_run_cmd.add_argument("--loop-guard", type=int, default=50)
+    workflow_run_cmd.add_argument("--allow-unsafe-runtime", action="store_true", help="Approve a custom runtime already pinned in runtime_security.override.json for this request only.")
     workflow_status_cmd = sub.add_parser("workflow-status")
     workflow_status_cmd.add_argument("--workflow-id", required=True)
     workflow_status_cmd.add_argument("--cwd")
@@ -18627,6 +20095,8 @@ def main() -> int:
     last.add_argument("--run-id")
     worker = sub.add_parser("_stream-worker")
     worker.add_argument("--run-id", required=True)
+    visible_worker_cmd = sub.add_parser("_visible-worker")
+    visible_worker_cmd.add_argument("--run-id", required=True)
     args = parser.parse_args()
     try:
         if args.command == "healthcheck":
@@ -18661,6 +20131,7 @@ def main() -> int:
                     allow_write=args.allow_write,
                     timeout_seconds=args.timeout_seconds,
                     cwd=Path(args.cwd) if args.cwd else None,
+                    allow_unsafe_runtime=args.allow_unsafe_runtime,
                 )
             )
         elif args.command == "run-streaming":
@@ -18682,6 +20153,7 @@ def main() -> int:
                     kill_on_excessive_output=args.kill_on_excessive_output,
                     final_only=args.final_only,
                     final_max_chars=args.final_max_chars,
+                    allow_unsafe_runtime=args.allow_unsafe_runtime,
                 )
             )
         elif args.command == "poll-run":
@@ -18738,6 +20210,7 @@ def main() -> int:
                     reroute=args.reroute,
                     route_profile=args.route_profile,
                     route_model=args.route_model,
+                    allow_unsafe_runtime=args.allow_unsafe_runtime,
                 )
             )
         elif args.command == "spawn-role-team":
@@ -18748,6 +20221,7 @@ def main() -> int:
                     cwd=Path(args.cwd) if args.cwd else None,
                     context=args.context,
                     timeout_seconds=args.timeout_seconds,
+                    allow_unsafe_runtime=args.allow_unsafe_runtime,
                 )
             )
         elif args.command == "collect-team-results":
@@ -18759,6 +20233,7 @@ def main() -> int:
                     reviewer_roles=split_csv(args.reviewer_roles),
                     cwd=Path(args.cwd) if args.cwd else None,
                     timeout_seconds=args.timeout_seconds,
+                    allow_unsafe_runtime=args.allow_unsafe_runtime,
                 )
             )
         elif args.command == "preflight-write-scope":
@@ -18795,10 +20270,11 @@ def main() -> int:
                     task=args.task,
                     timeout_seconds=args.timeout_seconds,
                     execute=args.execute,
+                    allow_unsafe_runtime=args.allow_unsafe_runtime,
                 )
             )
         elif args.command == "benchmark-suite":
-            print_json(benchmark_suite(profile=args.profile, execute=args.execute, timeout_seconds=args.timeout_seconds))
+            print_json(benchmark_suite(profile=args.profile, execute=args.execute, timeout_seconds=args.timeout_seconds, allow_unsafe_runtime=args.allow_unsafe_runtime))
         elif args.command == "calibrate-policy":
             preferences = parse_json_arg(args.preferences_json)
             preferences.update(parse_key_values(args.preferences))
@@ -18823,6 +20299,7 @@ def main() -> int:
                     timeout_seconds=args.timeout_seconds,
                     max_retries=args.max_retries,
                     allow_write=args.allow_write,
+                    allow_unsafe_runtime=args.allow_unsafe_runtime,
                 )
             )
         elif args.command == "queue-tick":
@@ -18831,6 +20308,8 @@ def main() -> int:
             print_json(queue_status(include_finished=not args.active_only))
         elif args.command == "queue-cancel":
             print_json(queue_cancel(args.job_id))
+        elif args.command == "queue-migrate-payloads":
+            print_json(migrate_legacy_queue_payloads(apply=args.apply))
         elif args.command == "queue-policy":
             policy_config = parse_json_arg(args.config_json)
             if args.max_concurrent is not None:
@@ -18894,6 +20373,7 @@ def main() -> int:
                     profile=args.profile,
                     allow_write=args.allow_write,
                     cwd=Path(args.cwd) if args.cwd else None,
+                    allow_unsafe_runtime=args.allow_unsafe_runtime,
                 )
             )
         elif args.command == "diff":
@@ -18905,7 +20385,7 @@ def main() -> int:
         elif args.command == "workflow-dry-run":
             print_json(workflow_dry_run(args.file, task=args.task, cwd=Path(args.cwd) if args.cwd else None))
         elif args.command == "workflow-run":
-            print_json(workflow_run(args.file, task=args.task, cwd=Path(args.cwd) if args.cwd else None, mock=args.mock, loop_guard=args.loop_guard))
+            print_json(workflow_run(args.file, task=args.task, cwd=Path(args.cwd) if args.cwd else None, mock=args.mock, loop_guard=args.loop_guard, allow_unsafe_runtime=args.allow_unsafe_runtime))
         elif args.command == "workflow-status":
             print_json(workflow_status(args.workflow_id, cwd=Path(args.cwd) if args.cwd else None))
         elif args.command == "workflow-retry-node":
@@ -18947,7 +20427,19 @@ def main() -> int:
             print_json(last_run(args.run_id))
         elif args.command == "_stream-worker":
             print_json(stream_worker(args.run_id))
+        elif args.command == "_visible-worker":
+            print_json(visible_worker(args.run_id))
         return 0
+    except RuntimeSecurityError as exc:
+        print_json(
+            {
+                "ok": False,
+                "error": exc.message,
+                "security_error": exc.to_dict(),
+                "next_step": exc.suggested_action,
+            }
+        )
+        return 2
     except OrchestratorError as exc:
         print_json({"ok": False, "error": str(exc)})
         return 2

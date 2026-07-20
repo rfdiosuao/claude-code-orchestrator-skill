@@ -46,6 +46,7 @@ from cc_orchestrator import (
     resolve_route,
     get_provider,
     migrate_data,
+    migrate_legacy_queue_payloads,
     poll_run,
     preflight_write_scope,
     queue_cancel,
@@ -83,6 +84,7 @@ from cc_orchestrator import (
     write_claude_md,
     write_reports,
 )
+from runtime_security import RuntimeSecurityError
 
 
 mcp = FastMCP("claude_code_mcp")
@@ -126,6 +128,7 @@ class RunAgentInput(BaseModel):
     timeout_seconds: Optional[int] = Field(default=None, ge=10, le=1800, description="Optional timeout override.")
     cwd: Optional[str] = Field(default=None, description="Working directory for Claude Code. Defaults to MCP server cwd.")
     context: Optional[str] = Field(default=None, max_length=20000, description="Additional context to append to the prompt.")
+    allow_unsafe_runtime: bool = Field(default=False, description="Per-request approval for a locally allowlisted custom runtime; local policy approval is also required.")
 
 
 class RunStreamingAgentInput(RunAgentInput):
@@ -207,6 +210,7 @@ class SendInstructionInput(BaseModel):
     reroute: bool = Field(default=False, description="Allow the follow-up run to choose a new route.")
     route_profile: Optional[str] = Field(default=None, description="Explicit profile for the restarted run.")
     route_model: Optional[str] = Field(default=None, description="Explicit model override for the restarted run.")
+    allow_unsafe_runtime: bool = Field(default=False, description="Per-request approval for a locally allowlisted custom runtime; local policy approval is also required.")
 
 
 class SpawnRoleTeamInput(BaseModel):
@@ -217,6 +221,7 @@ class SpawnRoleTeamInput(BaseModel):
     cwd: Optional[str] = None
     context: Optional[str] = Field(default=None, max_length=20000)
     timeout_seconds: Optional[int] = Field(default=None, ge=10, le=1800)
+    allow_unsafe_runtime: bool = Field(default=False, description="Per-request approval for a locally allowlisted custom runtime; local policy approval is also required.")
 
 
 class CollectTeamResultsInput(BaseModel):
@@ -234,6 +239,7 @@ class CrossReviewInput(BaseModel):
     reviewer_roles: list[str] = Field(default_factory=lambda: ["security", "testing", "review"], description=ROLE_DESCRIPTION)
     cwd: Optional[str] = None
     timeout_seconds: Optional[int] = Field(default=None, ge=10, le=1800)
+    allow_unsafe_runtime: bool = Field(default=False, description="Per-request approval for a locally allowlisted custom runtime; local policy approval is also required.")
 
 
 class PreflightWriteScopeInput(BaseModel):
@@ -290,6 +296,7 @@ class BenchmarkModelInput(BaseModel):
     task: str = Field(default="Return a concise JSON object with keys ok and summary.", max_length=20000)
     timeout_seconds: int = Field(default=120, ge=10, le=1800)
     execute: bool = Field(default=False, description="When false, returns the planned benchmark without spending model calls.")
+    allow_unsafe_runtime: bool = Field(default=False, description="Per-request approval for a locally allowlisted custom runtime; local policy approval is also required.")
 
 
 class BenchmarkSuiteInput(BaseModel):
@@ -298,6 +305,7 @@ class BenchmarkSuiteInput(BaseModel):
     profile: Optional[str] = None
     timeout_seconds: int = Field(default=120, ge=10, le=1800)
     execute: bool = Field(default=False, description="When false, returns the planned suite without spending model calls.")
+    allow_unsafe_runtime: bool = Field(default=False, description="Per-request approval for a locally allowlisted custom runtime; local policy approval is also required.")
 
 
 class CalibratePolicyInput(BaseModel):
@@ -365,6 +373,7 @@ class QueueSubmitInput(BaseModel):
     timeout_seconds: Optional[int] = Field(default=None, ge=10, le=1800)
     max_retries: int = Field(default=0, ge=0, le=5)
     allow_write: bool = False
+    allow_unsafe_runtime: bool = Field(default=False, description="Per-request approval for a locally allowlisted custom runtime; local policy approval is also required.")
 
 
 class QueueTickInput(BaseModel):
@@ -390,6 +399,12 @@ class QueuePolicyInput(BaseModel):
 
     config: dict = Field(default_factory=dict)
     apply: bool = False
+
+
+class QueueMigratePayloadsInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    apply: bool = Field(default=False, description="Preview by default; migrate and scrub legacy plaintext queue payloads only when true.")
 
 
 class UpgradeCheckInput(BaseModel):
@@ -543,6 +558,7 @@ class WorkflowRunInput(BaseModel):
     cwd: Optional[str] = None
     mock: bool = Field(default=True, description="Run without spending model quota by creating mock node runs. Real DAG execution is intentionally disabled in v0.7.0.")
     loop_guard: int = Field(default=50, ge=1, le=500)
+    allow_unsafe_runtime: bool = Field(default=False, description="Per-request approval for a locally allowlisted custom runtime; local policy approval is also required.")
 
 
 class WorkflowIdInput(BaseModel):
@@ -595,6 +611,13 @@ def _json(data: object) -> str:
 
 
 def _error(exc: Exception) -> str:
+    if isinstance(exc, RuntimeSecurityError):
+        return _json({
+            "ok": False,
+            "error": exc.message,
+            "security_error": exc.to_dict(),
+            "next_step": exc.suggested_action,
+        })
     return _json({"ok": False, "error": str(exc), "next_step": "Check cc_healthcheck and profile names, then retry."})
 
 
@@ -739,9 +762,10 @@ async def cc_run_agent(params: RunAgentInput) -> str:
             timeout_seconds=params.timeout_seconds,
             cwd=Path(params.cwd) if params.cwd else None,
             context=params.context,
+            allow_unsafe_runtime=params.allow_unsafe_runtime,
         )
         return _json(data)
-    except OrchestratorError as exc:
+    except Exception as exc:
         return _error(exc)
 
 
@@ -780,6 +804,7 @@ async def cc_run_streaming_agent(params: RunStreamingAgentInput) -> str:
             kill_on_excessive_output=params.kill_on_excessive_output,
             final_only=params.final_only,
             final_max_chars=params.final_max_chars,
+            allow_unsafe_runtime=params.allow_unsafe_runtime,
         )
         return _json(data)
     except Exception as exc:
@@ -896,6 +921,7 @@ async def cc_send_instruction(params: SendInstructionInput) -> str:
                 reroute=params.reroute,
                 route_profile=params.route_profile,
                 route_model=params.route_model,
+                allow_unsafe_runtime=params.allow_unsafe_runtime,
             )
         )
     except Exception as exc:
@@ -906,7 +932,7 @@ async def cc_send_instruction(params: SendInstructionInput) -> str:
 async def cc_spawn_role_team(params: SpawnRoleTeamInput) -> str:
     """Start several role-specific streaming Claude Code workers and write a team manifest."""
     try:
-        return _json(spawn_role_team(params.task, roles=params.roles, cwd=Path(params.cwd) if params.cwd else None, context=params.context, timeout_seconds=params.timeout_seconds))
+        return _json(spawn_role_team(params.task, roles=params.roles, cwd=Path(params.cwd) if params.cwd else None, context=params.context, timeout_seconds=params.timeout_seconds, allow_unsafe_runtime=params.allow_unsafe_runtime))
     except Exception as exc:
         return _error(exc)
 
@@ -924,7 +950,7 @@ async def cc_collect_team_results(params: CollectTeamResultsInput) -> str:
 async def cc_cross_review(params: CrossReviewInput) -> str:
     """Launch second-round reviewer workers over previous worker outputs."""
     try:
-        return _json(cross_review(params.run_ids, reviewer_roles=params.reviewer_roles, cwd=Path(params.cwd) if params.cwd else None, timeout_seconds=params.timeout_seconds))
+        return _json(cross_review(params.run_ids, reviewer_roles=params.reviewer_roles, cwd=Path(params.cwd) if params.cwd else None, timeout_seconds=params.timeout_seconds, allow_unsafe_runtime=params.allow_unsafe_runtime))
     except Exception as exc:
         return _error(exc)
 
@@ -987,7 +1013,7 @@ async def cc_verify_run(params: VerifyRunInput) -> str:
 async def cc_benchmark_model(params: BenchmarkModelInput) -> str:
     """Run or plan a small real benchmark through Claude Code for a selected profile/model."""
     try:
-        return _json(benchmark_model(profile=params.profile, role=params.role, task=params.task, timeout_seconds=params.timeout_seconds, execute=params.execute))
+        return _json(benchmark_model(profile=params.profile, role=params.role, task=params.task, timeout_seconds=params.timeout_seconds, execute=params.execute, allow_unsafe_runtime=params.allow_unsafe_runtime))
     except Exception as exc:
         return _error(exc)
 
@@ -996,7 +1022,7 @@ async def cc_benchmark_model(params: BenchmarkModelInput) -> str:
 async def cc_benchmark_suite(params: BenchmarkSuiteInput) -> str:
     """Run or plan the fixed benchmark suite for code fix, review, security, long context, and multimodal planning."""
     try:
-        return _json(benchmark_suite(profile=params.profile, execute=params.execute, timeout_seconds=params.timeout_seconds))
+        return _json(benchmark_suite(profile=params.profile, execute=params.execute, timeout_seconds=params.timeout_seconds, allow_unsafe_runtime=params.allow_unsafe_runtime))
     except Exception as exc:
         return _error(exc)
 
@@ -1070,7 +1096,7 @@ async def cc_usage_summary(params: UsageSummaryInput) -> str:
 async def cc_queue_submit(params: QueueSubmitInput) -> str:
     """Submit a Claude Code worker job to the priority queue without starting it immediately."""
     try:
-        return _json(queue_submit(task=params.task, role=params.role, priority=params.priority, cwd=Path(params.cwd) if params.cwd else None, context=params.context, timeout_seconds=params.timeout_seconds, max_retries=params.max_retries, allow_write=params.allow_write))
+        return _json(queue_submit(task=params.task, role=params.role, priority=params.priority, cwd=Path(params.cwd) if params.cwd else None, context=params.context, timeout_seconds=params.timeout_seconds, max_retries=params.max_retries, allow_write=params.allow_write, allow_unsafe_runtime=params.allow_unsafe_runtime))
     except Exception as exc:
         return _error(exc)
 
@@ -1107,6 +1133,15 @@ async def cc_queue_policy(params: QueuePolicyInput) -> str:
     """Read or write queue defaults such as max_concurrent, retry, and timeout policy."""
     try:
         return _json(queue_policy(params.config, apply=params.apply))
+    except Exception as exc:
+        return _error(exc)
+
+
+@mcp.tool(name="cc_queue_migrate_payloads", annotations={"title": "Migrate Legacy Queue Payloads", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False})
+async def cc_queue_migrate_payloads(params: QueueMigratePayloadsInput) -> str:
+    """Move legacy plaintext queue prompts to the native protected store."""
+    try:
+        return _json(migrate_legacy_queue_payloads(apply=params.apply))
     except Exception as exc:
         return _error(exc)
 
@@ -1298,6 +1333,7 @@ async def cc_run_visible_agent(params: RunAgentInput) -> str:
             allow_write=params.allow_write,
             cwd=Path(params.cwd) if params.cwd else None,
             context=params.context,
+            allow_unsafe_runtime=params.allow_unsafe_runtime,
         )
         return _json(data)
     except Exception as exc:
@@ -1412,7 +1448,7 @@ async def cc_workflow_run(params: WorkflowRunInput) -> str:
     """Run a workflow DAG. Use mock=true to validate controller behavior without model quota."""
     try:
         workflow_cwd = Path(params.cwd) if params.cwd else Path.cwd()
-        return _json(workflow_run(params.file, task=params.task, cwd=workflow_cwd, mock=params.mock, loop_guard=params.loop_guard))
+        return _json(workflow_run(params.file, task=params.task, cwd=workflow_cwd, mock=params.mock, loop_guard=params.loop_guard, allow_unsafe_runtime=params.allow_unsafe_runtime))
     except Exception as exc:
         return _error(exc)
 

@@ -637,6 +637,9 @@ class ProviderEnvironmentPolicyTests(unittest.TestCase):
             "ANTHROPIC_DEFAULT_OPUS_MODEL": "opus-test",
             "ANTHROPIC_DEFAULT_SONNET_MODEL": "sonnet-test",
             "ANTHROPIC_DEFAULT_HAIKU_MODEL": "haiku-test",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "opus-name-test",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": "sonnet-name-test",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME": "haiku-name-test",
             "ANTHROPIC_BASE_URL": "https://provider.example.test/v1",
             "HTTP_PROXY": "http://proxy.example.test",
             "HTTPS_PROXY": "https://proxy.example.test",
@@ -908,6 +911,35 @@ class RuntimeAuthorizationTests(unittest.TestCase):
             )
 
             self.assertEqual(first.trust_level, "trusted_default")
+            self.assertNotEqual(first.policy_decision_id, second.policy_decision_id)
+
+    def test_unsafe_decision_binds_the_complete_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            executable = Path(temp_dir) / "runtime.exe"
+            executable.write_text("fixture", encoding="utf-8")
+            identity = self.identity_chain(executable, 1)
+            candidate = self.candidate(executable, "local_configured")
+            first_policy = RuntimeSecurityPolicy(
+                unsafe_runtimes=(ApprovedUnsafeRuntime("local-fixture", identity),)
+            )
+            second_policy = RuntimeSecurityPolicy(
+                extra_provider_env_keys=("CUSTOM_PROVIDER_OPTION",),
+                unsafe_runtimes=(ApprovedUnsafeRuntime("local-fixture", identity),),
+            )
+
+            first = authorize_runtime(
+                candidate=candidate,
+                identity=identity,
+                policy=first_policy,
+                allow_unsafe_runtime=True,
+            )
+            second = authorize_runtime(
+                candidate=candidate,
+                identity=identity,
+                policy=second_policy,
+                allow_unsafe_runtime=True,
+            )
+
             self.assertNotEqual(first.policy_decision_id, second.policy_decision_id)
 
     def test_discovered_path_still_requires_both_unsafe_authorization_factors(self) -> None:

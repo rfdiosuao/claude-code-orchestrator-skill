@@ -30,6 +30,9 @@ _DEFAULT_PROVIDER_ENV_KEYS = frozenset(
         "ANTHROPIC_DEFAULT_OPUS_MODEL",
         "ANTHROPIC_DEFAULT_SONNET_MODEL",
         "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
         "ANTHROPIC_BASE_URL",
         "HTTP_PROXY",
         "HTTPS_PROXY",
@@ -1101,12 +1104,46 @@ def _identity_digests(identity: object) -> tuple[str, ...]:
     return tuple(digests)
 
 
+def _pinned_identity_frame(identity: PinnedExecutableIdentity) -> dict[str, Any]:
+    return {
+        "canonical_path": identity.canonical_path,
+        "sha256": identity.sha256,
+        "size": identity.size,
+        "file_id": identity.file_id,
+        "target_kind": identity.target_kind,
+        "interpreter_identity": (
+            None
+            if identity.interpreter_identity is None
+            else _pinned_identity_frame(identity.interpreter_identity)
+        ),
+    }
+
+
+def _policy_fingerprint(policy: RuntimeSecurityPolicy) -> str:
+    frame = {
+        "schema_version": POLICY_SCHEMA_VERSION,
+        "runtime_executable": policy.runtime_executable,
+        "extra_provider_env_keys": list(policy.extra_provider_env_keys),
+        "unsafe_runtimes": [
+            {
+                "runtime_id": approved.runtime_id,
+                "identity": _pinned_identity_frame(approved.identity),
+            }
+            for approved in policy.unsafe_runtimes
+        ],
+    }
+    return sha256(
+        json.dumps(frame, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def _decision_id(
     *,
     candidate: RuntimeExecutableCandidate,
     identity: object,
     policy_approval: bool,
     request_approval: bool,
+    policy_fingerprint: str,
 ) -> str:
     frame = {
         "canonical_path": str(Path(candidate.canonical_path).resolve(strict=False)),
@@ -1116,6 +1153,7 @@ def _decision_id(
         "schema_version": POLICY_SCHEMA_VERSION,
         "policy_approval": policy_approval,
         "request_approval": request_approval,
+        "policy_fingerprint": policy_fingerprint,
     }
     return sha256(
         json.dumps(frame, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -1161,6 +1199,7 @@ def authorize_runtime(
                 identity=identity,
                 policy_approval=True,
                 request_approval=allow_unsafe_runtime,
+                policy_fingerprint=_policy_fingerprint(policy),
             ),
         )
 
@@ -1195,5 +1234,6 @@ def authorize_runtime(
             identity=identity,
             policy_approval=True,
             request_approval=True,
+            policy_fingerprint=_policy_fingerprint(policy),
         ),
     )
