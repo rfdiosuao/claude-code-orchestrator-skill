@@ -13553,6 +13553,23 @@ class TaskSevenStopIdentityTests(GuardedLaunchFixture):
         exit_process.assert_called_with(127)
         prctl.assert_not_called()
 
+    @unittest.skipUnless(
+        orchestrator._HOST_IS_DARWIN,
+        "Darwin pre-launch artifact initialization contract",
+    )
+    def test_darwin_prelaunch_artifacts_initialize_before_containment(
+        self,
+    ) -> None:
+        for mode in ("one_shot", "streaming"):
+            with self.subTest(mode=mode):
+                prepared = self._prepare(mode)
+                run_dir, metadata = orchestrator._initialize_prepared_run(
+                    prepared
+                )
+
+                self.assertTrue(run_dir.is_dir())
+                self.assertEqual(metadata["run_id"], run_dir.name)
+
     def test_production_posix_launch_fails_before_any_runtime_process(self) -> None:
         for mode in ("one_shot", "streaming"):
             with self.subTest(mode=mode):
