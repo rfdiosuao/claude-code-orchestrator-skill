@@ -273,6 +273,17 @@ class GuardedLaunchFixture(unittest.TestCase):
             + "\n",
             encoding="utf-8",
         )
+        self.runtime_candidate = RuntimeExecutableCandidate(
+            canonical_path=str(self.fake_runtime.resolve()),
+            source="explicit_mock_stream_test_fixture",
+            trust_class="trusted_default",
+        )
+        fixture_token = orchestrator._TEST_ONLY_RUNTIME_CANDIDATE.set(
+            self.runtime_candidate
+        )
+        self.addCleanup(
+            orchestrator._TEST_ONLY_RUNTIME_CANDIDATE.reset, fixture_token
+        )
         self.provider = orchestrator.Provider(
             id="provider-fixture",
             name="Fixture Provider",
@@ -312,11 +323,7 @@ class GuardedLaunchFixture(unittest.TestCase):
             patch.object(
                 orchestrator,
                 "resolve_runtime_candidate",
-                return_value=RuntimeExecutableCandidate(
-                    canonical_path=str(self.fake_runtime.resolve()),
-                    source="fixture",
-                    trust_class="trusted_default",
-                ),
+                return_value=self.runtime_candidate,
                 create=True,
             ),
             patch.object(orchestrator, "enforce_cost_guard", side_effect=lambda _model, timeout: timeout),
@@ -4568,7 +4575,10 @@ class FifthReviewGitStateTests(FourthReviewScopeFixture):
         self.assertIsNotNone(git_bin)
         body = "\n".join(lines).replace("['git',", "[GIT,")
         self.fake_runtime.write_text(
-            "import pathlib, shutil, subprocess, sys\n"
+            "import os, pathlib, shutil, stat, subprocess, sys\n"
+            "def remove_readonly(operation, path, _details):\n"
+            "    os.chmod(path, stat.S_IWRITE)\n"
+            "    operation(path)\n"
             "sys.stdin.buffer.read()\n"
             + f"GIT = {git_bin!r}\n"
             + body
@@ -4640,7 +4650,9 @@ class FifthReviewGitStateTests(FourthReviewScopeFixture):
                 self._remove_git_tree(self.workspace / ".git-original")
                 self._initialize_committed_repo()
                 if operation == "disappear":
-                    lines = [f"shutil.rmtree({str(self.workspace / '.git')!r})"]
+                    lines = [
+                        f"shutil.rmtree({str(self.workspace / '.git')!r}, onerror=remove_readonly)"
+                    ]
                 else:
                     lines = [
                         f"pathlib.Path({str(self.workspace / '.git')!r}).rename({str(self.workspace / '.git-original')!r})",
@@ -9166,7 +9178,7 @@ class EleventhReviewCleanupOwnershipTests(TenthReviewFixture):
     ) -> None:
         run_dir = self.runs_dir / orchestrator.new_run_id()
         orchestrator._set_private_directory(run_dir)
-        deadline = time.monotonic() + 0.1
+        deadline = time.monotonic() + 1.0
         process = orchestrator._owned_process_popen(
             [sys.executable, "-c", "import threading; threading.Event().wait()"],
             ownership_deadline=deadline,
@@ -10068,7 +10080,9 @@ class TwelfthReviewLifecycleRegressionTests(TenthReviewFixture):
                     "o.resolve_route = lambda **_kwargs: {'profile': provider.id, 'permission_mode': 'plan', 'timeout_seconds': 8, 'task_type': 'code', 'model_override': None, 'reason': 'fixture'}",
                     "o.get_provider = lambda _profile: provider",
                     "o.load_runtime_security_policy = lambda: RuntimeSecurityPolicy.default()",
-                    f"o.resolve_runtime_candidate = lambda _policy: RuntimeExecutableCandidate(canonical_path={str(runtime)!r}, source='fixture', trust_class='trusted_default')",
+                    f"candidate = RuntimeExecutableCandidate(canonical_path={str(runtime)!r}, source='explicit_mock_stream_test_fixture', trust_class='trusted_default')",
+                    "o._TEST_ONLY_RUNTIME_CANDIDATE.set(candidate)",
+                    "o.resolve_runtime_candidate = lambda _policy: candidate",
                     "o.enforce_cost_guard = lambda _model, timeout: timeout",
                     "result = o.run_streaming_agent('detached controller probe', cwd=workspace, timeout_seconds=8)",
                     "print(json.dumps(result), flush=True)",
@@ -10264,6 +10278,108 @@ class TwelfthReviewLifecycleRegressionTests(TenthReviewFixture):
 
 @unittest.skipUnless(os.name == "nt", "Windows tenth-cycle publication regression")
 class TenthReviewWindowsPublicationTests(TenthReviewFixture):
+    def test_atomic_write_compares_only_native_windows_identity(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        target = run_dir / "native-identity.json"
+        real_fstat = orchestrator.os.fstat
+
+        def divergent_fstat(fd: int) -> object:
+            details = real_fstat(fd)
+            values = list(details)
+            values[1] = int(details.st_ino) ^ (1 << 80)
+            values[2] = int(details.st_dev) ^ (1 << 40)
+            return os.stat_result(values)
+
+        with patch.object(
+            orchestrator.os, "fstat", side_effect=divergent_fstat
+        ):
+            orchestrator._atomic_write_text(target, '{"state":"published"}')
+
+        self.assertEqual(target.read_text(encoding="utf-8"), '{"state":"published"}')
+
+    def test_native_identity_drift_blocks_before_atomic_publication(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        target = run_dir / "native-drift.json"
+        orchestrator._atomic_write_text(target, '{"state":"before"}')
+        real_identity = orchestrator._windows_file_handle_identity
+        drifted = False
+
+        def drift_once(handle: object, name: str) -> tuple[int, int]:
+            nonlocal drifted
+            identity = real_identity(handle, name)
+            if not drifted:
+                drifted = True
+                return identity[0], identity[1] ^ 1
+            return identity
+
+        with patch.object(
+            orchestrator, "_windows_file_handle_identity", side_effect=drift_once
+        ):
+            with self.assertRaisesRegex(
+                orchestrator.OrchestratorError,
+                "Managed artifact source handle changed",
+            ):
+                orchestrator._atomic_write_text(target, '{"state":"after"}')
+
+        self.assertTrue(drifted)
+        self.assertEqual(target.read_text(encoding="utf-8"), '{"state":"before"}')
+
+    def test_artifact_lock_candidate_rejects_native_identity_drift(self) -> None:
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        lock_path = run_dir / ".native-identity.lock"
+        candidate = orchestrator._prepare_private_atomic_write(
+            lock_path, b'{"owner":"fixture"}'
+        )
+        real_identity = orchestrator._windows_file_handle_identity
+
+        def drift(handle: object, name: str) -> tuple[int, int]:
+            identity = real_identity(handle, name)
+            return identity[0], identity[1] ^ 1
+
+        try:
+            with patch.object(
+                orchestrator, "_windows_file_handle_identity", side_effect=drift
+            ):
+                with self.assertRaisesRegex(
+                    orchestrator.OrchestratorError,
+                    "Artifact lock candidate identity changed",
+                ):
+                    orchestrator._publish_artifact_lock_candidate(
+                        candidate, lock_path
+                    )
+            self.assertFalse(lock_path.exists())
+        finally:
+            orchestrator._discard_prepared_atomic_write(candidate)
+
+    def test_windows_directory_accepts_equivalent_short_path_alias(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        run_dir = self.runs_dir / orchestrator.new_run_id()
+        orchestrator._set_private_directory(run_dir)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetShortPathNameW.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.LPWSTR,
+            wintypes.DWORD,
+        )
+        kernel32.GetShortPathNameW.restype = wintypes.DWORD
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = kernel32.GetShortPathNameW(str(run_dir), buffer, len(buffer))
+        if not length or length >= len(buffer):
+            self.skipTest("Windows short-path aliases are unavailable")
+        short_path = Path(buffer.value)
+        if os.path.normcase(str(short_path)) == os.path.normcase(str(run_dir)):
+            self.skipTest("Windows short-path alias is identical to the long path")
+
+        with orchestrator._open_windows_managed_directory(
+            short_path, verify_private=False
+        ) as (_handle, details):
+            self.assertTrue(os.path.samefile(details["final_path"], run_dir))
+
     def test_initial_source_fstat_failure_deletes_retained_source_not_successor(self) -> None:
         run_dir = self.runs_dir / orchestrator.new_run_id()
         orchestrator._set_private_directory(run_dir)
@@ -12694,6 +12810,7 @@ class TaskSevenStopIdentityTests(GuardedLaunchFixture):
             state="mismatch", differing_fields=("executable_path",)
         )
         with (
+            patch.object(orchestrator.sys, "platform", "win32"),
             patch.object(
                 orchestrator,
                 "single_run_status",
@@ -12735,6 +12852,7 @@ class TaskSevenStopIdentityTests(GuardedLaunchFixture):
             {"active": False, "status": "stopped", "exit_code": -15},
         ]
         with (
+            patch.object(orchestrator.sys, "platform", "win32"),
             patch.object(
                 orchestrator, "single_run_status", side_effect=statuses
             ),
@@ -12775,6 +12893,7 @@ class TaskSevenStopIdentityTests(GuardedLaunchFixture):
             {"active": False, "status": "stopped", "exit_code": -9},
         ]
         with (
+            patch.object(orchestrator.sys, "platform", "win32"),
             patch.object(
                 orchestrator, "single_run_status", side_effect=statuses
             ),
@@ -12811,6 +12930,7 @@ class TaskSevenStopIdentityTests(GuardedLaunchFixture):
             {"active": False, "status": "stopped", "exit_code": -15},
         ]
         with (
+            patch.object(orchestrator.sys, "platform", "win32"),
             patch.object(
                 orchestrator, "single_run_status", side_effect=statuses
             ),
@@ -12849,6 +12969,7 @@ class TaskSevenStopIdentityTests(GuardedLaunchFixture):
             }
         )
         with (
+            patch.object(orchestrator.sys, "platform", "win32"),
             patch.object(
                 orchestrator,
                 "single_run_status",
@@ -13115,16 +13236,20 @@ class TaskSevenStopIdentityTests(GuardedLaunchFixture):
         for mode in ("one_shot", "streaming"):
             with self.subTest(mode=mode):
                 prepared = self._prepare(mode)
-                with (
-                    patch.object(orchestrator.sys, "platform", "linux"),
-                    patch.object(
-                        orchestrator, "_start_one_shot_launch"
-                    ) as one_shot,
-                    patch.object(
-                        orchestrator, "_start_streaming_controller"
-                    ) as streaming,
-                ):
-                    result = orchestrator.start_prepared_worker_launch(prepared)
+                fixture_token = orchestrator._TEST_ONLY_RUNTIME_CANDIDATE.set(None)
+                try:
+                    with (
+                        patch.object(orchestrator.sys, "platform", "linux"),
+                        patch.object(
+                            orchestrator, "_start_one_shot_launch"
+                        ) as one_shot,
+                        patch.object(
+                            orchestrator, "_start_streaming_controller"
+                        ) as streaming,
+                    ):
+                        result = orchestrator.start_prepared_worker_launch(prepared)
+                finally:
+                    orchestrator._TEST_ONLY_RUNTIME_CANDIDATE.reset(fixture_token)
                 one_shot.assert_not_called()
                 streaming.assert_not_called()
                 self.assertFalse(result.get("ok", False), result)
@@ -13135,8 +13260,12 @@ class TaskSevenStopIdentityTests(GuardedLaunchFixture):
                 )
 
     def test_runtime_tree_support_names_only_kernel_enforced_mechanism(self) -> None:
-        with patch.object(orchestrator.sys, "platform", "linux"):
-            support = orchestrator.runtime_tree_containment_support()
+        fixture_token = orchestrator._TEST_ONLY_RUNTIME_CANDIDATE.set(None)
+        try:
+            with patch.object(orchestrator.sys, "platform", "linux"):
+                support = orchestrator.runtime_tree_containment_support()
+        finally:
+            orchestrator._TEST_ONLY_RUNTIME_CANDIDATE.reset(fixture_token)
         self.assertFalse(support["supported"])
         self.assertIsNone(support["mechanism"])
         self.assertNotIn("killpg", support["reason"].lower())
@@ -13433,6 +13562,21 @@ class TaskSevenStopIdentityTests(GuardedLaunchFixture):
                 json.loads(stdout.decode("utf-8"))
                 for stdout, _stderr in outputs
             ]
+            if sys.platform != "win32":
+                self.assertTrue(
+                    all(not result["ok"] for result in results), results
+                )
+                self.assertTrue(
+                    all(
+                        result["status"] == "identity_unverified"
+                        and "process_tree_containment"
+                        in result["differing_fields"]
+                        for result in results
+                    ),
+                    results,
+                )
+                self.assertIsNone(sleeper.poll())
+                return
             self.assertTrue(any(result["ok"] for result in results), results)
             self.assertTrue(
                 all(

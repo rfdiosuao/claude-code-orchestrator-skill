@@ -2079,8 +2079,8 @@ def _publish_artifact_lock_candidate(candidate: Path, lock_path: Path) -> None:
     ntdll.RtlNtStatusToDosError.argtypes = (ctypes.c_long,)
     ntdll.RtlNtStatusToDosError.restype = wintypes.ULONG
     source_handle = anchor[5]
-    current = os.fstat(source_handle.fileno())
-    if (int(current.st_dev), int(current.st_ino)) != anchor[6]:
+    os.fstat(source_handle.fileno())
+    if _windows_file_handle_identity(source_handle, candidate.name) != anchor[6]:
         raise OrchestratorError("Artifact lock candidate identity changed.")
     information = FileLinkInformation()
     information.ReplaceIfExists = 0
@@ -3522,9 +3522,11 @@ def _open_windows_managed_directory(
             final_path = "\\\\" + final_path[8:]
         elif final_path.startswith("\\\\?\\"):
             final_path = final_path[4:]
-        if os.path.normcase(os.path.abspath(final_path)) != os.path.normcase(
-            os.path.abspath(path)
-        ):
+        try:
+            same_directory = os.path.samefile(final_path, path)
+        except OSError:
+            same_directory = False
+        if not same_directory:
             raise OrchestratorError(
                 f"Managed artifact ancestor changed after directory open: {path.name}"
             )
@@ -4026,6 +4028,16 @@ def _windows_relative_handle_details(native_handle: Any, name: str) -> dict[str,
     }
 
 
+def _windows_file_handle_identity(handle: Any, name: str) -> tuple[int, int]:
+    import msvcrt
+
+    details = _windows_relative_handle_details(
+        msvcrt.get_osfhandle(handle.fileno()), name
+    )
+    file_id = details["file_id"]
+    return int(file_id[0]), int(file_id[1])
+
+
 @contextlib.contextmanager
 def _open_windows_relative_managed_directory(
     parent_handle: Any,
@@ -4325,12 +4337,7 @@ def _prepare_private_atomic_write(
                 handle,
                 (int(source_identity[0]), int(source_identity[1])),
             )
-            source_details = os.fstat(handle.fileno())
-            if (
-                int(source_details.st_dev),
-                int(source_details.st_ino),
-            ) != parent_anchor[6]:
-                raise OrchestratorError("Managed artifact source handle changed.")
+            os.fstat(handle.fileno())
         else:
             directory_fd = _open_posix_directory_fd(path.parent)
             temporary_path = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
@@ -4358,11 +4365,14 @@ def _prepare_private_atomic_write(
         handle.flush()
         os.fsync(handle.fileno())
         _check_deadline(deadline)
-        source_details = os.fstat(handle.fileno())
         expected_source = parent_anchor[5 if parent_anchor[0] == "posix" else 6]
-        if (int(source_details.st_dev), int(source_details.st_ino)) != expected_source:
-            raise OrchestratorError("Managed artifact source handle changed.")
         if parent_anchor[0] == "posix":
+            source_details = os.fstat(handle.fileno())
+            if (
+                int(source_details.st_dev),
+                int(source_details.st_ino),
+            ) != expected_source:
+                raise OrchestratorError("Managed artifact source handle changed.")
             _verify_private_path(temporary_path, is_dir=False)
             current_source = os.stat(
                 temporary_path.name,
@@ -4374,6 +4384,12 @@ def _prepare_private_atomic_write(
                     "Managed artifact source changed during atomic creation."
                 )
         else:
+            os.fstat(handle.fileno())
+            if (
+                _windows_file_handle_identity(handle, temporary_path.name)
+                != expected_source
+            ):
+                raise OrchestratorError("Managed artifact source handle changed.")
             import msvcrt
 
             native_source = msvcrt.get_osfhandle(handle.fileno())
@@ -4395,11 +4411,11 @@ def _prepare_private_atomic_write(
             if parent_anchor is not None and parent_anchor[0] == "windows":
                 try:
                     retained = parent_anchor[5]
-                    current = os.fstat(retained.fileno())
+                    os.fstat(retained.fileno())
                     if (
-                        int(current.st_dev),
-                        int(current.st_ino),
-                    ) == parent_anchor[6]:
+                        _windows_file_handle_identity(retained, temporary_path.name)
+                        == parent_anchor[6]
+                    ):
                         _windows_delete_retained_file(retained)
                 except FileNotFoundError:
                     pass
@@ -4472,8 +4488,11 @@ def _windows_replace_relative(
     if anchor is None or anchor[0] != "windows":
         raise OrchestratorError("Atomic artifact source handle is unavailable.")
     retained_handle = anchor[5]
-    retained_details = os.fstat(retained_handle.fileno())
-    if (int(retained_details.st_dev), int(retained_details.st_ino)) != anchor[6]:
+    os.fstat(retained_handle.fileno())
+    if (
+        _windows_file_handle_identity(retained_handle, temporary_path.name)
+        != anchor[6]
+    ):
         raise OrchestratorError("Atomic artifact source identity changed.")
     native_handle = msvcrt.get_osfhandle(retained_handle.fileno())
     if not _inspect_windows_private_acl_handle(
@@ -4735,8 +4754,11 @@ def _discard_prepared_atomic_write(temporary_path: Path | None) -> None:
         elif parent_anchor is not None:
             try:
                 retained = parent_anchor[5]
-                current = os.fstat(retained.fileno())
-                if (int(current.st_dev), int(current.st_ino)) == parent_anchor[6]:
+                os.fstat(retained.fileno())
+                if (
+                    _windows_file_handle_identity(retained, temporary_path.name)
+                    == parent_anchor[6]
+                ):
                     _windows_delete_retained_file(retained)
             except FileNotFoundError:
                 pass
@@ -5670,7 +5692,7 @@ def run_git_command(
         stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
-        errors="replace",
+        errors="surrogateescape" if os.name == "posix" else "replace",
     )
     try:
         stdout, stderr = process.communicate(timeout=timeout)
@@ -8552,14 +8574,18 @@ def _scrub_output_text(text: str, sensitive_values: tuple[str, ...]) -> str:
 def _scrub_guarded_value(value: Any, sensitive_values: tuple[str, ...]) -> Any:
     if isinstance(value, Mapping):
         return {
-            str(key): _scrub_guarded_value(item, sensitive_values)
+            _json_safe_text(str(key)): _scrub_guarded_value(item, sensitive_values)
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple)):
         return [_scrub_guarded_value(item, sensitive_values) for item in value]
     if isinstance(value, str):
-        return _scrub_exact_text(value, sensitive_values)
+        return _json_safe_text(_scrub_exact_text(value, sensitive_values))
     return value
+
+
+def _json_safe_text(value: str) -> str:
+    return value.encode("utf-8", errors="backslashreplace").decode("utf-8")
 
 
 def _scrub_untrusted_runtime_value(
@@ -8568,7 +8594,9 @@ def _scrub_untrusted_runtime_value(
     if isinstance(value, Mapping):
         scrubbed: dict[str, Any] = {}
         for key, item in value.items():
-            base_key = _scrub_exact_text(str(key), sensitive_values)
+            base_key = _json_safe_text(
+                _scrub_exact_text(str(key), sensitive_values)
+            )
             safe_key = base_key
             suffix = 2
             while safe_key in scrubbed:
@@ -8584,7 +8612,7 @@ def _scrub_untrusted_runtime_value(
             for item in value
         ]
     if isinstance(value, str):
-        return _scrub_exact_text(value, sensitive_values)
+        return _json_safe_text(_scrub_exact_text(value, sensitive_values))
     return value
 
 
@@ -8593,9 +8621,9 @@ def _scrub_data_keyed_mapping(
 ) -> dict[str, Any]:
     """Scrub mappings whose keys are user data, such as Git path indexes."""
     return {
-        _scrub_exact_text(str(key), sensitive_values): _scrub_guarded_value(
-            item, sensitive_values
-        )
+        _json_safe_text(
+            _scrub_exact_text(str(key), sensitive_values)
+        ): _scrub_guarded_value(item, sensitive_values)
         for key, item in value.items()
     }
 
@@ -9386,11 +9414,15 @@ def capture_git_snapshot(
         raw_diff = processes["diff"].stdout or processes["diff"].stderr or ""
         raw_staged_diff = processes["staged_diff"].stdout or processes["staged_diff"].stderr or ""
         raw_status = processes["status"].stdout or processes["status"].stderr or ""
-        safe_diff = _scrub_exact_text(str(redact(raw_diff)), sensitive_values)
-        safe_staged_diff = _scrub_exact_text(
-            str(redact(raw_staged_diff)), sensitive_values
+        safe_diff = _json_safe_text(
+            _scrub_exact_text(str(redact(raw_diff)), sensitive_values)
         )
-        safe_status = _scrub_exact_text(str(redact(raw_status)), sensitive_values)
+        safe_staged_diff = _json_safe_text(
+            _scrub_exact_text(str(redact(raw_staged_diff)), sensitive_values)
+        )
+        safe_status = _json_safe_text(
+            _scrub_exact_text(str(redact(raw_status)), sensitive_values)
+        )
         safe_items = _scrub_guarded_value(status_items, sensitive_values)
         safe_untracked = _scrub_guarded_value(untracked_paths, sensitive_values)
         safe_hashes = _scrub_data_keyed_mapping(hashes, sensitive_values)
