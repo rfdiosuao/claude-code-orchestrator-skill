@@ -13678,10 +13678,9 @@ class TaskSevenStopIdentityTests(GuardedLaunchFixture):
                     None
                 )
                 try:
-                    with patch.object(orchestrator.sys, "platform", "linux"):
-                        run_dir, metadata = orchestrator._initialize_prepared_run(
-                            prepared
-                        )
+                    run_dir, metadata = orchestrator._initialize_prepared_run(
+                        prepared
+                    )
                 finally:
                     orchestrator._TEST_ONLY_RUNTIME_CANDIDATE.reset(
                         fixture_token

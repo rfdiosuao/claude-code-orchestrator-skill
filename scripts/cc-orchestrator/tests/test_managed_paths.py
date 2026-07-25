@@ -68,7 +68,7 @@ class RepairMcpPathsTests(unittest.TestCase):
         )
         target = self.root / ".mcp.json"
         self.assertTrue(result["applied"])
-        self.assertEqual(Path(result["path"]), target)
+        self.assertTrue(os.path.samefile(Path(result["path"]), target))
         payload = json.loads(target.read_text(encoding="utf-8"))
         env = payload["claude-code-orchestrator"]["env"]
         self.assertEqual(env["CC_ORCHESTRATOR_WORKSPACE_ROOT"], str(self.root))

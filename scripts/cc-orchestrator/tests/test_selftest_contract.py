@@ -93,23 +93,16 @@ class SelftestCliContractTests(unittest.TestCase):
         )
         open_alias.assert_not_called()
 
-    @unittest.skipUnless(os.name == "posix", "Darwin path aliases are POSIX-only")
+    @unittest.skipUnless(
+        orchestrator._HOST_IS_DARWIN, "Darwin path aliases require macOS"
+    )
     def test_security_audit_identity_is_stable_across_darwin_aliases(self) -> None:
-        with patch.object(
-            orchestrator, "_HOST_IS_DARWIN", True
-        ), patch.object(
-            orchestrator, "_open_posix_directory_fd", return_value=123
-        ), patch.object(
-            orchestrator,
-            "_darwin_volume_is_case_sensitive",
-            return_value=False,
-        ), patch.object(orchestrator.os, "close"):
-            aliased = orchestrator._security_audit_paths(
-                Path("/var/folders/fixture/artifacts")
-            )
-            canonical = orchestrator._security_audit_paths(
-                Path("/private/var/folders/fixture/artifacts")
-            )
+        aliased = orchestrator._security_audit_paths(
+            Path("/var/folders/fixture/artifacts")
+        )
+        canonical = orchestrator._security_audit_paths(
+            Path("/private/var/folders/fixture/artifacts")
+        )
 
         self.assertEqual(aliased["root"], canonical["root"])
         self.assertEqual(aliased["bootstrap_failures"], canonical["bootstrap_failures"])
@@ -118,25 +111,27 @@ class SelftestCliContractTests(unittest.TestCase):
     def test_security_audit_identity_preserves_raw_tail_components(
         self,
     ) -> None:
-        with patch.object(orchestrator, "_HOST_IS_DARWIN", True):
-            upper = Path("/private/var/Project/Artifacts")
-            lower = Path("/private/var/project/artifacts")
-            self.assertNotEqual(
-                orchestrator._security_audit_root_identity(upper),
-                orchestrator._security_audit_root_identity(lower),
-            )
+        with tempfile.TemporaryDirectory(prefix="darwin-audit-tail-") as temp:
+            with patch.object(orchestrator, "_HOST_IS_DARWIN", True):
+                upper = Path(temp) / "Project" / "Artifacts"
+                lower = Path(temp) / "project" / "artifacts"
+                self.assertNotEqual(
+                    orchestrator._security_audit_root_identity(upper),
+                    orchestrator._security_audit_root_identity(lower),
+                )
 
     @unittest.skipUnless(os.name == "posix", "Darwin audit identity contract")
     def test_security_audit_identity_uses_length_delimited_tail(
         self,
     ) -> None:
-        with patch.object(orchestrator, "_HOST_IS_DARWIN", True):
-            upper = Path("/private/var/project/ab/c")
-            lower = Path("/private/var/project/a/bc")
-            self.assertNotEqual(
-                orchestrator._security_audit_root_identity(upper),
-                orchestrator._security_audit_root_identity(lower),
-            )
+        with tempfile.TemporaryDirectory(prefix="darwin-audit-tail-") as temp:
+            with patch.object(orchestrator, "_HOST_IS_DARWIN", True):
+                upper = Path(temp) / "project" / "ab" / "c"
+                lower = Path(temp) / "project" / "a" / "bc"
+                self.assertNotEqual(
+                    orchestrator._security_audit_root_identity(upper),
+                    orchestrator._security_audit_root_identity(lower),
+                )
 
     @unittest.skipUnless(
         orchestrator._HOST_IS_DARWIN, "Darwin volume capability contract"
