@@ -105,12 +105,47 @@ class InstallerPreservationTests(unittest.TestCase):
             before_override = digest(override_payload)
             before_audit = digest(audit_payload)
 
-            source_canary_root = Path(
-                tempfile.mkdtemp(prefix=".cco-audit-key-canary-", dir=REPO_ROOT)
+            release_root = root / "release"
+            shutil.copytree(
+                REPO_ROOT,
+                release_root,
+                ignore=shutil.ignore_patterns(
+                    ".git",
+                    ".agent-workspace",
+                    "node_modules",
+                    "__pycache__",
+                    "*.pyc",
+                ),
             )
+            source_canary_root = release_root / ".cco-audit-key-canary"
             source_canary = source_canary_root / "custom-artifacts" / AUDIT_KEY_NAME
             source_canary.parent.mkdir(parents=True)
             source_canary.write_bytes(audit_payload)
+            manifest_tool = release_root / "scripts" / "release_manifest.py"
+            private_key = (
+                release_root
+                / "scripts"
+                / "cc-orchestrator"
+                / "tests"
+                / "fixtures"
+                / "release_test_private.json"
+            )
+            public_key = private_key.with_name("release_test_public.json")
+            subprocess.run(
+                [sys.executable, str(manifest_tool), "create", str(release_root)],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(manifest_tool),
+                    "sign",
+                    str(release_root / "release-manifest.json"),
+                    "--private-key",
+                    str(private_key),
+                ],
+                check=True,
+            )
 
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
@@ -125,9 +160,11 @@ class InstallerPreservationTests(unittest.TestCase):
                     "-ExecutionPolicy",
                     "Bypass",
                     "-File",
-                    str(REPO_ROOT / "install" / "install.ps1"),
+                    str(release_root / "install" / "install.ps1"),
                     "-CodexHome",
                     str(codex_home),
+                    "-TrustedPublicKey",
+                    str(public_key),
                 ]
             else:
                 bash = shutil.which("bash")
@@ -135,7 +172,11 @@ class InstallerPreservationTests(unittest.TestCase):
                 if bash is None or rsync is None:
                     self.fail("bash and rsync are required by the POSIX installer test")
                 env["CODEX_HOME"] = str(codex_home)
-                command = [bash, str(REPO_ROOT / "install" / "install.sh")]
+                command = [
+                    bash,
+                    str(release_root / "install" / "install.sh"),
+                    str(public_key),
+                ]
 
             try:
                 completed = subprocess.run(

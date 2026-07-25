@@ -119,6 +119,7 @@ from process_identity import (
     open_stable_process_capability,
     process_identity_support,
 )
+from managed_paths import ManagedPathError, managed_mcp_path, read_managed_text
 from runtime_security import (
     MAX_SECURITY_AUDIT_EVENT_BYTES,
     SECURITY_AUDIT_POLICY,
@@ -1578,14 +1579,28 @@ def repair_mcp_paths(
     create: bool = False,
 ) -> dict[str, Any]:
     paths = workspace_paths(cwd)
-    if mcp_path:
-        raw_path = Path(mcp_path).expanduser()
-        path = raw_path.resolve() if raw_path.is_absolute() else (paths["workspace_root"] / raw_path).resolve()
-    else:
-        path = paths["workspace_root"] / ".mcp.json"
+    try:
+        path = managed_mcp_path(
+            paths["workspace_root"], paths["artifact_root"], mcp_path
+        )
+    except ManagedPathError as exc:
+        raise OrchestratorError(str(exc)) from exc
+
+    def validate_target() -> Path:
+        try:
+            return managed_mcp_path(
+                paths["workspace_root"], paths["artifact_root"], mcp_path
+            )
+        except ManagedPathError as exc:
+            raise OrchestratorError(str(exc)) from exc
+
     before: dict[str, Any] | None = None
     if path.exists():
-        before = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            source_text = read_managed_text(path, validate=validate_target)
+        except ManagedPathError as exc:
+            raise OrchestratorError(str(exc)) from exc
+        before = json.loads(source_text)
         data = json.loads(json.dumps(before))
     elif create:
         data = {}
@@ -1608,11 +1623,17 @@ def repair_mcp_paths(
     changed = before != after
     backup_path: Path | None = None
     if apply and changed:
-        path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
-            backup_path = path.with_name(f"{path.name}.backup.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}")
-            backup_path.write_text(path.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
-        path.write_text(json.dumps(after, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            backup_path = path.with_name(
+                f"{path.name}.backup."
+                f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}."
+                f"{uuid.uuid4().hex}"
+            )
+            _atomic_write_text(backup_path, source_text)
+        validate_target()
+        _atomic_write_text(
+            path, json.dumps(after, ensure_ascii=False, indent=2) + "\n"
+        )
     return {
         "ok": True,
         "applied": apply and changed,
@@ -5140,25 +5161,52 @@ def _security_audit_paths(artifact_root: str | Path) -> dict[str, Path]:
 
 
 def _security_audit_root_identity(artifact_root: str | Path) -> str:
-    identity = str(Path(artifact_root))
-    if _HOST_IS_DARWIN:
-        if not _darwin_volume_is_case_sensitive(Path(artifact_root)):
-            identity = unicodedata.normalize("NFC", identity).casefold()
-        return identity
-    return os.path.normcase(identity)
+    root = Path(os.path.abspath(Path(artifact_root).expanduser()))
+    if not _HOST_IS_DARWIN:
+        return os.path.normcase(str(root))
+    fd, tail = _open_nearest_posix_directory_fd_with_tail(root)
+    try:
+        details = os.fstat(fd)
+        if not stat.S_ISDIR(details.st_mode):
+            raise OrchestratorError(
+                "Security audit identity anchor is not a directory."
+            )
+        encoded_tail = "".join(
+            f"{len(raw)}:{raw.hex()}"
+            for raw in (
+                os.fsencode(component)
+                for component in tail
+            )
+        )
+        return (
+            "darwin-fs-v2:"
+            f"{int(details.st_dev)}:{int(details.st_ino)}:"
+            f"{encoded_tail}"
+        )
+    finally:
+        os.close(fd)
 
 
-def _open_nearest_posix_directory_fd(path: Path) -> int:
+def _open_nearest_posix_directory_fd_with_tail(
+    path: Path,
+) -> tuple[int, tuple[str, ...]]:
     candidate = Path(os.path.abspath(path))
     anchor = Path(candidate.anchor)
+    tail: list[str] = []
     while candidate != anchor:
         try:
-            return _open_posix_directory_fd(candidate)
+            return _open_posix_directory_fd(candidate), tuple(tail)
         except FileNotFoundError:
+            tail.insert(0, candidate.name)
             candidate = candidate.parent
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    return os.open(str(anchor), flags)
+    return os.open(str(anchor), flags), tuple(tail)
+
+
+def _open_nearest_posix_directory_fd(path: Path) -> int:
+    fd, _tail = _open_nearest_posix_directory_fd_with_tail(path)
+    return fd
 
 
 def _darwin_volume_is_case_sensitive(path: Path) -> bool:
@@ -5386,20 +5434,56 @@ def _static_private_file_lock(path: Path) -> Any:
 
 
 def _prepare_security_audit_directories(paths: Mapping[str, Path]) -> None:
-    _prepare_security_audit_bootstrap_directories(paths)
     root = paths["root"]
+    root_already_existed = root.exists()
+    if root_already_existed:
+        _verify_security_audit_bootstrap_scope(paths)
     _set_private_directory(root)
+    if root_already_existed:
+        _verify_security_audit_bootstrap_scope(paths)
+    else:
+        _refresh_security_audit_bootstrap_scope(paths)
+    _prepare_security_audit_bootstrap_directories(paths)
     _ensure_strict_private_directory(paths["config"])
     _ensure_strict_private_directory(paths["logs"])
     _ensure_strict_private_directory(paths["failures"])
+    _verify_security_audit_bootstrap_scope(paths)
+
+
+def _refresh_security_audit_bootstrap_scope(
+    paths: Mapping[str, Path],
+) -> None:
+    expected = _security_audit_paths(paths["root"])
+    if not isinstance(paths, dict):
+        if paths["bootstrap_failures"] != expected["bootstrap_failures"]:
+            raise OrchestratorError(
+                "Security audit filesystem identity changed."
+            )
+        return
+    paths["bootstrap_root"] = expected["bootstrap_root"]
+    paths["bootstrap_failures"] = expected["bootstrap_failures"]
+
+
+def _verify_security_audit_bootstrap_scope(
+    paths: Mapping[str, Path],
+) -> None:
+    expected = _security_audit_paths(paths["root"])
+    if paths["bootstrap_root"] != expected["bootstrap_root"] or (
+        paths["bootstrap_failures"] != expected["bootstrap_failures"]
+    ):
+        raise OrchestratorError(
+            "Security audit filesystem identity changed."
+        )
 
 
 def _prepare_security_audit_bootstrap_directories(
     paths: Mapping[str, Path]
 ) -> None:
+    _verify_security_audit_bootstrap_scope(paths)
     _set_private_directory(paths["bootstrap_failures"])
     _verify_strict_private_directory(paths["bootstrap_root"])
     _verify_strict_private_directory(paths["bootstrap_failures"])
+    _verify_security_audit_bootstrap_scope(paths)
 
 
 def _load_or_create_security_audit_key(
@@ -5729,10 +5813,15 @@ def _security_audit_failure_marker_paths(
     paths: Mapping[str, Path]
 ) -> tuple[Path, ...]:
     markers: list[Path] = []
-    for failure_dir in (
+    failure_dirs = [
         paths["bootstrap_failures"],
         paths["failures"],
-    ):
+    ]
+    if _HOST_IS_DARWIN:
+        failure_dirs[1:1] = _legacy_security_audit_bootstrap_scopes(
+            paths["root"], paths["bootstrap_root"]
+        )
+    for failure_dir in failure_dirs:
         if not failure_dir.exists():
             continue
         _verify_strict_private_directory(failure_dir)
@@ -5746,6 +5835,19 @@ def _security_audit_failure_marker_paths(
                 )
             markers.append(marker)
     return tuple(sorted(markers, key=lambda item: (item.name, str(item.parent))))
+
+
+def _legacy_security_audit_bootstrap_scopes(
+    root: Path, bootstrap_root: Path
+) -> list[Path]:
+    identity = str(root)
+    if not _darwin_volume_is_case_sensitive(root):
+        identity = unicodedata.normalize("NFC", identity).casefold()
+    return [
+        bootstrap_root / hashlib.sha256(
+            identity.encode("utf-8", errors="surrogatepass")
+        ).hexdigest()
+    ]
 
 
 def _read_persisted_security_audit_failures(

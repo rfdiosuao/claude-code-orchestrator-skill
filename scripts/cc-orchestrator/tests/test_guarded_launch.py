@@ -2252,6 +2252,117 @@ class SecondReviewScrubAndScannerTests(GuardedLaunchFixture):
         )
 
 
+class DarwinSecurityAuditIdentityTests(GuardedLaunchFixture):
+    @staticmethod
+    def _directory_stat(device: int, inode: int) -> object:
+        return type(
+            "DirectoryStat",
+            (),
+            {
+                "st_mode": stat.S_IFDIR | 0o700,
+                "st_dev": device,
+                "st_ino": inode,
+            },
+        )()
+
+    def _identity(
+        self,
+        *,
+        device: int,
+        inode: int,
+        tail: tuple[str, ...],
+    ) -> str:
+        with patch.object(orchestrator, "_HOST_IS_DARWIN", True), patch.object(
+            orchestrator,
+            "_open_nearest_posix_directory_fd_with_tail",
+            return_value=(917, tail),
+        ), patch.object(
+            orchestrator.os,
+            "fstat",
+            return_value=self._directory_stat(device, inode),
+        ), patch.object(orchestrator.os, "close") as closed, patch.object(
+            orchestrator,
+            "_darwin_volume_is_case_sensitive",
+        ) as volume_query:
+            identity = orchestrator._security_audit_root_identity(
+                Path("/audit/root")
+            )
+        closed.assert_called_once_with(917)
+        volume_query.assert_not_called()
+        return identity
+
+    def test_root_scope_uses_filesystem_identity_without_casefold_emulation(
+        self,
+    ) -> None:
+        first = self._identity(device=11, inode=29, tail=("Audit",))
+        moved = self._identity(device=12, inode=29, tail=("Audit",))
+        replaced = self._identity(device=11, inode=30, tail=("Audit",))
+
+        self.assertNotEqual(first, moved)
+        self.assertNotEqual(first, replaced)
+        self.assertIn("5:4175646974", first)
+
+    def test_root_scope_tail_components_are_length_delimited(self) -> None:
+        split_after_two = self._identity(
+            device=11, inode=29, tail=("ab", "c")
+        )
+        split_after_one = self._identity(
+            device=11, inode=29, tail=("a", "bc")
+        )
+
+        self.assertNotEqual(split_after_two, split_after_one)
+
+    def test_bootstrap_scope_fails_closed_when_mount_identity_changes(
+        self,
+    ) -> None:
+        root = Path("/audit/root")
+        bootstrap_root = root.parent / ".runtime-security-audit-bootstrap"
+        paths = {
+            "root": root,
+            "bootstrap_root": bootstrap_root,
+            "bootstrap_failures": bootstrap_root / ("1" * 64),
+        }
+        changed = {
+            **paths,
+            "bootstrap_failures": bootstrap_root / ("2" * 64),
+        }
+
+        with patch.object(
+            orchestrator, "_security_audit_paths", return_value=changed
+        ), self.assertRaisesRegex(
+            orchestrator.OrchestratorError, "filesystem identity changed"
+        ):
+            orchestrator._verify_security_audit_bootstrap_scope(paths)
+
+    def test_legacy_hash_scopes_are_read_only_compatibility_candidates(
+        self,
+    ) -> None:
+        root = Path("/Volumes/CaseMix/Audit")
+        bootstrap_root = root.parent / ".runtime-security-audit-bootstrap"
+        with patch.object(
+            orchestrator, "_HOST_IS_DARWIN", True
+        ), patch.object(
+            orchestrator,
+            "_darwin_volume_is_case_sensitive",
+            return_value=False,
+        ):
+            candidates = (
+                orchestrator._legacy_security_audit_bootstrap_scopes(
+                    root, bootstrap_root
+                )
+            )
+
+        folded_hash = hashlib.sha256(
+            str(root).casefold().encode(
+                "utf-8", errors="surrogatepass"
+            )
+        ).hexdigest()
+        self.assertEqual(
+            {item.name for item in candidates},
+            {folded_hash},
+        )
+
+
 class SecurityAuditWriterTests(GuardedLaunchFixture):
     def _append(self, **overrides: object) -> Path:
         values: dict[str, object] = {
@@ -13563,9 +13674,18 @@ class TaskSevenStopIdentityTests(GuardedLaunchFixture):
         for mode in ("one_shot", "streaming"):
             with self.subTest(mode=mode):
                 prepared = self._prepare(mode)
-                run_dir, metadata = orchestrator._initialize_prepared_run(
-                    prepared
+                fixture_token = orchestrator._TEST_ONLY_RUNTIME_CANDIDATE.set(
+                    None
                 )
+                try:
+                    with patch.object(orchestrator.sys, "platform", "linux"):
+                        run_dir, metadata = orchestrator._initialize_prepared_run(
+                            prepared
+                        )
+                finally:
+                    orchestrator._TEST_ONLY_RUNTIME_CANDIDATE.reset(
+                        fixture_token
+                    )
 
                 self.assertTrue(run_dir.is_dir())
                 self.assertEqual(metadata["run_id"], run_dir.name)

@@ -468,7 +468,7 @@ class RepairMcpPathsInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     cwd: Optional[str] = None
-    mcp_path: Optional[str] = Field(default=None, description="Optional .mcp.json path. Relative paths resolve under cwd.")
+    mcp_path: Optional[str] = Field(default=None, description="Optional literal .mcp.json name. Absolute, nested, and parent-relative paths are rejected.")
     create: bool = Field(default=False, description="Create .mcp.json if it does not exist.")
     apply: bool = Field(default=False, description="Write changes. Defaults to dry-run.")
 

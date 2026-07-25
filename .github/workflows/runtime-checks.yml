@@ -6,9 +6,11 @@ on:
       - main
     paths:
       - scripts/cc-orchestrator/**
+      - scripts/release_manifest.py
       - install/**
       - examples/workflows/**
       - docs/superpowers/**
+      - docs/release-integrity.md
       - docs-site/**
       - README.md
       - README.zh-CN.md
@@ -22,9 +24,11 @@ on:
   pull_request:
     paths:
       - scripts/cc-orchestrator/**
+      - scripts/release_manifest.py
       - install/**
       - examples/workflows/**
       - docs/superpowers/**
+      - docs/release-integrity.md
       - docs-site/**
       - README.md
       - README.zh-CN.md
@@ -191,6 +195,31 @@ jobs:
           assert root["released_at"] == "2026-07-18"
           assert any("guarded runtime" in note.lower() for note in root["notes"])
           assert root["version"] == package["version"] == lock["version"] == lock["packages"][""]["version"]
+
+      - name: Test authenticated release manifest gate
+        run: >-
+          python -m unittest discover
+          -s scripts/cc-orchestrator/tests
+          -p test_release_manifest.py
+          -v
+
+      - name: Exercise signed release artifact verification
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-payload"
+          printf 'release gate\n' > "$RUNNER_TEMP/release-payload/payload.txt"
+          python scripts/release_manifest.py create "$RUNNER_TEMP/release-payload"
+          python scripts/release_manifest.py sign \
+            "$RUNNER_TEMP/release-payload/release-manifest.json" \
+            --private-key scripts/cc-orchestrator/tests/fixtures/release_test_private.json
+          python scripts/release_manifest.py verify "$RUNNER_TEMP/release-payload" \
+            --public-key scripts/cc-orchestrator/tests/fixtures/release_test_public.json
+          printf 'tampered\n' >> "$RUNNER_TEMP/release-payload/payload.txt"
+          if python scripts/release_manifest.py verify "$RUNNER_TEMP/release-payload" \
+            --public-key scripts/cc-orchestrator/tests/fixtures/release_test_public.json; then
+            echo "tampered release unexpectedly verified" >&2
+            exit 1
+          fi
 
       - name: Scan tracked files for secrets
         shell: python

@@ -115,35 +115,24 @@ class SelftestCliContractTests(unittest.TestCase):
         self.assertEqual(aliased["bootstrap_failures"], canonical["bootstrap_failures"])
 
     @unittest.skipUnless(os.name == "posix", "Darwin audit identity contract")
-    def test_security_audit_identity_folds_tail_case_on_insensitive_volume(
+    def test_security_audit_identity_preserves_raw_tail_components(
         self,
     ) -> None:
-        with patch.object(
-            orchestrator, "_HOST_IS_DARWIN", True
-        ), patch.object(
-            orchestrator,
-            "_darwin_volume_is_case_sensitive",
-            return_value=False,
-        ):
+        with patch.object(orchestrator, "_HOST_IS_DARWIN", True):
             upper = Path("/private/var/Project/Artifacts")
             lower = Path("/private/var/project/artifacts")
-            self.assertEqual(
+            self.assertNotEqual(
                 orchestrator._security_audit_root_identity(upper),
                 orchestrator._security_audit_root_identity(lower),
             )
 
-    def test_security_audit_identity_keeps_tail_case_on_sensitive_volume(
+    @unittest.skipUnless(os.name == "posix", "Darwin audit identity contract")
+    def test_security_audit_identity_uses_length_delimited_tail(
         self,
     ) -> None:
-        with patch.object(
-            orchestrator, "_HOST_IS_DARWIN", True
-        ), patch.object(
-            orchestrator,
-            "_darwin_volume_is_case_sensitive",
-            return_value=True,
-        ):
-            upper = Path("/private/var/Project/Artifacts")
-            lower = Path("/private/var/project/artifacts")
+        with patch.object(orchestrator, "_HOST_IS_DARWIN", True):
+            upper = Path("/private/var/project/ab/c")
+            lower = Path("/private/var/project/a/bc")
             self.assertNotEqual(
                 orchestrator._security_audit_root_identity(upper),
                 orchestrator._security_audit_root_identity(lower),
