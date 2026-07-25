@@ -2,6 +2,16 @@
 
 This page tracks the public docs-facing history of Claude Code Orchestrator Skill.
 
+## v0.8.0 - Guarded runtime launch
+
+- Added provider-environment isolation and immutable, secret-free runtime launch contracts.
+- Custom runtimes now require both a complete recursive identity pin and explicit approval for each request.
+- Added process-identity-safe containment and stop behavior across foreground, streaming, visible, queue, team, and workflow surfaces.
+- Moved immediate prompts to guarded stdin and queued payloads to protected storage with single-use unsafe grants.
+- Added allowlisted hash-chained security events, authenticated checkpoints, failure markers, and bounded audit capacity.
+- Production guarded worker execution is currently Windows-only in v0.8.0; macOS and Linux fail closed until a kernel-enforced whole-tree containment backend is available.
+- Windows CI runs the complete test suite on Python 3.10 and 3.12. Ubuntu and macOS run a dedicated POSIX release contract that verifies process identity, runtime policy, protected storage, installer behavior, and the production fail-closed boundary; Linux also checks byte-exact non-UTF-8 Git paths.
+
 ## v0.7.1 - Manual retry invalidates workflow success
 
 - Fixed GitHub issue #24.

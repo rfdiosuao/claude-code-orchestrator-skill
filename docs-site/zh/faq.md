@@ -62,7 +62,7 @@ python "$CC_ORCHESTRATOR_HOME/cc_orchestrator.py" last-run
 .agent-workspace/claude-code-orchestrator/runs/<run_id>/
 ```
 
-每次 run 可以包含 `metadata.json`、`prompt.txt`、`stdout.txt`、`stderr.txt`。
+每次 run 可以包含 `metadata.json`、`stdout.txt`、`stderr.txt` 和总控产物。即时 prompt/context 通过 stdin 传输，不会再持久化成 `prompt.txt`。
 
 ## 怎么让 Agent 文件更整齐？
 

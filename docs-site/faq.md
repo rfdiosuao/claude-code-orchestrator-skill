@@ -62,7 +62,7 @@ Under:
 .agent-workspace/claude-code-orchestrator/runs/<run_id>/
 ```
 
-Each run can include `metadata.json`, `prompt.txt`, `stdout.txt`, and `stderr.txt`.
+Each run can include `metadata.json`, `stdout.txt`, `stderr.txt`, and guarded controller artifacts. Immediate prompt/context text is delivered over stdin and is not persisted as `prompt.txt`.
 
 ## How do I keep agent files tidy?
 

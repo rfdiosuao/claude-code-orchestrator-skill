@@ -2,6 +2,16 @@
 
 这里记录 Claude Code Orchestrator Skill 的主要版本变化。
 
+## v0.8.0 - Guarded runtime launch
+
+- 新增 provider 环境隔离和不可变、无密钥的 runtime 启动合约。
+- 自定义 runtime 必须同时具备完整递归 identity pin 和每次请求的显式批准。
+- foreground、streaming、visible、queue、team、workflow 全链路使用进程身份安全的 containment 和停止逻辑。
+- 即时 prompt 改走受控 stdin；队列正文进入受保护存储，unsafe grant 只能消费一次。
+- 新增字段白名单、hash chain、认证 checkpoint、失败标记和容量上限的安全审计。
+- v0.8.0 的生产级 guarded worker 执行目前仅支持 Windows；macOS 和 Linux 在具备内核强制的整棵进程树 containment 后端之前会 fail closed。
+- Windows CI 在 Python 3.10/3.12 上运行完整测试集；Ubuntu 和 macOS 运行专门的 POSIX 发布契约，验证进程身份、runtime 策略、受保护存储、安装行为和生产 fail-closed 边界，Linux 还检查非 UTF-8 Git 路径的字节级精确性。
+
 ## v0.7.1 - 手动 retry 会取消 workflow 成功状态
 
 - 修复 GitHub issue #24。

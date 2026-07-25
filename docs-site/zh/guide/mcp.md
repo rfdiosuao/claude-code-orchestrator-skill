@@ -58,6 +58,7 @@ docs/mcp.codex.example.toml
 | `cc_dashboard` | 生成本地 HTML 看板 |
 | `cc_controller_report` | 导出总控验收和压测证据报告 |
 | `cc_pressure_report` | `cc_controller_report` 的压测报告别名 |
+| `cc_mock_stream_test` | 可选的本机诊断工具，默认不注册 |
 | `cc_decision_review` | 审查 Codex 总控决策，返回 approve/revise/block |
 | `cc_workflow_validate` | 校验 YAML/JSON 工作流 DAG |
 | `cc_workflow_dry_run` | 不启动 worker，只看拓扑批次 |
@@ -80,6 +81,10 @@ worker 默认使用计划模式。
 只有 Codex 已经判断需要改文件，并且写入范围清楚时，才传 `allow_write=true`。
 
 工具输出和保存日志会做密钥脱敏，但 prompt 里也不要主动要求打印原始密钥。
+
+受支持的 MCP 部署仅限本机、同一用户的 `stdio`。`cc_mock_stream_test` 是使用内部 fake runtime 的诊断入口；不得通过 SSE/HTTP 或代理对外暴露，任何可远程访问的工具白名单都必须排除它。
+
+MCP server 默认不会注册 `cc_mock_stream_test`。仅在临时本机诊断会话中，可为该 server 进程设置 `CC_ORCHESTRATOR_ENABLE_LOCAL_DIAGNOSTICS=1` 并重启；测试结束后应立即移除该变量。
 
 ## 冒烟测试
 

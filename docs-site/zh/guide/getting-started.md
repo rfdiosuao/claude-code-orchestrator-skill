@@ -16,7 +16,7 @@ Windows PowerShell：
 
 ```powershell
 $tmp = Join-Path $env:TEMP "claude-code-orchestrator-skill.zip"; `
-iwr -UseBasicParsing "https://github.com/chu459/claude-code-orchestrator-skill/archive/refs/heads/main.zip" -OutFile $tmp; `
+iwr -UseBasicParsing "https://github.com/rfdiosuao/claude-code-orchestrator-skill/archive/refs/tags/v0.8.0.zip" -OutFile $tmp; `
 $dir = Join-Path $env:TEMP "claude-code-orchestrator-skill"; `
 if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }; `
 Expand-Archive $tmp -DestinationPath $dir -Force; `
@@ -27,16 +27,20 @@ macOS 或 Linux：
 
 ```bash
 tmp="$(mktemp -d)" && \
-curl -L "https://github.com/chu459/claude-code-orchestrator-skill/archive/refs/heads/main.zip" -o "$tmp/skill.zip" && \
+curl -L "https://github.com/rfdiosuao/claude-code-orchestrator-skill/archive/refs/tags/v0.8.0.zip" -o "$tmp/skill.zip" && \
 unzip -q "$tmp/skill.zip" -d "$tmp" && \
-bash "$tmp"/claude-code-orchestrator-skill-main/install/install.sh
+bash "$tmp"/claude-code-orchestrator-skill-0.8.0/install/install.sh
 ```
+
+只有在不可变的 `v0.8.0` tag 发布后才能用于生产安装。请把下载归档的 SHA-256 记入部署日志，回滚时复核；不得替换成分支归档。
 
 默认安装到：
 
 ```text
 ~/.codex/skills/claude-code-orchestrator
 ```
+
+> **平台边界：** v0.8.0 的生产级 guarded worker 执行仅支持 Windows。macOS 和 Linux 可以安装并运行管理检查，但在实现整棵进程树 containment 之前，启动命令会 fail closed。
 
 ## 设置工具路径
 
@@ -65,7 +69,7 @@ python "$CC_ORCHESTRATOR_HOME/cc_orchestrator.py" workspace-status --cwd .
 
 你应该看到：
 
-- `selftest` 返回 `ok: true`。
+- Windows 上 `selftest` 返回 `ok: true`；macOS/Linux 上会按设计返回非零，并报告 `runtime_security.process_tree_containment.supported: false`。
 - `healthcheck` 能找到 Python 配置、Claude Code 和 CCSwitch 文件。
 - `list-profiles` 能列出 Claude-compatible profiles。
 - `score-models` 返回本机模型评分。

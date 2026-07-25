@@ -7,6 +7,8 @@ scripts/cc-orchestrator/config/model_calibration.json
 scripts/cc-orchestrator/config/model_registry.json
 scripts/cc-orchestrator/config/model_benchmark_history.json
 scripts/cc-orchestrator/config/local_policy.override.json
+scripts/cc-orchestrator/config/runtime_security.override.json
+**/runtime_security.audit.key
 scripts/cc-orchestrator/config/worker_quality_history.json
 scripts/cc-orchestrator/config/cost_guard.json
 scripts/cc-orchestrator/config/queue_policy.json

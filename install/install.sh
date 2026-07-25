@@ -28,6 +28,8 @@ rsync -a \
   --exclude 'model_registry.json' \
   --exclude 'model_benchmark_history.json' \
   --exclude 'local_policy.override.json' \
+  --exclude 'runtime_security.override.json' \
+  --exclude 'runtime_security.audit.key' \
   --exclude 'worker_quality_history.json' \
   --exclude 'cost_guard.json' \
   --exclude 'queue_policy.json' \
@@ -40,6 +42,7 @@ for relative in \
   "scripts/cc-orchestrator/config/model_registry.json" \
   "scripts/cc-orchestrator/config/model_benchmark_history.json" \
   "scripts/cc-orchestrator/config/local_policy.override.json" \
+  "scripts/cc-orchestrator/config/runtime_security.override.json" \
   "scripts/cc-orchestrator/config/worker_quality_history.json" \
   "scripts/cc-orchestrator/config/cost_guard.json" \
   "scripts/cc-orchestrator/config/queue_policy.json" \
@@ -47,6 +50,10 @@ for relative in \
   if [ -f "$BACKUP/$relative" ]; then
     mkdir -p "$(dirname "$TARGET/$relative")"
     cp "$BACKUP/$relative" "$TARGET/$relative"
+    cmp -s "$BACKUP/$relative" "$TARGET/$relative" || {
+      echo "Preserved local config failed verification: $relative" >&2
+      exit 1
+    }
     echo "Preserved local config: $relative"
   fi
 done
